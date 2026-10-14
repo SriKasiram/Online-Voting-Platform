@@ -1,0 +1,34 @@
+# Secrets and keys: never commit these
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+secrets/
+keys/
+
+# Databases and dumps
+*.sqlite
+*.sqlite3
+*.dump
+*.sql.gz
+pgdata/
+
+# Node and frontend build output
+node_modules/
+frontend/dist/
+coverage/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
