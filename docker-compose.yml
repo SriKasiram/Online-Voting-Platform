@@ -1,0 +1,24 @@
+# Local PostgreSQL for development. The API itself runs on your machine with uvicorn.
+#
+#   docker compose up -d db
+#
+# Reads the database name, user and password from backend/.env, so copy
+# backend/.env.example to backend/.env first.
+
+services:
+  db:
+    image: postgres:16-alpine
+    env_file: ./backend/.env
+    ports:
+      # Reachable from this computer only. If 5432 is taken, see "Run the backend" in README.md.
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  pgdata:
