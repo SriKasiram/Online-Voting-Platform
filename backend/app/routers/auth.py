@@ -1,0 +1,126 @@
+"""
+Sign in, in two parts, then extend or end the session.
+
+Stage 2 placeholders: password_hash holds the plain demo password and
+totp_secret_enc a fixed demo code. A later stage checks Argon2 password hashes
+and real authenticator (TOTP) codes instead, and limits repeated attempts.
+"""
+
+from datetime import timedelta
+from secrets import compare_digest
+
+from fastapi import APIRouter, HTTPException, Request, Response, status
+from pydantic import BaseModel, Field
+from sqlalchemy import delete, select
+from sqlalchemy.orm import Session
+
+from app.config import settings
+from app.database import DbSession
+from app.models import Account, AccountRole, AuthSession, ElectoralRollEntry, LoginChallenge
+from app.sessions import (
+    CHALLENGE_COOKIE,
+    CHALLENGE_PATH,
+    SESSION_COOKIE,
+    SESSION_PATH,
+    CurrentSession,
+    clear_cookie,
+    new_token,
+    set_cookie,
+    utc_now,
+)
+
+router = APIRouter(prefix="/auth", tags=["auth"])
+
+# Time allowed between the password step and the code step
+CHALLENGE_MINUTES = 5
+
+
+class LoginIn(BaseModel):
+    username: str = Field(max_length=200)
+    password: str = Field(max_length=200)
+
+
+class VerifyIn(BaseModel):
+    otp_code: str = Field(pattern=r"^\d{6}$")
+
+
+class VerifyOut(BaseModel):
+    display_name: str
+
+
+def display_name(db: Session, account: Account) -> str:
+    if account.role == AccountRole.ELECTION_OFFICIAL:
+        return "Election official"
+    roll = db.get(ElectoralRollEntry, account.roll_id) if account.roll_id else None
+    # Stage 2: full_name_enc holds the plain name. A later stage decrypts it here.
+    return roll.full_name_enc.decode() if roll else account.username
+
+
+@router.post("/login", status_code=status.HTTP_204_NO_CONTENT)
+def login(body: LoginIn, response: Response, db: DbSession) -> None:
+    """Part 1. Answers the same way whether or not the username and password are right."""
+    challenge_id = new_token()
+    account = db.scalar(select(Account).where(Account.username == body.username.strip()))
+    if account is not None and compare_digest(account.password_hash.encode(), body.password.encode()):
+        db.add(
+            LoginChallenge(
+                challenge_id_hash=challenge_id.encode(),
+                account_id=account.id,
+                expires_at=utc_now() + timedelta(minutes=CHALLENGE_MINUTES),
+            )
+        )
+        db.commit()
+    # Wrong details still get a cookie. It matches nothing, so the code step fails
+    # with the same message as a wrong code.
+    set_cookie(response, CHALLENGE_COOKIE, challenge_id, CHALLENGE_PATH, max_age=CHALLENGE_MINUTES * 60)
+
+
+@router.post("/verify")
+def verify(body: VerifyIn, request: Request, response: Response, db: DbSession) -> VerifyOut:
+    """Part 2. Swaps a passed challenge for a signed-in session."""
+    token = request.cookies.get(CHALLENGE_COOKIE)
+    challenge = db.get(LoginChallenge, token.encode()) if token else None
+    account = db.get(Account, challenge.account_id) if challenge else None
+    if (
+        challenge is None
+        or account is None
+        or challenge.expires_at <= utc_now()
+        or not compare_digest(account.totp_secret_enc, body.otp_code.encode())
+    ):
+        # The challenge stays, so a mistyped code can be tried again
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "sign_in_failed")
+
+    # A brand new session id, never the challenge id, so an id seen before sign in is useless after it
+    session_id = new_token()
+    db.delete(challenge)
+    db.add(
+        AuthSession(
+            session_id_hash=session_id.encode(),
+            account_id=account.id,
+            expires_at=utc_now() + timedelta(minutes=settings.session_minutes),
+        )
+    )
+    db.commit()
+
+    clear_cookie(response, CHALLENGE_COOKIE, CHALLENGE_PATH)
+    set_cookie(response, SESSION_COOKIE, session_id, SESSION_PATH)
+    return VerifyOut(display_name=display_name(db, account))
+
+
+@router.post("/extend", status_code=status.HTTP_204_NO_CONTENT)
+def extend(session: CurrentSession, db: DbSession) -> None:
+    """Starts a new full session. Called only when the voter chooses Keep voting."""
+    session.expires_at = utc_now() + timedelta(minutes=settings.session_minutes)
+    db.commit()
+
+
+@router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
+def logout(request: Request, response: Response, db: DbSession) -> None:
+    """Ends the session and any half-finished sign in. Safe to call when already signed out."""
+    if token := request.cookies.get(SESSION_COOKIE):
+        db.execute(delete(AuthSession).where(AuthSession.session_id_hash == token.encode()))
+    if token := request.cookies.get(CHALLENGE_COOKIE):
+        db.execute(delete(LoginChallenge).where(LoginChallenge.challenge_id_hash == token.encode()))
+    db.commit()
+    clear_cookie(response, SESSION_COOKIE, SESSION_PATH)
+    clear_cookie(response, CHALLENGE_COOKIE, CHALLENGE_PATH)
