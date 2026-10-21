@@ -11,6 +11,7 @@ alembic==1.20.0
 psycopg[binary]==3.3.6
 
 # Security: password hashing, field encryption, authenticator codes
+# SR-01: argon2-cffi (Argon2id passwords) and pyotp (TOTP codes) were already here; no new packages
 argon2-cffi==25.1.0
 cryptography==50.0.2
 pyotp==2.10.0
