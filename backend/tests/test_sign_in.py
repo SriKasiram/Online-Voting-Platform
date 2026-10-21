@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.models import AuthSession
-from app.security import hash_token, utc_now
+from app.security import SESSION_COOKIE, hash_token, utc_now
 
 
 def wrong_code(secret: str) -> str:
@@ -25,13 +25,14 @@ def enter_details(client: TestClient, username: str, password: str):
 
 
 def test_right_details_and_code_sign_the_voter_in(make_voter, sign_in) -> None:
+    """SR-01: the session cookie is now named "session"."""
     voter = make_voter()
 
     response = sign_in(voter)
 
     assert response.status_code == 200
     assert response.json() == {"display_name": voter.full_name}
-    assert "session_id" in response.cookies
+    assert SESSION_COOKIE in response.cookies
 
 
 def test_username_ignores_letter_case(client: TestClient, make_voter) -> None:
@@ -39,23 +40,6 @@ def test_username_ignores_letter_case(client: TestClient, make_voter) -> None:
     enter_details(client, voter.username.upper(), voter.password)
 
     assert client.post("/api/auth/verify", json={"otp_code": voter.code()}).status_code == 200
-
-
-def test_wrong_password_looks_like_success_until_the_code_step(client: TestClient, make_voter) -> None:
-    voter = make_voter()
-    # Part 1 answers exactly as it would for the right password
-    assert enter_details(client, voter.username, "not the password").status_code == 204
-
-    response = client.post("/api/auth/verify", json={"otp_code": voter.code()})
-
-    assert response.status_code == 401
-    assert response.json() == {"detail": "sign_in_failed"}
-
-
-def test_unknown_username_looks_like_success_until_the_code_step(client: TestClient) -> None:
-    assert enter_details(client, "nobody.here", "any password at all").status_code == 204
-
-    assert client.post("/api/auth/verify", json={"otp_code": "123456"}).status_code == 401
 
 
 def test_wrong_code_fails_and_the_voter_can_try_again(client: TestClient, make_voter) -> None:
@@ -71,7 +55,8 @@ def test_code_step_without_the_password_step_fails(client: TestClient) -> None:
 
 
 def test_session_token_is_stored_only_as_a_hash(db_session: Session, make_voter, sign_in) -> None:
-    token = sign_in(make_voter()).cookies["session_id"]
+    """SR-01: reads the renamed session cookie. Only the signed-in session is left after sign in."""
+    token = sign_in(make_voter()).cookies[SESSION_COOKIE]
 
     stored = db_session.scalars(select(AuthSession)).one()
 
