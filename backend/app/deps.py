@@ -8,7 +8,7 @@ from fastapi import Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from app.db import SessionLocal
-from app.models import Account, AccountRole, AuthSession, ElectoralRollEntry
+from app.models import Account, AccountRole, AuthSession, ElectoralRollEntry, SessionStage
 from app.security import SESSION_COOKIE, hash_token, utc_now
 
 
@@ -24,7 +24,9 @@ def current_session(request: Request, db: DbSession) -> AuthSession:
     """The signed-in session for this request. Refuses missing and expired sessions."""
     token = request.cookies.get(SESSION_COOKIE)
     session = db.get(AuthSession, hash_token(token)) if token else None
-    if session is None or session.expires_at <= utc_now():
+    # SR-01: only a session that passed both the password and the code opens /ballot,
+    # /ballot/submit and /auth/extend. A session waiting for its code gets 401 here.
+    if session is None or session.stage != SessionStage.AUTHENTICATED or session.expires_at <= utc_now():
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "not_signed_in")
     session.last_seen = utc_now()
     return session
