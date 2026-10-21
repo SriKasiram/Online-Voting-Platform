@@ -36,15 +36,15 @@ from app.models import AuditLogEntry
 # Tokens and cookies
 # ---------------------------------------------------------------
 
-SESSION_COOKIE = "session_id"
-SESSION_PATH = "/api"
-CHALLENGE_COOKIE = "login_challenge"
-CHALLENGE_PATH = "/api/auth"
+# SR-01: one cookie for both sign-in stages. The server records which stage each session is at.
+SESSION_COOKIE = "session"
+SESSION_PATH = "/"
 REGISTRATION_COOKIE = "registration_session"
 REGISTRATION_PATH = "/api/register"
 
 
 def utc_now() -> datetime:
+    # SR-01: the one clock for lockouts, session expiry and code checks, so tests can replace it
     return datetime.now(UTC)
 
 
@@ -58,13 +58,16 @@ def hash_token(token: str) -> bytes:
     return hashlib.sha256(token.encode()).digest()
 
 
-def set_cookie(response: Response, name: str, value: str, path: str, max_age: int | None = None) -> None:
+# SR-01: `secure` added for the session cookie (COOKIE_SECURE). The registration cookie is unchanged.
+def set_cookie(
+    response: Response, name: str, value: str, path: str, max_age: int | None = None, secure: bool = False
+) -> None:
     # HttpOnly keeps the token away from page scripts. SameSite=Strict stops other sites sending it.
-    response.set_cookie(name, value, path=path, max_age=max_age, httponly=True, samesite="strict")
+    response.set_cookie(name, value, path=path, max_age=max_age, httponly=True, samesite="strict", secure=secure)
 
 
-def clear_cookie(response: Response, name: str, path: str) -> None:
-    response.delete_cookie(name, path=path, httponly=True, samesite="strict")
+def clear_cookie(response: Response, name: str, path: str, secure: bool = False) -> None:
+    response.delete_cookie(name, path=path, httponly=True, samesite="strict", secure=secure)
 
 
 # ---------------------------------------------------------------
@@ -85,8 +88,10 @@ _CODE_KEY = _derive_key("enrolment-code-v1")
 # Passwords (Argon2id)
 # ---------------------------------------------------------------
 
+# SR-01: argon2-cffi's defaults are Argon2id, so every hash starts with "$argon2id$"
 _hasher = PasswordHasher()
 # Checked when there is no account, so an unknown username takes as long as a wrong password
+# SR-01: also checked for a locked account, so a locked account answers as slowly as any other
 _DUMMY_HASH = _hasher.hash(secrets.token_urlsafe(16))
 
 
@@ -192,6 +197,21 @@ def totp_uri(secret: str, username: str) -> str:
 
 def verify_totp(secret: str, code: str) -> bool:
     return pyotp.TOTP(secret).verify(code, valid_window=TOTP_VALID_WINDOW)
+
+
+def totp_matching_step(secret: str, code: str, now: datetime) -> int | None:
+    """
+    SR-01: the 30-second time step, one either side of `now`, whose code matches,
+    or None. Every step is compared in constant time. Sign in stores the step so
+    the same code cannot be used twice.
+    """
+    totp = pyotp.TOTP(secret)
+    current = totp.timecode(now)
+    matched = None
+    for step in range(current - TOTP_VALID_WINDOW, current + TOTP_VALID_WINDOW + 1):
+        if same(totp.generate_otp(step).encode(), code.encode()):
+            matched = step
+    return matched
 
 
 # ---------------------------------------------------------------
