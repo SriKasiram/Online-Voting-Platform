@@ -29,7 +29,6 @@ from app.models import (
     Election,
     ElectionStatus,
     ElectoralRollEntry,
-    LoginChallenge,
     RegistrationSession,
     VoterParticipation,
 )
@@ -181,7 +180,8 @@ def reset_reviewer(session: Session) -> None:
     entry = seed_reviewer(session, now)
 
     accounts = select(Account.id).where(Account.roll_id == entry.id)
-    for table in (AuthSession, LoginChallenge, VoterParticipation):
+    # SR-01: half-finished sign ins are sessions now, so AuthSession covers them too
+    for table in (AuthSession, VoterParticipation):
         session.execute(
             delete(table).where(table.account_id.in_(accounts)).execution_options(synchronize_session=False)
         )
