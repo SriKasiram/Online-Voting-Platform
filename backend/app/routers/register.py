@@ -92,12 +92,13 @@ def verify(body: RegisterVerifyIn, request: Request, response: Response, db: DbS
     code_matches = same(enrolment_code_hash(body.enrolment_code), stored_hash or _DUMMY_CODE_HASH)
     code_matches = code_matches and stored_hash is not None
 
+    # SR-01: window constant renamed only; registration limits are unchanged
     allowed = rate_limiter.allow(
-        f"register-ip:{ip}", config.REGISTER_VERIFY_LIMIT_PER_IP, config.RATE_LIMIT_WINDOW_SECONDS
+        f"register-ip:{ip}", config.REGISTER_VERIFY_LIMIT_PER_IP, config.REGISTER_VERIFY_WINDOW_SECONDS
     )
     if allowed and entry is not None:
         allowed = rate_limiter.allow(
-            f"register-roll:{entry.id}", config.REGISTER_VERIFY_LIMIT_PER_ENTRY, config.RATE_LIMIT_WINDOW_SECONDS
+            f"register-roll:{entry.id}", config.REGISTER_VERIFY_LIMIT_PER_ENTRY, config.REGISTER_VERIFY_WINDOW_SECONDS
         )
 
     if not (
