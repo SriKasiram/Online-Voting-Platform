@@ -110,7 +110,8 @@ def client(connection: Connection) -> Iterator[TestClient]:
             yield session
 
     app.dependency_overrides[get_db] = test_db
-    with TestClient(app) as test_client:
+    # SR-01: https, so a Secure session cookie comes back the way a browser would send it
+    with TestClient(app, base_url="https://testserver") as test_client:
         yield test_client
     app.dependency_overrides.clear()
 
