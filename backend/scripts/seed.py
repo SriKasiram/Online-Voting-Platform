@@ -11,6 +11,9 @@ Run from the backend folder, with the virtual environment active:
     python -m scripts.seed                    loads the data, safe to repeat
     python -m scripts.seed --reset-reviewer   lets the reviewer register again
     python -m scripts.seed --reset            deletes all data, then loads it again
+
+SR-02: every run ends by signing the roll (scripts/sign_roll.py), creating
+development keys in backend/keys/ the first time.
 """
 
 import argparse
@@ -33,6 +36,7 @@ from app.models import (
     VoterParticipation,
 )
 from app.security import encrypt, enrolment_code_hash, roll_lookup
+from scripts.sign_roll import load_or_create_private_key, sign_all
 
 ELECTION_NAME = "House of Representatives"
 
@@ -99,6 +103,8 @@ def seed_election(session: Session, now: datetime) -> bool:
         status=ElectionStatus.OPEN,
         starts_at=now - timedelta(days=1),
         ends_at=now + timedelta(days=30),
+        # SR-02: polling day is the last day of voting
+        polling_date=(now + timedelta(days=30)).date(),
     )
     divisions = {name: Division(name=name, state=state) for name, state in DIVISIONS.items()}
     session.add(election)
@@ -205,6 +211,12 @@ def reset(session: Session) -> None:
     session.commit()
 
 
+def sign_roll(session: Session) -> None:
+    # SR-02: a freshly seeded roll is signed, so the API's start-up check passes
+    count = sign_all(session, load_or_create_private_key())
+    print(f"Signed {count} electoral roll records with the development key in backend/keys/.")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Load the seed data.")
     group = parser.add_mutually_exclusive_group()
@@ -215,12 +227,14 @@ def main() -> None:
     with SessionLocal() as session:
         if args.reset_reviewer:
             reset_reviewer(session)
+            sign_roll(session)
             print("The reviewer's account is gone and their enrolment code works again.")
             return
         if args.reset:
             reset(session)
             print("Deleted all data.")
         added = seed(session)
+        sign_roll(session)
 
     print("Added the election data." if added else "Election data already present. Nothing duplicated.")
     print(

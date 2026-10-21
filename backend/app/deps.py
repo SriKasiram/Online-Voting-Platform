@@ -1,14 +1,13 @@
 """FastAPI dependencies: a database session per request, and the signed-in voter."""
 
 from collections.abc import Iterator
-from dataclasses import dataclass
 from typing import Annotated
 
 from fastapi import Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from app.db import SessionLocal
-from app.models import Account, AccountRole, AuthSession, ElectoralRollEntry, SessionStage
+from app.models import Account, AccountRole, AuthSession, SessionStage
 from app.security import SESSION_COOKIE, hash_token, utc_now
 
 
@@ -35,21 +34,14 @@ def current_session(request: Request, db: DbSession) -> AuthSession:
 CurrentSession = Annotated[AuthSession, Depends(current_session)]
 
 
-@dataclass
-class Voter:
-    account: Account
-    roll: ElectoralRollEntry
-
-
-def current_voter(session: CurrentSession, db: DbSession) -> Voter:
-    """The signed-in account, if it is allowed to vote: a voter who is enrolled."""
+def current_voter(session: CurrentSession, db: DbSession) -> Account:
+    """The signed-in account, if it is a voter account linked to the roll."""
     account = db.get_one(Account, session.account_id)
     if account.role != AccountRole.VOTER or account.roll_id is None:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "not_a_voter")
-    roll = db.get_one(ElectoralRollEntry, account.roll_id)
-    if not roll.enrolled:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "not_enrolled")
-    return Voter(account=account, roll=roll)
+    # SR-02: enrolment, division and age now come from the signed roll record
+    # (app/eligibility.py), so the unsigned roll row is no longer read here
+    return account
 
 
-CurrentVoter = Annotated[Voter, Depends(current_voter)]
+CurrentVoter = Annotated[Account, Depends(current_voter)]

@@ -45,6 +45,11 @@ class Settings(BaseSettings):
     # SR-01: marks the session cookie Secure. Set false only for local http:// development.
     cookie_secure: bool = True
 
+    # SR-02: the Ed25519 public key that checks electoral roll signatures. The API never holds the private key.
+    roll_public_key_path: Path = BACKEND_DIR / "keys" / "roll_public.pem"
+    # SR-02: minimum age on the election's polling date
+    min_voting_age: int = 18
+
     def database_url(self, database: str | None = None) -> URL:
         """Connection URL for the app database, or for another database on the same server."""
         return URL.create(

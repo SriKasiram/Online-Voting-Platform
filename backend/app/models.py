@@ -19,7 +19,7 @@ ballot_definitions.signature is empty.
 
 import enum
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 
 from sqlalchemy import BigInteger, Enum, ForeignKey, UniqueConstraint, false, func, text
@@ -52,6 +52,8 @@ class Election(Base):
     status: Mapped[ElectionStatus] = mapped_column(Enum(ElectionStatus, name="election_status"))
     starts_at: Mapped[datetime]
     ends_at: Mapped[datetime]
+    # SR-02: the day a voter's age is worked out on, whenever they vote
+    polling_date: Mapped[date]
 
 
 class Division(Base):
@@ -112,7 +114,8 @@ class ElectoralRollEntry(Base):
     # Empty only on entries created before registration existed
     date_of_birth_enc: Mapped[bytes | None]
     postcode_enc: Mapped[bytes | None]
-    division_id: Mapped[int] = mapped_column(ForeignKey("divisions.id"))
+    # SR-02: may be empty, for an elector not (or no longer) assigned to a division. They get no ballot.
+    division_id: Mapped[int | None] = mapped_column(ForeignKey("divisions.id"))
     enrolled: Mapped[bool]
     # The one-time enrolment code, as a keyed hash. Cleared once used.
     enrolment_code_hash: Mapped[bytes | None]
@@ -120,6 +123,9 @@ class ElectoralRollEntry(Base):
     # Wrong codes so far. At ENROLMENT_CODE_MAX_ATTEMPTS the code is locked.
     code_attempts: Mapped[int] = mapped_column(default=0, server_default=text("0"))
     registered_at: Mapped[datetime | None]
+    # SR-02: Ed25519 signature over the eligibility fields (app/roll_signing.py). Empty until
+    # python -m scripts.sign_roll runs, and an empty one fails every check.
+    record_signature: Mapped[bytes | None]
 
 
 class Account(Base):

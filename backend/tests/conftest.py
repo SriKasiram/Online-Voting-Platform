@@ -13,21 +13,25 @@ import re
 import uuid
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import date, datetime, timedelta
 
 import pyotp
 import pytest
 from alembic import command
 from alembic.config import Config
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from fastapi.testclient import TestClient
 from httpx2 import Response
 from sqlalchemy import Connection, Engine, create_engine, text
 from sqlalchemy.orm import Session
 
+from app import deps, security
 from app.config import BACKEND_DIR, settings
 from app.deps import get_db
 from app.main import app
 from app.models import Account, AccountRole, Candidate, Division, Election, ElectionStatus, ElectoralRollEntry
+from app.routers import auth, ballot
 from app.security import (
     encrypt,
     enrolment_code_hash,
@@ -37,6 +41,10 @@ from app.security import (
     roll_lookup,
     utc_now,
 )
+from scripts.sign_roll import sign_record
+
+# SR-02: a fixed polling date, so no test depends on today's date
+POLLING_DATE = date(2027, 5, 15)
 
 CANDIDATE_NAMES = [
     ("Hana", "Ortega", "Harbour Party"),
@@ -123,6 +131,43 @@ def fresh_rate_limits() -> Iterator[None]:
     rate_limiter.clear()
 
 
+@pytest.fixture(scope="session", autouse=True)
+def roll_key(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Ed25519PrivateKey]:
+    """
+    SR-02: a signing key made for this test run. The API checks roll records
+    with its public key, so the development keys in backend/keys/ are never used.
+    """
+    key = Ed25519PrivateKey.generate()
+    public_path = tmp_path_factory.mktemp("roll_keys") / "roll_public.pem"
+    public_path.write_bytes(
+        key.public_key().public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo)
+    )
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(settings, "roll_public_key_path", public_path)
+        yield key
+
+
+@dataclass
+class Clock:
+    now: datetime
+
+    def advance(self, **delta: float) -> None:
+        self.now += timedelta(**delta)
+
+
+@pytest.fixture
+def clock(monkeypatch: pytest.MonkeyPatch) -> Clock:
+    """
+    SR-01: one controllable time for sign in, sessions, lockouts and code checks.
+    SR-02: moved here from test_sr01_auth.py so the eligibility tests share it,
+    and it now sets the time the ballot router sees too.
+    """
+    fake = Clock(utc_now())
+    for module in (security, deps, auth, ballot):
+        monkeypatch.setattr(module, "utc_now", lambda: fake.now)
+    return fake
+
+
 # ---------------------------------------------------------------
 # Test data
 # ---------------------------------------------------------------
@@ -144,6 +189,8 @@ def election(db_session: Session) -> ElectionData:
         status=ElectionStatus.OPEN,
         starts_at=now - timedelta(days=1),
         ends_at=now + timedelta(days=1),
+        # SR-02: ages are worked out on this fixed date
+        polling_date=POLLING_DATE,
     )
     divisions = {name: Division(name=name, state="Victoria") for name in ("Northgate", "Southvale")}
     db_session.add(election)
@@ -192,10 +239,11 @@ class Person:
 
 
 @pytest.fixture
-def make_person(db_session: Session, election: ElectionData) -> Callable[..., Person]:
+def make_person(db_session: Session, election: ElectionData, roll_key: Ed25519PrivateKey) -> Callable[..., Person]:
     """Puts a person on the roll, with an enrolment code, and returns their details."""
     counter = itertools.count(1)
 
+    # SR-02: date_of_birth added, so eligibility tests can choose an age
     def make(
         *,
         division: str = "Northgate",
@@ -203,12 +251,13 @@ def make_person(db_session: Session, election: ElectionData) -> Callable[..., Pe
         registered: bool = False,
         code_expires_in: timedelta = timedelta(days=30),
         code_attempts: int = 0,
+        date_of_birth: str = "1985-06-15",
     ) -> Person:
         n = next(counter)
         person = Person(
             given_name="Alex",
             surname=f"Tester{n}",
-            date_of_birth="1985-06-15",
+            date_of_birth=date_of_birth,
             postcode="3000",
             enrolment_code=f"TEST-CODE-{n:04d}",
             division=division,
@@ -227,6 +276,8 @@ def make_person(db_session: Session, election: ElectionData) -> Callable[..., Pe
             code_attempts=code_attempts,
             registered_at=utc_now() if registered else None,
         )
+        # SR-02: every test roll record is signed, as scripts/sign_roll.py would sign it
+        entry.record_signature = sign_record(roll_key, entry)
         db_session.add(entry)
         db_session.commit()
         return person
@@ -252,9 +303,16 @@ def make_voter(db_session: Session, make_person: Callable[..., Person]) -> Calla
     """A person on the roll who has already registered, as the registration flow would leave them."""
     counter = itertools.count(1)
 
-    def make(*, division: str = "Northgate", enrolled: bool = True, official: bool = False) -> RegisteredVoter:
+    # SR-02: date_of_birth passed on to the roll record
+    def make(
+        *, division: str = "Northgate", enrolled: bool = True, official: bool = False, date_of_birth: str = "1985-06-15"
+    ) -> RegisteredVoter:
         n = next(counter)
-        person = None if official else make_person(division=division, enrolled=enrolled, registered=True)
+        person = (
+            None
+            if official
+            else make_person(division=division, enrolled=enrolled, registered=True, date_of_birth=date_of_birth)
+        )
         voter = RegisteredVoter(
             username=f"official.{n}" if official else f"voter.{n}",
             password=f"long enough password {n}",

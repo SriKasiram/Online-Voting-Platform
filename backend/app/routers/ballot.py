@@ -15,6 +15,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.deps import CurrentVoter, DbSession
+from app.eligibility import eligible_division
 from app.models import Ballot, BallotToken, Candidate, Division, Election, ElectionStatus, VoterParticipation
 from app.schemas import BallotOut, CandidateOut, SubmitIn, SubmitOut
 from app.security import hash_token, new_token, utc_now
@@ -62,10 +63,13 @@ def receipt_code() -> str:
 def get_ballot(voter: CurrentVoter, db: DbSession) -> BallotOut:
     """The ballot paper for the voter's division, with a one-time token to submit it."""
     election = open_election(db)
-    if db.get(VoterParticipation, (voter.account.id, election.id)) is not None:
+    # SR-02: eligibility from the signed roll record, before any ballot token exists. The division
+    # comes only from that record; any division the browser sends is never read.
+    division_id = eligible_division(db, voter, election)
+    if db.get(VoterParticipation, (voter.id, election.id)) is not None:
         raise HTTPException(status.HTTP_409_CONFLICT, "already_voted")
 
-    division = db.get_one(Division, voter.roll.division_id)
+    division = db.get_one(Division, division_id)
     token = new_token()
     ballot = BallotOut(
         ballot_token=token,
@@ -87,7 +91,8 @@ def get_ballot(voter: CurrentVoter, db: DbSession) -> BallotOut:
 def submit_ballot(body: SubmitIn, voter: CurrentVoter, db: DbSession) -> SubmitOut:
     """Accepts a full preferential ballot once per voter."""
     election = open_election(db)
-    division_id = voter.roll.division_id
+    # SR-02: checked again before the vote is accepted, and the division comes from the signed record
+    division_id = eligible_division(db, voter, election)
 
     # Every candidate numbered exactly once. The frontend checks this too, but only this check counts.
     expected = {c.id for c in ballot_candidates(db, election, division_id)}
@@ -97,7 +102,8 @@ def submit_ballot(body: SubmitIn, voter: CurrentVoter, db: DbSession) -> SubmitO
 
     # 1. Mark the voter. The primary key (account_id, election_id) refuses a second vote.
     try:
-        db.execute(insert(VoterParticipation).values(account_id=voter.account.id, election_id=election.id))
+        # SR-02: CurrentVoter is now the account itself
+        db.execute(insert(VoterParticipation).values(account_id=voter.id, election_id=election.id))
     except IntegrityError:
         db.rollback()
         raise HTTPException(status.HTTP_409_CONFLICT, "already_voted") from None

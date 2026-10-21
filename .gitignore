@@ -7,6 +7,8 @@
 *.p12
 secrets/
 keys/
+# SR-02: the electoral roll signing keys (scripts/sign_roll.py). Also covered by keys/ and *.pem above.
+backend/keys/
 
 # Databases and dumps
 *.sqlite

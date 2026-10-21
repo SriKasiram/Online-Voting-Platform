@@ -7,8 +7,7 @@ attempts lock the account, and each client IP has a limit on sign-in requests.
 import json
 import threading
 from collections.abc import Iterator
-from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 import pyotp
 import pytest
@@ -16,13 +15,12 @@ from fastapi.testclient import TestClient
 from sqlalchemy import Engine, delete, func, select
 from sqlalchemy.orm import Session
 
-from app import deps, security
+from app import security
 from app.config import Settings, settings
 from app.deps import get_db
 from app.main import app
 from app.models import Account, AccountRole, AuditLogEntry, AuthSession, SessionStage
-from app.routers import auth
-from app.security import SESSION_COOKIE, encrypt, hash_password, hash_token, new_totp_secret, utc_now
+from app.security import SESSION_COOKIE, encrypt, hash_password, hash_token, new_totp_secret
 
 LOGIN = "/api/auth/login"
 VERIFY = "/api/auth/verify"
@@ -36,30 +34,15 @@ VOTING_ROUTES = [
 ]
 EVENTS = {"auth_password_failed", "auth_totp_failed", "auth_account_locked", "auth_rate_limited", "auth_login_success"}
 
-
-@dataclass
-class Clock:
-    now: datetime
-
-    def advance(self, **delta: float) -> None:
-        self.now += timedelta(**delta)
+# SR-02: the `clock` fixture moved to conftest.py so the SR-02 tests share it. Behaviour unchanged.
 
 
-@pytest.fixture
-def clock(monkeypatch: pytest.MonkeyPatch) -> Clock:
-    """SR-01: one controllable time for sign in, sessions, lockouts and code checks."""
-    fake = Clock(utc_now())
-    for module in (security, deps, auth):
-        monkeypatch.setattr(module, "utc_now", lambda: fake.now)
-    return fake
-
-
-def code(voter, clock: Clock, steps: int = 0) -> str:
+def code(voter, clock, steps: int = 0) -> str:
     """The voter's authenticator code, `steps` 30-second steps away from the clock's time."""
     return pyotp.TOTP(voter.totp_secret).at(clock.now + timedelta(seconds=30 * steps))
 
 
-def wrong_code(voter, clock: Clock) -> str:
+def wrong_code(voter, clock) -> str:
     valid = {code(voter, clock, steps) for steps in (-1, 0, 1)}
     return next(c for c in ("000000", "111111", "222222", "333333") if c not in valid)
 
@@ -94,7 +77,7 @@ def test_pending_session_is_refused_by_every_voting_route(client: TestClient, ma
 
 
 def test_password_and_code_open_voting_under_a_new_token(
-    client: TestClient, db_session: Session, make_voter, clock: Clock, monkeypatch: pytest.MonkeyPatch
+    client: TestClient, db_session: Session, make_voter, clock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """SR-01 test 3: both steps open voting under a new token, in a cookie with the required flags."""
     monkeypatch.setattr(settings, "cookie_secure", True)
@@ -126,7 +109,7 @@ def test_wrong_password_and_unknown_username_get_the_same_answer(client: TestCli
 
 
 def test_mixed_failures_lock_the_account_until_lock_minutes_pass(
-    client: TestClient, db_session: Session, make_voter, clock: Clock
+    client: TestClient, db_session: Session, make_voter, clock
 ) -> None:
     """SR-01 test 5: password and code failures count together, and while locked even the right details fail."""
     voter = make_voter()
@@ -149,7 +132,7 @@ def test_mixed_failures_lock_the_account_until_lock_minutes_pass(
     assert verify(client, code(voter, clock)).status_code == 200
 
 
-def test_a_full_sign_in_resets_the_count(client: TestClient, db_session: Session, make_voter, clock: Clock) -> None:
+def test_a_full_sign_in_resets_the_count(client: TestClient, db_session: Session, make_voter, clock) -> None:
     """SR-01 test 6: failures before a successful sign in no longer count toward the lock."""
     voter = make_voter()
     for _ in range(settings.max_failed_attempts - 1):
@@ -165,7 +148,7 @@ def test_a_full_sign_in_resets_the_count(client: TestClient, db_session: Session
     assert account_row(db_session, voter).locked_until is None
 
 
-def test_a_code_cannot_be_used_twice(client: TestClient, db_session: Session, make_voter, clock: Clock) -> None:
+def test_a_code_cannot_be_used_twice(client: TestClient, db_session: Session, make_voter, clock) -> None:
     """SR-01 test 7: a code is refused the second time within its 30 seconds, and that counts as a failure."""
     voter = make_voter()
     used = code(voter, clock)
@@ -182,7 +165,7 @@ def test_a_code_cannot_be_used_twice(client: TestClient, db_session: Session, ma
 
 @pytest.mark.parametrize(("steps", "status_code"), [(-2, 401), (-1, 200), (1, 200), (2, 401)])
 def test_codes_one_step_either_side_are_accepted(
-    client: TestClient, make_voter, clock: Clock, steps: int, status_code: int
+    client: TestClient, make_voter, clock, steps: int, status_code: int
 ) -> None:
     """SR-01 test 8: codes from steps -1 and +1 are accepted for clock drift, -2 and +2 are not."""
     voter = make_voter()
@@ -191,7 +174,7 @@ def test_codes_one_step_either_side_are_accepted(
     assert verify(client, code(voter, clock, steps)).status_code == status_code
 
 
-def test_expired_or_spent_pending_session_is_refused(client: TestClient, make_voter, clock: Clock) -> None:
+def test_expired_or_spent_pending_session_is_refused(client: TestClient, make_voter, clock) -> None:
     """SR-01 test 9: a pending session ends after MFA_PENDING_MINUTES and cannot be used again after success."""
     voter = make_voter()
     login(client, voter)
@@ -302,7 +285,7 @@ def test_stored_passwords_are_argon2id(db_session: Session, make_voter) -> None:
 
 
 def test_locked_and_unknown_users_still_run_the_dummy_hash(
-    client: TestClient, db_session: Session, make_voter, clock: Clock, monkeypatch: pytest.MonkeyPatch
+    client: TestClient, db_session: Session, make_voter, clock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """SR-01 test 13: an unknown username and a locked account both run Argon2id against the dummy hash."""
     voter = make_voter()
@@ -326,7 +309,7 @@ def test_locked_and_unknown_users_still_run_the_dummy_hash(
 
 
 def test_audit_records_each_event_without_secrets(
-    client: TestClient, db_session: Session, make_voter, clock: Clock, monkeypatch: pytest.MonkeyPatch
+    client: TestClient, db_session: Session, make_voter, clock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """SR-01 test 14: every sign-in event is audited with only the account (or "unknown") and the event type."""
     before = db_session.scalar(select(func.coalesce(func.max(AuditLogEntry.id), 0)))

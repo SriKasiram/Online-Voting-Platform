@@ -1,14 +1,31 @@
 """FastAPI application. Every route lives under /api, matching the frontend's dev proxy."""
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from sqlalchemy import select
 
-from app.deps import DbSession
+from app.deps import DbSession, get_db
 from app.models import Division
+from app.roll_signing import check_roll_at_startup
 from app.routers import auth, ballot, register
 from app.schemas import DivisionOut
 
-app = FastAPI(title="Electronic voting prototype API", version="0.1.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    # SR-02: the API refuses to start unless every electoral roll record's signature checks out.
+    # Uses the routes' database dependency, so tests check their own database.
+    sessions = app.dependency_overrides.get(get_db, get_db)()
+    try:
+        check_roll_at_startup(next(sessions))
+    finally:
+        sessions.close()
+    yield
+
+
+app = FastAPI(title="Electronic voting prototype API", version="0.1.0", lifespan=lifespan)
 
 app.include_router(auth.router, prefix="/api")
 app.include_router(ballot.router, prefix="/api")

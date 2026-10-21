@@ -25,6 +25,7 @@ from app.security import (
     roll_lookup,
     utc_now,
 )
+from scripts.sign_roll import sign_record
 
 VERIFY = "/api/register/verify"
 ACCOUNT = "/api/register/account"
@@ -381,8 +382,11 @@ def run_together(*calls: Callable[[], object]) -> list:
     return results
 
 
-def test_two_simultaneous_registrations_create_one_account(engine) -> None:
-    """Needs real, separate transactions, so this test commits its own data and removes it afterwards."""
+def test_two_simultaneous_registrations_create_one_account(engine, roll_key) -> None:
+    """
+    Needs real, separate transactions, so this test commits its own data and removes it afterwards.
+    SR-02: its roll entry is signed like all test roll data, and the clean-up now commits.
+    """
 
     def real_db():
         with Session(engine) as session:
@@ -406,6 +410,8 @@ def test_two_simultaneous_registrations_create_one_account(engine) -> None:
             code_expires_at=utc_now() + timedelta(days=1),
         )
         setup.add(entry)
+        setup.flush()  # SR-02: assigns the id, which is part of the signed record
+        entry.record_signature = sign_record(roll_key, entry)
         setup.commit()
         roll_id = entry.id
 
@@ -449,4 +455,6 @@ def test_two_simultaneous_registrations_create_one_account(engine) -> None:
                 delete(AuditLogEntry).where(AuditLogEntry.id > before),
             ):
                 cleanup.execute(statement)
+            # SR-02: without this the rows stayed behind, and later start-up checks would see them
+            cleanup.commit()
             cleanup.commit()
