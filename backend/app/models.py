@@ -133,33 +133,34 @@ class Account(Base):
     # Election officials are not on the roll. UNIQUE: one account per person on the roll.
     roll_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("electoral_roll.id"), unique=True)
     totp_secret_enc: Mapped[bytes]
+    # SR-01: consecutive failed sign-in attempts, at the password or the code step. Reset by a full sign in.
     failed_logins: Mapped[int] = mapped_column(default=0, server_default=text("0"))
+    # SR-01: set for LOCK_MINUTES when failed_logins reaches MAX_FAILED_ATTEMPTS
     locked_until: Mapped[datetime | None]
+    # SR-01: the last authenticator time step accepted, so a code cannot be used twice
+    totp_last_step: Mapped[int | None] = mapped_column(BigInteger)
+
+
+class SessionStage(enum.StrEnum):
+    """SR-01: a session opens voting routes only once both sign-in steps have passed."""
+
+    MFA_PENDING = "mfa_pending"
+    AUTHENTICATED = "authenticated"
 
 
 class AuthSession(Base):
-    """A signed-in session. Named AuthSession so it is not confused with a SQLAlchemy Session."""
+    """A sign-in session. Named AuthSession so it is not confused with a SQLAlchemy Session."""
 
     __tablename__ = "sessions"
 
     session_id_hash: Mapped[bytes] = mapped_column(primary_key=True)
     account_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("accounts.id"))
+    # SR-01: mfa_pending after the password, authenticated after the code
+    stage: Mapped[SessionStage] = mapped_column(
+        Enum(SessionStage, name="session_stage", values_callable=lambda e: [m.value for m in e])
+    )
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     last_seen: Mapped[datetime] = mapped_column(server_default=func.now())
-    expires_at: Mapped[datetime]
-
-
-class LoginChallenge(Base):
-    """
-    A sign in that passed the password step and waits for the 6-digit code. Kept
-    apart from sessions, so a half-finished sign in can never pass for a signed-in voter.
-    """
-
-    __tablename__ = "login_challenges"
-
-    challenge_id_hash: Mapped[bytes] = mapped_column(primary_key=True)
-    account_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("accounts.id"))
-    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     expires_at: Mapped[datetime]
 
 
