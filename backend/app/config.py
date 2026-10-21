@@ -1,11 +1,11 @@
 """
-Settings. Every value comes from an environment variable, or from backend/.env
-during local development. See .env.example for the full list.
+Settings from environment variables, or from backend/.env during local
+development (see .env.example), plus the fixed limits the app enforces.
 """
 
 from pathlib import Path
 
-from pydantic import SecretStr
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import URL
 
@@ -31,6 +31,9 @@ class Settings(BaseSettings):
     # How long a signed-in session lasts. Keep it equal to VITE_SESSION_MINUTES in the frontend.
     session_minutes: int = 10
 
+    # Root secret. app/security.py derives a separate key from it for each purpose.
+    secret_key: SecretStr = Field(min_length=32)
+
     def database_url(self, database: str | None = None) -> URL:
         """Connection URL for the app database, or for another database on the same server."""
         return URL.create(
@@ -44,3 +47,24 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+# Minutes allowed between the password step and the code step of sign in
+CHALLENGE_MINUTES = 5
+
+# Registration (app/routers/register.py)
+REGISTRATION_SESSION_MINUTES = 10
+# Wrong enrolment codes before a roll entry's code is locked
+ENROLMENT_CODE_MAX_ATTEMPTS = 5
+# Wrong authenticator codes before a registration in progress is ended
+REGISTRATION_CODE_MAX_ATTEMPTS = 5
+# Requests to /api/register/verify allowed per window, per client IP and per roll entry
+RATE_LIMIT_WINDOW_SECONDS = 15 * 60
+REGISTER_VERIFY_LIMIT_PER_IP = 20
+REGISTER_VERIFY_LIMIT_PER_ENTRY = 10
+USERNAME_PATTERN = r"[A-Za-z0-9._]{3,32}"
+PASSWORD_MIN_LENGTH = 12
+
+# Authenticator apps (TOTP)
+TOTP_ISSUER = "Australian E-Voting Platform"
+# Accept a code from one 30-second step either side, for clock drift on the phone
+TOTP_VALID_WINDOW = 1

@@ -1,8 +1,17 @@
 import { useEffect, useState, type ReactNode } from "react";
-import { USE_MOCK } from "../api/client";
-import { initials } from "../lib/names";
-import { formatClock } from "../lib/useSessionTimer";
+import { formatClock } from "../lib/hooks";
 import { ClockIcon } from "./Icons";
+
+/** Up to two capital letters for the signed-in voter's badge. */
+function initials(name: string): string {
+  return name
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((word) => word[0])
+    .join("")
+    .slice(0, 2)
+    .toUpperCase();
+}
 
 type Props = {
   /** 0 to 3, matching STEPS below. */
@@ -136,7 +145,6 @@ export default function Layout({ step, voterName, sessionSecondsLeft, onSignOut,
       <footer className="foot">
         <div className="wrap foot-row">
           <span>Need help? Ask a polling official.</span>
-          {USE_MOCK && <span>Demo mode. Candidates and data are invented.</span>}
         </div>
       </footer>
     </div>

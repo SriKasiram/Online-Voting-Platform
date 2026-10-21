@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import { formatClock } from "../lib/useSessionTimer";
+import { formatClock } from "../lib/hooks";
 import { ClockIcon } from "./Icons";
 
 type Props = {

@@ -590,7 +590,8 @@ form.stack {
   display: grid;
   gap: 0.4rem;
 }
-.field label {
+.field label,
+.field .label {
   font-size: 0.9375rem;
   font-weight: 700;
 }
@@ -615,6 +616,9 @@ form.stack {
 }
 .input:focus {
   border-color: var(--primary);
+}
+.input-short {
+  max-width: 8rem;
 }
 
 .pw {
@@ -767,6 +771,44 @@ form.stack {
   gap: 0.35rem;
   color: var(--muted);
   font-size: var(--step--1);
+}
+
+.link-btn {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--primary-text);
+  font: inherit;
+  font-weight: 700;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+.link-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.authenticator {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 1rem 1.5rem;
+}
+.qr-box {
+  padding: 0.75rem;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  /* Black on white in both themes: phone cameras read light-on-dark QR codes poorly */
+  background: #ffffff;
+  line-height: 0;
+}
+.secret-key {
+  font-family: var(--font-mono);
+  font-size: var(--step-1);
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  overflow-wrap: anywhere;
 }
 
 .login-context {

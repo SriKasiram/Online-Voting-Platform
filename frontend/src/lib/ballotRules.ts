@@ -6,7 +6,7 @@
 /** Candidate ids from first preference to last. */
 export type Ranking = number[];
 
-export type RankingCheck = {
+type RankingCheck = {
   /** True when every candidate has exactly one number and nothing else is listed. */
   valid: boolean;
   /** Candidates that do not have a number yet. */

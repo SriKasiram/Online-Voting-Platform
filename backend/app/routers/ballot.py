@@ -10,52 +10,19 @@ import json
 import secrets
 
 from fastapi import APIRouter, HTTPException, status
-from pydantic import BaseModel, Field
 from sqlalchemy import insert, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.database import DbSession
-from app.models import (
-    Ballot,
-    BallotToken,
-    Candidate,
-    Division,
-    Election,
-    ElectionStatus,
-    VoterParticipation,
-)
-from app.sessions import CurrentVoter, new_token, utc_now
+from app.deps import CurrentVoter, DbSession
+from app.models import Ballot, BallotToken, Candidate, Division, Election, ElectionStatus, VoterParticipation
+from app.schemas import BallotOut, CandidateOut, SubmitIn, SubmitOut
+from app.security import hash_token, new_token, utc_now
 
 router = APIRouter(prefix="/ballot", tags=["ballot"])
 
 # No 0, O, 1, I or L, so a receipt code is easy to read aloud
 RECEIPT_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
-
-
-class CandidateOut(BaseModel):
-    id: int
-    given_name: str
-    surname: str
-    party: str
-
-
-class BallotOut(BaseModel):
-    ballot_token: str
-    election_name: str
-    division_name: str
-    state_name: str
-    candidates: list[CandidateOut]
-
-
-class SubmitIn(BaseModel):
-    ballot_token: str = Field(max_length=200)
-    # Candidate ids from first preference to last
-    ranked_candidate_ids: list[int] = Field(max_length=100)
-
-
-class SubmitOut(BaseModel):
-    receipt_id: str
 
 
 def open_election(db: Session) -> Election:
@@ -98,10 +65,7 @@ def get_ballot(voter: CurrentVoter, db: DbSession) -> BallotOut:
     if db.get(VoterParticipation, (voter.account.id, election.id)) is not None:
         raise HTTPException(status.HTTP_409_CONFLICT, "already_voted")
 
-    division = db.get(Division, voter.roll.division_id)
-    if division is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "no_open_election")
-
+    division = db.get_one(Division, voter.roll.division_id)
     token = new_token()
     ballot = BallotOut(
         ballot_token=token,
@@ -114,7 +78,7 @@ def get_ballot(voter: CurrentVoter, db: DbSession) -> BallotOut:
         ],
     )
     # The token row records the election and division only, never who received it
-    db.add(BallotToken(token_hash=token.encode(), election_id=election.id, division_id=division.id))
+    db.add(BallotToken(token_hash=hash_token(token), election_id=election.id, division_id=division.id))
     db.commit()
     return ballot
 
@@ -133,9 +97,7 @@ def submit_ballot(body: SubmitIn, voter: CurrentVoter, db: DbSession) -> SubmitO
 
     # 1. Mark the voter. The primary key (account_id, election_id) refuses a second vote.
     try:
-        db.execute(
-            insert(VoterParticipation).values(account_id=voter.account.id, election_id=election.id)
-        )
+        db.execute(insert(VoterParticipation).values(account_id=voter.account.id, election_id=election.id))
     except IntegrityError:
         db.rollback()
         raise HTTPException(status.HTTP_409_CONFLICT, "already_voted") from None
@@ -144,7 +106,7 @@ def submit_ballot(body: SubmitIn, voter: CurrentVoter, db: DbSession) -> SubmitO
     spent = db.execute(
         update(BallotToken)
         .where(
-            BallotToken.token_hash == body.ballot_token.encode(),
+            BallotToken.token_hash == hash_token(body.ballot_token),
             BallotToken.election_id == election.id,
             BallotToken.division_id == division_id,
             BallotToken.used.is_(False),

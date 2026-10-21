@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
-import { SESSION_MINUTES, SIGN_IN_DIVISION, USE_MOCK } from "../api/client";
+import { SESSION_MINUTES } from "../api/client";
 import { KeyIcon, ClockIcon, LockIcon, PhoneIcon, UserIcon } from "../components/Icons";
 import { ErrorAlert, Notice, Spinner } from "../components/Messages";
 import OtpInput from "../components/OtpInput";
-import { useFocusOnMount } from "../lib/useFocusOnMount";
+import { useFocusOnMount } from "../lib/hooks";
 
 type Props = {
   notice: string;
@@ -11,11 +11,12 @@ type Props = {
   onSubmitDetails: (username: string, password: string) => Promise<void>;
   /** Part 2. The app moves to the ballot when this resolves. */
   onSubmitCode: (code: string) => Promise<void>;
+  onRegister: () => void;
 };
 
 type Part = "details" | "code";
 
-export default function Login({ notice, onSubmitDetails, onSubmitCode }: Props) {
+export default function Login({ notice, onSubmitDetails, onSubmitCode, onRegister }: Props) {
   const detailsHeading = useFocusOnMount<HTMLHeadingElement>();
   const usernameInput = useRef<HTMLInputElement>(null);
   const passwordInput = useRef<HTMLInputElement>(null);
@@ -231,25 +232,29 @@ export default function Login({ notice, onSubmitDetails, onSubmitCode }: Props) 
           )}
 
           <div className="hints">
+            <p>
+              Not registered yet?{" "}
+              <button type="button" className="link-btn" onClick={onRegister} disabled={busy}>
+                Register to vote
+              </button>
+            </p>
             <p>Using a shared terminal? Sign out when you finish voting.</p>
-            {USE_MOCK && (
-              <p>Demo: any username and password, then any 6-digit code. Enter 000000 to see the error message.</p>
-            )}
           </div>
         </div>
 
         <aside className="login-context" aria-label="About this ballot">
           <div className="ctx-division">
-            <p className="eyebrow">{SIGN_IN_DIVISION.electionName}</p>
+            <p className="eyebrow">House of Representatives</p>
+            {/* Each voter's division is only known once they have signed in */}
             <h2>
-              {SIGN_IN_DIVISION.divisionName} <span>{SIGN_IN_DIVISION.stateName}</span>
+              Your division <span>shown after you sign in</span>
             </h2>
           </div>
 
           <div className="mini-sheet" aria-hidden="true">
             <div className="mini-head">
               <span>Ballot paper</span>
-              <span>{SIGN_IN_DIVISION.divisionName}</span>
+              <span>Your division</span>
             </div>
             {["2", "1", "3", ""].map((n, i) => (
               <div className="mini-row" key={i}>

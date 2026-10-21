@@ -1,34 +1,39 @@
 """
-Demo data for local development and the tests.
+Seed data: the election (divisions, candidates, ballot papers) and one roll
+entry for the reviewer to register with. There are no accounts: every voter
+registers through the app.
 
-Every person, address and account here is fictional. Running the script again
-changes nothing. Add --reset to delete everything first, including votes cast,
-and start the demo again.
+The reviewer's details below are fake test data. They are written down here,
+and in the README, only because this is a prototype. A real voter's enrolment
+code would arrive by post or email.
 
 Run from the backend folder, with the virtual environment active:
-    python -m scripts.seed
-    python -m scripts.seed --reset
+    python -m scripts.seed                    loads the data, safe to repeat
+    python -m scripts.seed --reset-reviewer   lets the reviewer register again
+    python -m scripts.seed --reset            deletes all data, then loads it again
 """
 
 import argparse
 from datetime import UTC, datetime, timedelta
-from typing import NamedTuple
 
-from sqlalchemy import select, text
+from sqlalchemy import delete, select, text
 from sqlalchemy.orm import Session
 
-from app.database import SessionLocal
+from app.db import Base, SessionLocal
 from app.models import (
     Account,
-    AccountRole,
+    AuthSession,
     BallotDefinition,
-    Base,
     Candidate,
     Division,
     Election,
     ElectionStatus,
     ElectoralRollEntry,
+    LoginChallenge,
+    RegistrationSession,
+    VoterParticipation,
 )
+from app.security import encrypt, enrolment_code_hash, roll_lookup
 
 ELECTION_NAME = "House of Representatives"
 
@@ -40,7 +45,7 @@ DIVISIONS: dict[str, str] = {
 }
 
 # Candidates per division as (given name, surname, party), in ballot paper order.
-# Melbourne matches the frontend's demo ballot.
+# Every name and party is invented.
 CANDIDATES: dict[str, list[tuple[str, str, str]]] = {
     "Melbourne": [
         ("Hana", "Ortega", "Harbour Party"),
@@ -65,54 +70,31 @@ CANDIDATES: dict[str, list[tuple[str, str, str]]] = {
     ],
 }
 
-# Electoral roll: (roll lookup, full name, address, division, enrolled)
-ROLL: list[tuple[str, str, str, str, bool]] = [
-    ("VIC-0001", "Sri Kasiram", "10 Example Street, Carlton VIC 3053", "Melbourne", True),
-    ("VIC-0002", "Roshan Kumar", "22 Sample Road, Kew VIC 3101", "Kooyong", True),
-    ("VIC-0003", "Sharvari Rajkumar", "5 Test Avenue, St Kilda VIC 3182", "Macnamara", True),
-    ("VIC-0004", "Swathi Gajendra", "7 Test Avenue, Kew VIC 3101", "Kooyong", True),
-    ("VIC-0005", "Roopsee Kaur", "1 Example Avenue, Southbank VIC 3182", "Melbourne", True),
-    ("VIC-0006", "Riley Fictional", "9 Mock Lane, Hawthorn VIC 3122", "Macnamara", False),
-]
-
-# Voter accounts: (username, roll lookup). voter.notenrolled is on the roll but not enrolled.
-VOTERS: list[tuple[str, str]] = [
-    ("srikasiram", "VIC-0001"),
-    ("roshan", "VIC-0002"),
-    ("sharvari", "VIC-0003"),
-    ("swathi", "VIC-0004"),
-    ("Roopsee", "VIC-0005"),
-    ("voter.notenrolled", "VIC-0006"),
-]
-
-OFFICIAL_USERNAME = "official.demo"
-
-# Stage 2 placeholders, stored as plain values: every demo account signs in with
-# this password and this 6-digit code. A later stage stores Argon2 password
-# hashes and encrypted authenticator (TOTP) secrets instead.
-DEMO_PASSWORD = "demo-password"
-DEMO_CODE = "123456"
-
-
-class VoterAccount(NamedTuple):
-    username: str
-    full_name: str
-    division: str
-    enrolled: bool
-
-
-def voter_accounts() -> list[VoterAccount]:
-    """Each voter account joined to its roll entry, in the order above. The tests use this too."""
-    roll = {lookup: (full_name, division, enrolled) for lookup, full_name, _, division, enrolled in ROLL}
-    return [VoterAccount(username, *roll[lookup]) for username, lookup in VOTERS]
+# The reviewer's roll entry. Fake test data, not a real person or address.
+REVIEWER_GIVEN_NAME = "Robin"
+REVIEWER_SURNAME = "Reviewer"
+REVIEWER_DATE_OF_BIRTH = "1990-01-01"
+REVIEWER_POSTCODE = "3000"
+REVIEWER_ADDRESS = "1 Example Street, Melbourne VIC 3000"
+REVIEWER_DIVISION = "Melbourne"
+REVIEWER_ENROLMENT_CODE = "RVWR-7K3M-Q9TX"
+# The code expires this long after the seed last ran
+CODE_VALID_DAYS = 365
 
 
 def seed(session: Session) -> bool:
-    """Adds the demo data and commits. Returns False, changing nothing, if it is already there."""
+    """Loads the data and commits. Returns False if the election data was already there."""
+    now = datetime.now(UTC)
+    added = seed_election(session, now)
+    seed_reviewer(session, now)
+    session.commit()
+    return added
+
+
+def seed_election(session: Session, now: datetime) -> bool:
     if session.scalar(select(Election).where(Election.name == ELECTION_NAME)) is not None:
         return False
 
-    now = datetime.now(UTC)
     election = Election(
         name=ELECTION_NAME,
         status=ElectionStatus.OPEN,
@@ -163,42 +145,57 @@ def seed(session: Session) -> bool:
                 },
             )
         )
-
-    roll = {
-        lookup: ElectoralRollEntry(
-            roll_lookup=lookup.encode(),
-            full_name_enc=full_name.encode(),
-            address_enc=address.encode(),
-            division_id=divisions[division_name].id,
-            enrolled=enrolled,
-        )
-        for lookup, full_name, address, division_name, enrolled in ROLL
-    }
-    session.add_all(roll.values())
-    session.flush()
-
-    for username, lookup in VOTERS:
-        session.add(
-            Account(
-                username=username,
-                password_hash=DEMO_PASSWORD,
-                role=AccountRole.VOTER,
-                roll_id=roll[lookup].id,
-                totp_secret_enc=DEMO_CODE.encode(),
-            )
-        )
-    session.add(
-        Account(
-            username=OFFICIAL_USERNAME,
-            password_hash=DEMO_PASSWORD,
-            role=AccountRole.ELECTION_OFFICIAL,
-            roll_id=None,
-            totp_secret_enc=DEMO_CODE.encode(),
-        )
-    )
-
-    session.commit()
     return True
+
+
+def seed_reviewer(session: Session, now: datetime) -> ElectoralRollEntry:
+    """Creates the reviewer's roll entry if it is missing, and refreshes the code's expiry."""
+    lookup = roll_lookup(REVIEWER_GIVEN_NAME, REVIEWER_SURNAME, REVIEWER_DATE_OF_BIRTH, REVIEWER_POSTCODE)
+    entry = session.scalar(select(ElectoralRollEntry).where(ElectoralRollEntry.roll_lookup == lookup))
+    if entry is None:
+        division = session.scalars(select(Division).where(Division.name == REVIEWER_DIVISION)).one()
+        entry = ElectoralRollEntry(
+            roll_lookup=lookup,
+            full_name_enc=encrypt(f"{REVIEWER_GIVEN_NAME} {REVIEWER_SURNAME}", "electoral_roll.full_name"),
+            address_enc=encrypt(REVIEWER_ADDRESS, "electoral_roll.address"),
+            date_of_birth_enc=encrypt(REVIEWER_DATE_OF_BIRTH, "electoral_roll.date_of_birth"),
+            postcode_enc=encrypt(REVIEWER_POSTCODE, "electoral_roll.postcode"),
+            division_id=division.id,
+            enrolled=True,
+            enrolment_code_hash=enrolment_code_hash(REVIEWER_ENROLMENT_CODE),
+        )
+        session.add(entry)
+    entry.code_expires_at = now + timedelta(days=CODE_VALID_DAYS)
+    session.flush()
+    return entry
+
+
+def reset_reviewer(session: Session) -> None:
+    """
+    Deletes the reviewer's account and restores their entry and code, so they
+    can register again. A ballot they already cast stays in the ballot box:
+    ballots are not linked to voters, so it cannot be found and removed.
+    """
+    now = datetime.now(UTC)
+    seed_election(session, now)
+    entry = seed_reviewer(session, now)
+
+    accounts = select(Account.id).where(Account.roll_id == entry.id)
+    for table in (AuthSession, LoginChallenge, VoterParticipation):
+        session.execute(
+            delete(table).where(table.account_id.in_(accounts)).execution_options(synchronize_session=False)
+        )
+    for statement in (
+        delete(Account).where(Account.roll_id == entry.id),
+        delete(RegistrationSession).where(RegistrationSession.roll_id == entry.id),
+    ):
+        session.execute(statement.execution_options(synchronize_session=False))
+
+    entry.registered_at = None
+    entry.code_attempts = 0
+    entry.enrolment_code_hash = enrolment_code_hash(REVIEWER_ENROLMENT_CODE)
+    entry.code_expires_at = now + timedelta(days=CODE_VALID_DAYS)
+    session.commit()
 
 
 def reset(session: Session) -> None:
@@ -209,32 +206,28 @@ def reset(session: Session) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Load the demo data.")
-    parser.add_argument(
-        "--reset", action="store_true", help="delete all data first, including votes cast"
-    )
+    parser = argparse.ArgumentParser(description="Load the seed data.")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--reset", action="store_true", help="delete all data first, including votes cast")
+    group.add_argument("--reset-reviewer", action="store_true", help="let the reviewer register again")
     args = parser.parse_args()
 
     with SessionLocal() as session:
+        if args.reset_reviewer:
+            reset_reviewer(session)
+            print("The reviewer's account is gone and their enrolment code works again.")
+            return
         if args.reset:
             reset(session)
             print("Deleted all data.")
         added = seed(session)
 
-    if not added:
-        print("Demo data is already present. Nothing changed. Add --reset to start again.")
-        return
-
-    candidates = sum(len(entries) for entries in CANDIDATES.values())
+    print("Added the election data." if added else "Election data already present. Nothing duplicated.")
     print(
-        f"Added 1 election, {len(DIVISIONS)} divisions, {candidates} candidates, "
-        f"{len(ROLL)} roll entries and {len(VOTERS) + 1} accounts."
+        f"Reviewer roll entry ready (fake test data): {REVIEWER_GIVEN_NAME} {REVIEWER_SURNAME}, "
+        f"born {REVIEWER_DATE_OF_BIRTH}, postcode {REVIEWER_POSTCODE}, enrolment code {REVIEWER_ENROLMENT_CODE}, "
+        f"valid for {CODE_VALID_DAYS} days."
     )
-    print(f"\nDemo sign in: password {DEMO_PASSWORD}, 6-digit code {DEMO_CODE}")
-    for voter in voter_accounts():
-        note = f"votes in {voter.division}" if voter.enrolled else "on the roll but not enrolled, cannot vote"
-        print(f"  {voter.username:<19}{note}")
-    print(f"  {OFFICIAL_USERNAME:<19}election official, cannot vote")
 
 
 if __name__ == "__main__":

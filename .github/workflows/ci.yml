@@ -67,6 +67,8 @@ jobs:
       POSTGRES_PASSWORD: ci-only-password
       POSTGRES_DB: evoting
       POSTGRES_TEST_DB: evoting_test
+      # Throwaway key that only ever protects this job's test database
+      SECRET_KEY: ci-only-secret-key-for-throwaway-test-data
     steps:
       - uses: actions/checkout@v4
 
@@ -79,7 +81,7 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Tests (migrations, seed, API, schema)
+      - name: Tests (migrations, seed, API, registration, schema)
         run: pytest
 
   # Added in later stages:

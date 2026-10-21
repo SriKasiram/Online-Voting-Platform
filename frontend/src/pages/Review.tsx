@@ -4,7 +4,7 @@ import BallotName from "../components/BallotName";
 import { ArrowLeftIcon } from "../components/Icons";
 import { ErrorAlert, Spinner } from "../components/Messages";
 import { checkRanking, type Ranking } from "../lib/ballotRules";
-import { useFocusOnMount } from "../lib/useFocusOnMount";
+import { useFocusOnMount } from "../lib/hooks";
 
 type Props = {
   ballot: BallotDefinition;

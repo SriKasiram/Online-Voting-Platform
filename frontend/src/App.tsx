@@ -1,5 +1,6 @@
 import { useCallback, useState } from "react";
 import {
+  ApiError,
   SESSION_MINUTES,
   extendSession,
   getBallot,
@@ -12,20 +13,38 @@ import type { BallotDefinition } from "./api/types";
 import Layout from "./components/Layout";
 import SessionWarning from "./components/SessionWarning";
 import type { Ranking } from "./lib/ballotRules";
-import { useSessionTimer } from "./lib/useSessionTimer";
+import { useSessionTimer } from "./lib/hooks";
 import Ballot from "./pages/Ballot";
 import Login from "./pages/Login";
 import Receipt, { type ReceiptDetails } from "./pages/Receipt";
+import Register from "./pages/Register";
 import Review from "./pages/Review";
 
-type Screen = "login" | "ballot" | "review" | "receipt";
+type Screen = "login" | "register" | "ballot" | "review" | "receipt";
 
-const STEP: Record<Screen, number> = { login: 0, ballot: 1, review: 2, receipt: 3 };
+const STEP: Record<Screen, number> = { login: 0, register: 0, ballot: 1, review: 2, receipt: 3 };
 
 /** The "Do you need more time?" box appears this many seconds before the session ends. */
 const WARN_SECONDS = 60;
 
 const SESSION_ENDED = "Your session ended, so you were signed out. Sign in again to vote.";
+const REGISTERED = "Registration complete. Sign in with your username, password and authenticator code.";
+
+/** Why a signed-in account was not given a ballot, in the voter's terms. */
+function noBallotMessage(error: unknown): string {
+  switch (error instanceof ApiError ? error.code : undefined) {
+    case "already_voted":
+      return "You have already voted in this election. Each voter can vote once.";
+    case "not_enrolled":
+      return "You are not enrolled to vote in this election. Ask a polling official for help.";
+    case "not_a_voter":
+      return "This account is for election officials and cannot vote.";
+    case "no_open_election":
+      return "No election is open for voting right now.";
+    default:
+      return "Your ballot could not be loaded. Sign in again, or ask a polling official for help.";
+  }
+}
 
 export default function App() {
   const [screen, setScreen] = useState<Screen>("login");
@@ -34,6 +53,8 @@ export default function App() {
   const [ranking, setRanking] = useState<Ranking>([]);
   const [receipt, setReceipt] = useState<ReceiptDetails | null>(null);
   const [notice, setNotice] = useState("");
+  // Changing this gives the sign-in form a fresh start, so nothing typed is left behind
+  const [loginKey, setLoginKey] = useState(0);
 
   // Clears everything held in the browser, so the next voter on a shared
   // terminal starts from a blank screen.
@@ -44,6 +65,7 @@ export default function App() {
     setRanking([]);
     setReceipt(null);
     setNotice(message);
+    setLoginKey((key) => key + 1);
     try {
       await logout();
     } catch {
@@ -51,9 +73,19 @@ export default function App() {
     }
   }, []);
 
-  const session = useSessionTimer(screen !== "login", SESSION_MINUTES, () => {
+  // Runs only while someone is signed in. Registration has its own 10-minute limit on the server.
+  const signedIn = screen === "ballot" || screen === "review" || screen === "receipt";
+  const session = useSessionTimer(signedIn, SESSION_MINUTES, () => {
     void signOut(SESSION_ENDED);
   });
+
+  // Leaving registration, finished or not, starts the sign-in form afresh.
+  // Everything typed into registration lived in the Register screen and goes with it.
+  function showLogin(message: string) {
+    setNotice(message);
+    setLoginKey((key) => key + 1);
+    setScreen("login");
+  }
 
   const ballotOpen = screen === "ballot" || screen === "review";
   const warningOpen = ballotOpen && session.secondsLeft > 0 && session.secondsLeft <= WARN_SECONDS;
@@ -68,8 +100,16 @@ export default function App() {
   }
 
   async function handleCode(code: string) {
+    // A wrong code throws here, and the sign-in form shows its usual message
     const { displayName } = await verifyCode(code);
-    const definition = await getBallot();
+    let definition: BallotDefinition;
+    try {
+      definition = await getBallot();
+    } catch (error) {
+      // Signed in, but this account gets no ballot. End the session and say why.
+      void signOut(noBallotMessage(error));
+      return;
+    }
     setNotice("");
     setVoterName(displayName);
     setBallot(definition);
@@ -79,7 +119,21 @@ export default function App() {
 
   async function handleSubmit(ballotToken: string, ranked: number[]) {
     if (!ballot) throw new Error("No ballot is open");
-    const { receiptId } = await submitBallot(ballotToken, ranked);
+    let receiptId: string;
+    try {
+      ({ receiptId } = await submitBallot(ballotToken, ranked));
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 401) {
+        void signOut(SESSION_ENDED);
+        return;
+      }
+      if (error instanceof ApiError && error.code === "already_voted") {
+        void signOut(noBallotMessage(error));
+        return;
+      }
+      // Anything else: the review screen offers to try again
+      throw error;
+    }
     setReceipt({
       receiptId,
       acceptedAt: new Date(),
@@ -99,7 +153,16 @@ export default function App() {
       sessionSecondsLeft={ballotOpen ? session.secondsLeft : null}
       onSignOut={() => void signOut("You have signed out.")}
     >
-      {screen === "login" && <Login notice={notice} onSubmitDetails={login} onSubmitCode={handleCode} />}
+      {screen === "login" && (
+        <Login
+          key={loginKey}
+          notice={notice}
+          onSubmitDetails={login}
+          onSubmitCode={handleCode}
+          onRegister={() => setScreen("register")}
+        />
+      )}
+      {screen === "register" && <Register onCancel={() => showLogin("")} onComplete={() => showLogin(REGISTERED)} />}
       {screen === "ballot" && ballot && (
         <Ballot
           ballot={ballot}

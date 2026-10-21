@@ -1,1 +1,0 @@
-"""Electronic voting prototype API."""

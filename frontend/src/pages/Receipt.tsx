@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { CopyIcon } from "../components/Icons";
-import { useFocusOnMount } from "../lib/useFocusOnMount";
+import { useFocusOnMount } from "../lib/hooks";
 
 export type ReceiptDetails = {
   receiptId: string;

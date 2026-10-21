@@ -1,20 +1,26 @@
 import react from "@vitejs/plugin-react";
+import { loadEnv } from "vite";
 import { defineConfig } from "vitest/config";
 
-// In real mode the React app and the API share one origin, so the dev server
-// forwards /api to the FastAPI backend. This avoids CORS and keeps cookies simple.
-export default defineConfig({
-  plugins: [react()],
-  server: {
-    port: 5173,
-    proxy: {
-      "/api": {
-        target: process.env.VITE_API_TARGET ?? "http://localhost:8000",
-        changeOrigin: false,
+// The React app and the API share one origin: the dev server forwards /api to
+// the FastAPI backend. This avoids CORS and keeps cookies simple.
+export default defineConfig(({ mode }) => {
+  // The config file does not see frontend/.env on its own, so load it here
+  const env = loadEnv(mode, process.cwd(), "VITE_");
+  return {
+    plugins: [react()],
+    server: {
+      port: 5173,
+      proxy: {
+        "/api": {
+          // 127.0.0.1 rather than localhost: on Windows, localhost can try IPv6 first and stall
+          target: env.VITE_API_TARGET || "http://127.0.0.1:8000",
+          changeOrigin: false,
+        },
       },
     },
-  },
-  test: {
-    environment: "node",
-  },
+    test: {
+      environment: "node",
+    },
+  };
 });

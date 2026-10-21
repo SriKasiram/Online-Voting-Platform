@@ -17,8 +17,17 @@ import {
   toggleCandidate,
   type Ranking,
 } from "../lib/ballotRules";
-import { boxes, fullName } from "../lib/names";
-import { useFocusOnMount } from "../lib/useFocusOnMount";
+import { useFocusOnMount } from "../lib/hooks";
+
+/** Everyday form, e.g. "Hana Ortega". The ballot paper itself uses BallotName. */
+function fullName(candidate: Candidate): string {
+  return `${candidate.givenName} ${candidate.surname}`;
+}
+
+/** "1 box" or "3 boxes". */
+function boxes(count: number): string {
+  return `${count} ${count === 1 ? "box" : "boxes"}`;
+}
 
 type Props = {
   ballot: BallotDefinition;
