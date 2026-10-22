@@ -1,3 +1,4 @@
+import { fileURLToPath } from "node:url";
 import react from "@vitejs/plugin-react";
 import { loadEnv } from "vite";
 import { defineConfig } from "vitest/config";
@@ -16,6 +17,15 @@ export default defineConfig(({ mode }) => {
           // 127.0.0.1 rather than localhost: on Windows, localhost can try IPv6 first and stall
           target: env.VITE_API_TARGET || "http://127.0.0.1:8000",
           changeOrigin: false,
+        },
+      },
+    },
+    // SR-06: two pages, the voter app and the staff sign-in page, so both are built
+    build: {
+      rollupOptions: {
+        input: {
+          main: fileURLToPath(new URL("index.html", import.meta.url)),
+          staff: fileURLToPath(new URL("staff.html", import.meta.url)),
         },
       },
     },

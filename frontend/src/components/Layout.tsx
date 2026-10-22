@@ -21,6 +21,8 @@ type Props = {
   sessionSecondsLeft: number | null;
   onSignOut: () => void;
   children: ReactNode;
+  // SR-06: false hides the voting steps, for the staff sign-in page. The voter app leaves it out.
+  steps?: boolean;
 };
 
 const STEPS = [
@@ -55,7 +57,7 @@ function BrandMark() {
   );
 }
 
-export default function Layout({ step, voterName, sessionSecondsLeft, onSignOut, children }: Props) {
+export default function Layout({ step, voterName, sessionSecondsLeft, onSignOut, children, steps = true }: Props) {
   const [textSize, setTextSize] = useState<TextSize>("md");
 
   useEffect(() => {
@@ -117,26 +119,29 @@ export default function Layout({ step, voterName, sessionSecondsLeft, onSignOut,
         </div>
       </header>
 
-      <nav className="wrap steps" aria-label="Voting steps">
-        <ol>
-          {STEPS.map((s, i) => {
-            const state = i < step ? "done" : i === step ? "current" : "todo";
-            return (
-              <li key={s.long} data-state={state} aria-current={i === step ? "step" : undefined}>
-                <span className="step-bar" />
-                <span className="step-label">
-                  <span className="step-num">{String(i + 1).padStart(2, "0")}</span>
-                  <span className="step-name">
-                    <span className="long">{s.long}</span>
-                    <span className="short">{s.short}</span>
+      {/* SR-06: shown only when steps is true (the voter app) */}
+      {steps && (
+        <nav className="wrap steps" aria-label="Voting steps">
+          <ol>
+            {STEPS.map((s, i) => {
+              const state = i < step ? "done" : i === step ? "current" : "todo";
+              return (
+                <li key={s.long} data-state={state} aria-current={i === step ? "step" : undefined}>
+                  <span className="step-bar" />
+                  <span className="step-label">
+                    <span className="step-num">{String(i + 1).padStart(2, "0")}</span>
+                    <span className="step-name">
+                      <span className="long">{s.long}</span>
+                      <span className="short">{s.short}</span>
+                    </span>
+                    {state === "done" && <span className="sr-only">, completed</span>}
                   </span>
-                  {state === "done" && <span className="sr-only">, completed</span>}
-                </span>
-              </li>
-            );
-          })}
-        </ol>
-      </nav>
+                </li>
+              );
+            })}
+          </ol>
+        </nav>
+      )}
 
       <main id="main" className="wrap">
         {children}

@@ -434,7 +434,7 @@ The database refuses any other role, an elector without a roll entry, and staff 
 - **Every route checked.** Each `/api/admin` route is declared through `AdminRouter`, which demands a permission and attaches the check.
 - **Deny by default.** The API refuses to start if any `/api/admin` route lacks a mapped permission, including one inside an included router. There is no setting to skip this.
 - **Denied requests** get `403 {"detail": "forbidden"}` and an `AUTHZ_DENIED` audit entry naming the account and the permission. A caller with no valid session gets the usual `401`, which is not audited.
-- **The voting routes** (`/api/ballot`, `/api/ballot/submit`) accept electors only, so staff get `403 forbidden`. Every role can use `/api/auth/extend` and `/api/auth/logout`.
+- **The voting routes** (`/api/ballot`, `/api/ballot/submit`) accept electors only, so staff get `403 forbidden`. Every role can use `/api/auth/logout`. `/api/auth/extend` works for electors; staff sessions cannot be extended (SR-06).
 
 **Create a staff account**, inside `backend/` with the virtual environment active:
 
@@ -454,7 +454,7 @@ No API endpoint creates staff, and the seed creates none.
 **Try the admin routes:**
 1. Set `COOKIE_SECURE=false` in `backend/.env` for local `http://`.
 2. Open http://127.0.0.1:8000/docs.
-3. Sign in with `POST /api/auth/login` (username and password), then `POST /api/auth/verify` (the 6-digit code from the authenticator app). In this prototype staff use a TOTP code like electors.
+3. Sign in with `POST /api/auth/login` (username and password), then `POST /api/auth/verify` (the 6-digit code from the authenticator app). In this prototype staff use a TOTP code like electors. The staff sign-in page (SR-06) does the same.
 4. Call the `/api/admin` routes from the same page; the browser keeps the session cookie. With curl, keep the cookie in a file:
 
 ```
@@ -478,8 +478,47 @@ Design only, not implemented:
 - Admin screens. Staff use the API directly.
 - An access review before each election and after any staff change.
 - Separation of privileged services, and least-privilege database roles.
-- Phishing-resistant staff sign in (SR-06). Staff use a password and TOTP for now.
+- Phishing-resistant passkeys (WebAuthn) for staff. SR-06 requires a password and a TOTP code for every staff sign in, but TOTP is not phishing-resistant, and passkeys remain design only.
 - Known gap: every `AUTHZ_DENIED` writes an audit row, so a flood of denied requests also floods the log.
+
+## SR-06: multi-factor sign-in for privileged users
+
+Every privileged user (any role except `elector`) signs in with two factors: a password and a 6-digit time-based code (TOTP) from an authenticator app. The admin routes accept only a session that passed both steps; after the password alone they answer `401`. Every SR-01 rule applies to staff exactly as to electors: the generic failure, one use per code, the lockout after 5 failures and the per-IP limit.
+
+| | Electors | Staff |
+|---|---|---|
+| Sign in | Password, then TOTP code | Password, then TOTP code |
+| Session | 10 minutes, extendable twice (SR-04) | 10 minutes, fixed, cannot be extended (`/api/auth/extend` answers `409 extension_limit`) |
+| `/api/auth/verify` answers | `{"display_name": ...}` (unchanged) | `{"role": ...}` |
+| Audit on success | `auth_login_success` | `auth_login_success` and `AUTH_PRIVILEGED_LOGIN_SUCCESS` |
+
+Every account must have a TOTP secret: `accounts.totp_secret_enc` is `NOT NULL`, and `scripts/create_staff.py` always creates one.
+
+**To sign in as staff:**
+
+1. Create the account, inside `backend/` with the virtual environment active:
+   ```
+   python -m scripts.create_staff --username official.one --role polling_official
+   ```
+2. Add the setup link or key it prints, shown only once, to an authenticator app.
+3. With the backend and the frontend dev server running, open http://localhost:5173/staff.html. This page is separate from the voter app.
+4. Enter the username and password, then the 6-digit code. The page shows your role and when the session ends, and signs you out after 10 minutes. It does not call any admin route.
+5. Use the admin routes from the API docs page (http://localhost:8000/docs) or curl (see SR-05). The session cookie also works on `localhost:8000`, because cookies are shared across ports of the same host. Set `COOKIE_SECURE=false` in `backend/.env` for local `http://`.
+
+Run the SR-06 tests, inside `backend/` with PostgreSQL running:
+
+```
+pytest tests/test_sr06_privileged_mfa.py -v
+```
+
+**TOTP is not phishing-resistant.** A fake sign-in page can capture a password and a code and use them within the same 30 seconds.
+
+Design only, not implemented:
+- Phishing-resistant passkeys (WebAuthn) for privileged users.
+- Re-authentication before each sensitive function.
+- A sealed break-glass account, with alerting and a review within 24 hours of any use.
+- A two-credential policy for privileged users.
+- Alerting on privileged sign ins and failures.
 
 ## Folder layout
 

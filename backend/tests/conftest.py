@@ -23,7 +23,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from fastapi.testclient import TestClient
 from httpx2 import Response
-from sqlalchemy import Connection, Engine, create_engine, text
+from sqlalchemy import Connection, Engine, create_engine, select, text
 from sqlalchemy.orm import Session
 
 from app import deps, security
@@ -41,6 +41,7 @@ from app.security import (
     roll_lookup,
     utc_now,
 )
+from scripts.create_staff import create_staff
 from scripts.sign_roll import sign_record
 
 # SR-02: a fixed polling date, so no test depends on today's date
@@ -336,6 +337,24 @@ def make_voter(db_session: Session, make_person: Callable[..., Person]) -> Calla
         )
         db_session.commit()
         return voter
+
+    return make
+
+
+@pytest.fixture
+def make_staff(db_session: Session) -> Callable[[str], RegisteredVoter]:
+    """
+    SR-05: a staff account, made by the create_staff script's own function.
+    SR-06: moved here from test_sr05_access_control.py so the SR-06 tests share it.
+    """
+    counter = itertools.count(1)
+
+    def make(role: str) -> RegisteredVoter:
+        n = next(counter)
+        username, password = f"{role}.{n}", f"staff password number {n}"
+        _, secret = create_staff(db_session, username, role, password)
+        account_id = db_session.scalars(select(Account.id).where(Account.username == username)).one()
+        return RegisteredVoter(username, password, secret, full_name=username, division="", account_id=account_id)
 
     return make
 

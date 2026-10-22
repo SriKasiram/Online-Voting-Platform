@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.deps import DbSession
 from app.models import Account, AccountRole, AuthSession, ElectoralRollEntry, SessionStage
-from app.schemas import LoginIn, VerifyIn, VerifyOut
+from app.schemas import LoginIn, StaffVerifyOut, VerifyIn, VerifyOut
 from app.security import (
     SESSION_COOKIE,
     SESSION_PATH,
@@ -101,9 +101,12 @@ def record_failure(db: Session, account_id: UUID, event_type: str) -> None:
     db.commit()
 
 
-def start_session(db: Session, response: Response, account_id: UUID, stage: SessionStage, minutes: int) -> None:
+def start_session(
+    db: Session, response: Response, account_id: UUID, stage: SessionStage, minutes: int, extensions: int = 0
+) -> None:
     # SR-01: a new random token for each stage, stored only as its SHA-256. The cookie has
     # no Max-Age: expires_at on the server decides when the session ends.
+    # SR-06: `extensions` lets a privileged session start with none left (see verify)
     token = new_token()
     db.add(
         AuthSession(
@@ -111,6 +114,7 @@ def start_session(db: Session, response: Response, account_id: UUID, stage: Sess
             account_id=account_id,
             stage=stage,
             expires_at=utc_now() + timedelta(minutes=minutes),
+            extensions=extensions,
         )
     )
     db.commit()
@@ -139,8 +143,12 @@ def login(body: LoginIn, request: Request, response: Response, db: DbSession) ->
 
 
 @router.post("/verify")
-def verify(body: VerifyIn, request: Request, response: Response, db: DbSession) -> VerifyOut:
-    """Part 2. SR-01: a correct, unused code swaps the pending session for a new signed-in one."""
+def verify(body: VerifyIn, request: Request, response: Response, db: DbSession) -> VerifyOut | StaffVerifyOut:
+    """
+    Part 2. SR-01: a correct, unused code swaps the pending session for a new signed-in one.
+    SR-06: privileged accounts (every role but elector) go through exactly the same
+    password and code steps; their session then cannot be extended.
+    """
     check_ip_limit(request, db)
     now = utc_now()
     token = request.cookies.get(SESSION_COOKIE)
@@ -151,6 +159,9 @@ def verify(body: VerifyIn, request: Request, response: Response, db: DbSession) 
         raise rejected()
     account = db.get_one(Account, pending.account_id)
     account_id = account.id
+    # SR-06: read now, while the account row is loaded
+    role = account.role
+    privileged = role != AccountRole.ELECTOR
 
     secret = decrypt_or_none(account.totp_secret_enc, "accounts.totp_secret")
     step = totp_matching_step(secret, body.otp_code, now) if secret else None
@@ -183,7 +194,21 @@ def verify(body: VerifyIn, request: Request, response: Response, db: DbSession) 
         raise rejected()
 
     log(db, "auth_login_success", account_id)
-    start_session(db, response, account_id, SessionStage.AUTHENTICATED, settings.session_minutes)
+    if privileged:
+        # SR-06: an extra event, so privileged sign ins are easy to review
+        log(db, "AUTH_PRIVILEGED_LOGIN_SUCCESS", account_id)
+    # SR-06: a privileged session starts with its extensions used up: 10 minutes, fixed, then sign in again
+    start_session(
+        db,
+        response,
+        account_id,
+        SessionStage.AUTHENTICATED,
+        settings.session_minutes,
+        extensions=settings.max_session_extensions if privileged else 0,
+    )
+    if privileged:
+        # SR-06: staff get their role; electors keep getting exactly what they did before
+        return StaffVerifyOut(role=role)
     return VerifyOut(display_name=display_name(db, account))
 
 
