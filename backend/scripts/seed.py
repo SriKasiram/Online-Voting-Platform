@@ -17,6 +17,10 @@ Run from the backend folder, with the virtual environment active:
 
 SR-02: every run ends by signing the roll (scripts/sign_roll.py), creating
 development keys in backend/keys/ the first time.
+
+SR-07: the election's ballot papers are version 1 of a ballot definition,
+signed by two development delegates (scripts/ballot_definition.py). --reset
+clears definitions with everything else.
 """
 
 import argparse
@@ -25,11 +29,11 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import delete, select, text
 from sqlalchemy.orm import Session
 
+from app.ballot_definitions import active_definition
 from app.db import Base, SessionLocal
 from app.models import (
     Account,
     AuthSession,
-    BallotDefinition,
     Candidate,
     Division,
     Election,
@@ -39,6 +43,7 @@ from app.models import (
 )
 from app.participation import reset_issued
 from app.security import encrypt, enrolment_code_hash, roll_lookup
+from scripts.ballot_definition import build_payload, ensure_delegate_keys, sign, store_active
 from scripts.sign_roll import load_or_create_private_key, sign_all
 
 ELECTION_NAME = "House of Representatives"
@@ -93,6 +98,8 @@ def seed(session: Session) -> bool:
     now = datetime.now(UTC)
     added = seed_election(session, now)
     seed_reviewer(session, now)
+    # SR-07: also gives an election seeded before SR-07 its signed definition
+    seed_definition(session)
     session.commit()
     return added
 
@@ -101,13 +108,15 @@ def seed_election(session: Session, now: datetime) -> bool:
     if session.scalar(select(Election).where(Election.name == ELECTION_NAME)) is not None:
         return False
 
+    # SR-07: polls opened an hour ago and close in about a year. starts_at and ends_at are the
+    # times polls open and close.
     election = Election(
         name=ELECTION_NAME,
         status=ElectionStatus.OPEN,
-        starts_at=now - timedelta(days=1),
-        ends_at=now + timedelta(days=30),
+        starts_at=now - timedelta(hours=1),
+        ends_at=now + timedelta(days=365),
         # SR-02: polling day is the last day of voting
-        polling_date=(now + timedelta(days=30)).date(),
+        polling_date=(now + timedelta(days=365)).date(),
     )
     divisions = {name: Division(name=name, state=state) for name, state in DIVISIONS.items()}
     session.add(election)
@@ -128,31 +137,27 @@ def seed_election(session: Session, now: datetime) -> bool:
             for position, (given_name, surname, party) in enumerate(entries, start=1)
         ]
         session.add_all(candidates)
-        session.flush()
+    # SR-07: the old unsigned per-division ballot_definitions rows are gone; seed_definition signs them all
+    session.flush()
+    return True
 
-        session.add(
-            BallotDefinition(
-                election_id=election.id,
-                division_id=division.id,
-                definition={
-                    "election_id": str(election.id),
-                    "election_name": ELECTION_NAME,
-                    "division_id": division.id,
-                    "division_name": division_name,
-                    "state_name": division.state,
-                    "candidates": [
-                        {
-                            "id": c.id,
-                            "ballot_position": c.ballot_position,
-                            "given_name": c.given_name,
-                            "surname": c.surname,
-                            "party": c.party,
-                        }
-                        for c in candidates
-                    ],
-                },
-            )
-        )
+
+def seed_definition(session: Session) -> bool:
+    """
+    SR-07: signs version 1 of the seeded election's ballot definition with
+    delegate_a and delegate_b and stores it as active, if it has none.
+
+    Seed fixture data, written directly: the activation script would refuse,
+    because the 24-hour rule applies to it and the demo election must already be
+    open. activated_at is therefore set to polls open minus 25 hours.
+    """
+    election = session.scalars(select(Election).where(Election.name == ELECTION_NAME)).one()
+    if active_definition(session, election.id) is not None:
+        return False
+    keys = ensure_delegate_keys()
+    activated_at = election.starts_at - timedelta(hours=25)
+    payload = build_payload(session, election, valid_from=activated_at, valid_until=election.ends_at)
+    store_active(session, election.id, payload, [sign(keys[d], payload) for d in ("delegate_a", "delegate_b")], activated_at)
     return True
 
 

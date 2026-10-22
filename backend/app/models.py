@@ -17,8 +17,8 @@ reference or time.
 Protected columns (helpers in app/security.py): *_enc columns are AES-GCM
 encrypted, password_hash is Argon2id, roll_lookup and enrolment_code_hash are
 keyed hashes, and the token *_hash columns hold SHA-256 hashes of the cookie
-values. Still placeholders: ballots.ciphertext holds plain JSON, and
-ballot_definitions.signature is empty.
+values. Still a placeholder: ballots.ciphertext holds plain JSON.
+SR-07: ballot_definitions hold payloads signed by two delegates (app/ballot_definitions.py).
 """
 
 import enum
@@ -26,8 +26,8 @@ import uuid
 from datetime import date, datetime
 from typing import Any
 
-from sqlalchemy import BigInteger, CheckConstraint, Enum, ForeignKey, UniqueConstraint, func, text
-from sqlalchemy.dialects.postgresql import CITEXT
+from sqlalchemy import BigInteger, CheckConstraint, Enum, ForeignKey, Index, UniqueConstraint, false, func, text
+from sqlalchemy.dialects.postgresql import CITEXT, JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db import Base
@@ -84,16 +84,28 @@ class Candidate(Base):
 
 
 class BallotDefinition(Base):
-    """The ballot paper for one division. A later stage signs it so voters can trust it."""
+    """
+    SR-07: one signed version of an election's ballot papers, for every division.
+    A change is always a new version: the app never updates or deletes a stored
+    payload or its signatures. Only is_active moves to the newest version.
+    """
 
     __tablename__ = "ballot_definitions"
-    __table_args__ = (UniqueConstraint("election_id", "division_id"),)
+    __table_args__ = (
+        UniqueConstraint("election_id", "version"),
+        # Only one active version per election
+        Index("uq_ballot_definitions_one_active", "election_id", unique=True, postgresql_where=text("is_active")),
+    )
 
     id: Mapped[uuid.UUID] = uuid_pk()
     election_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("elections.id"))
-    division_id: Mapped[int] = mapped_column(ForeignKey("divisions.id"))
-    definition: Mapped[dict[str, Any]]
-    signature: Mapped[bytes | None]
+    version: Mapped[int]
+    # The exact canonical JSON that was signed. Verified as stored, never re-serialised.
+    payload: Mapped[str]
+    # [{"key_id": ..., "signature": base64}, ...]
+    signatures: Mapped[list[dict[str, str]]] = mapped_column(JSONB)
+    is_active: Mapped[bool] = mapped_column(default=False, server_default=false())
+    activated_at: Mapped[datetime]
 
 
 # ---------------------------------------------------------------

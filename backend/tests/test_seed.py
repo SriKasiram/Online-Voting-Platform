@@ -59,7 +59,7 @@ def test_seed_is_idempotent(db_session: Session) -> None:
         "elections": 1,
         "divisions": 3,
         "candidates": 15,
-        "ballot_definitions": 3,
+        "ballot_definitions": 1,  # SR-07: one signed version for the whole election, not one row per division
         "electoral_roll": 1,
         "accounts": 0,
     }

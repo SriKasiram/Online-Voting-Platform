@@ -59,6 +59,14 @@ class Settings(BaseSettings):
     # SR-03: a ballot token must be used within this many minutes of being issued
     ballot_token_minutes: int = 10
 
+    # SR-07: public keys of the ballot definition delegates, as {key_id: {delegate, public_key}}.
+    # The app reads only this file; the delegates' private keys never belong on the API server.
+    delegate_keyring_path: Path = BACKEND_DIR / "keys" / "delegates" / "keyring.json"
+    # SR-07: distinct delegates who must sign a ballot definition
+    required_delegate_approvals: int = 2
+    # SR-07: a definition must be activated at least this long before polls open
+    min_activation_lead_hours: int = 24
+
     def database_url(self, database: str | None = None) -> URL:
         """Connection URL for the app database, or for another database on the same server."""
         return URL.create(
