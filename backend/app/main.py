@@ -1,9 +1,9 @@
 """FastAPI application. Every route lives under /api, matching the frontend's dev proxy."""
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, Response
 from sqlalchemy import select
 
 from app.ballot_definitions import check_definitions_at_startup
@@ -31,6 +31,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(title="Electronic voting prototype API", version="0.1.0", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def no_store(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
+    # SR-09: no browser or proxy may keep a copy of any API response (ballots, receipts, errors).
+    # Runs outside FastAPI's exception handlers, so 401, 404, 422, 429, 503 and redirects get it too.
+    response = await call_next(request)
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    return response
+
 
 app.include_router(auth.router, prefix="/api")
 app.include_router(ballot.router, prefix="/api")

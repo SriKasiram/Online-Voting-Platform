@@ -3,6 +3,9 @@ import react from "@vitejs/plugin-react";
 import { loadEnv } from "vite";
 import { defineConfig } from "vitest/config";
 
+// SR-09: the browser keeps no copy of the app's pages and files (the API sends the same header)
+const noStore = { "Cache-Control": "no-store" };
+
 // The React app and the API share one origin: the dev server forwards /api to
 // the FastAPI backend. This avoids CORS and keeps cookies simple.
 export default defineConfig(({ mode }) => {
@@ -12,6 +15,7 @@ export default defineConfig(({ mode }) => {
     plugins: [react()],
     server: {
       port: 5173,
+      headers: noStore, // SR-09
       proxy: {
         "/api": {
           // 127.0.0.1 rather than localhost: on Windows, localhost can try IPv6 first and stall
@@ -19,6 +23,10 @@ export default defineConfig(({ mode }) => {
           changeOrigin: false,
         },
       },
+    },
+    // SR-09: `vite preview` serves the built app with the same header
+    preview: {
+      headers: noStore,
     },
     // SR-06: two pages, the voter app and the staff sign-in page, so both are built
     build: {

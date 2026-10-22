@@ -117,10 +117,12 @@ export default function Review({ ballot, ranking, onBack, onSubmit }: Props) {
           </dl>
 
           <label className="check" htmlFor="confirm-final">
+            {/* SR-09: autoComplete off, so the browser does not restore the tick */}
             <input
               ref={confirmBox}
               id="confirm-final"
               type="checkbox"
+              autoComplete="off"
               checked={confirmed}
               disabled={busy}
               onChange={(e) => {

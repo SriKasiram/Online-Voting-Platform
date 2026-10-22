@@ -1,4 +1,5 @@
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
+import { flushSync } from "react-dom";
 import {
   ApiError,
   SESSION_MINUTES,
@@ -13,6 +14,8 @@ import type { BallotDefinition } from "./api/types";
 import Layout from "./components/Layout";
 import SessionWarning from "./components/SessionWarning";
 import type { Ranking } from "./lib/ballotRules";
+// SR-09: one place that clears the ballot, and the pagehide/pageshow handling
+import { acceptBallot, clearBallotState, endSession, registerPageLifecycle, sessionLost } from "./lib/clientSession";
 import { useSessionTimer } from "./lib/hooks";
 import Ballot from "./pages/Ballot";
 import Login from "./pages/Login";
@@ -59,23 +62,28 @@ export default function App() {
   // "acknowledged" once the voter has closed that warning
   const [extension, setExtension] = useState<"allowed" | "refused" | "acknowledged">("allowed");
 
+  // SR-09: the ballot paper, its token and the ranking, cleared only through clearBallotState
+  const clearBallot = useCallback(() => clearBallotState({ setBallot, setRanking }), []);
+
   // Clears everything held in the browser, so the next voter on a shared
   // terminal starts from a blank screen.
-  const signOut = useCallback(async (message = "") => {
-    setScreen("login");
-    setVoterName(null);
-    setBallot(null);
-    setRanking([]);
-    setReceipt(null);
-    setNotice(message);
-    setLoginKey((key) => key + 1);
-    setExtension("allowed"); // SR-04: the next sign in starts with its extensions unused
-    try {
-      await logout();
-    } catch {
-      // The server session also expires on its own
-    }
-  }, []);
+  const signOut = useCallback(
+    async (message = "") => {
+      setScreen("login");
+      setVoterName(null);
+      setReceipt(null);
+      setNotice(message);
+      setLoginKey((key) => key + 1);
+      setExtension("allowed"); // SR-04: the next sign in starts with its extensions unused
+      // SR-09: the voter, the session timer and a lost session (401) all sign out here
+      await endSession(clearBallot, logout);
+    },
+    [clearBallot],
+  );
+
+  // SR-09: pagehide clears the ballot at once (the browser may freeze the page straight after),
+  // and a page restored from the back/forward cache reloads. Removed when the app unmounts.
+  useEffect(() => registerPageLifecycle(window, () => flushSync(clearBallot)), [clearBallot]);
 
   // Runs only while someone is signed in. Registration has its own 10-minute limit on the server.
   const signedIn = screen === "ballot" || screen === "review" || screen === "receipt";
@@ -140,7 +148,8 @@ export default function App() {
     try {
       ({ receiptId } = await submitBallot(ballotToken, ranked));
     } catch (error) {
-      if (error instanceof ApiError && error.status === 401) {
+      // SR-09: session lost: signing out clears the ballot
+      if (sessionLost(error)) {
         void signOut(SESSION_ENDED);
         return;
       }
@@ -151,15 +160,8 @@ export default function App() {
       // Anything else: the review screen offers to try again
       throw error;
     }
-    setReceipt({
-      receiptId,
-      acceptedAt: new Date(),
-      electionName: ballot.electionName,
-      divisionName: ballot.divisionName,
-    });
-    // Selections are dropped as soon as the ballot is accepted
-    setBallot(null);
-    setRanking([]);
+    // SR-09: selections are cleared as soon as the ballot is accepted, and the receipt holds none
+    setReceipt(acceptBallot(receiptId, ballot, { setBallot, setRanking }));
     setScreen("receipt");
   }
 

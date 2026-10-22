@@ -220,7 +220,7 @@ Never commit a real `.env` file. Only `.env.example` belongs in Git.
 ## Frontend security notes
 
 - The browser never decides anything that matters. The rules in `src/lib/ballotRules.ts` and `src/lib/registerRules.ts` only give quick feedback, and the server repeats every check.
-- Nothing is stored in `localStorage` or `sessionStorage`. The ballot token, selections and registration details live in memory and are cleared on submit, sign out, session timeout and leaving the register screen.
+- Nothing is stored in `localStorage` or `sessionStorage`. The ballot token, selections and registration details live in memory and are cleared on submit, sign out, session timeout and leaving the register screen. SR-09 adds a lost session and leaving the page, and a test that enforces it (see [SR-09](#sr-09-client-side-data-handling)).
 - Sign in and registration step 1 each show one generic message for every failure, so the screen never reveals which detail was wrong, or who is on the roll.
 - Passwords are cleared from the page as soon as they are sent. The authenticator secret and QR code exist only while step 3 is on screen.
 - The session timer counts down from sign in. Ordinary activity does not reset it. Only the voter choosing Keep voting in the warning calls `POST /api/auth/extend`, and only that call extends the server session. The timer restarts only once the server agrees. After the second extension the warning says no more time is available, and the session ends on time (SR-04).
@@ -630,11 +630,67 @@ Design only, not implemented:
 - **The one-blank-box savings provision.** Under the House rules, a ballot with every box but one numbered consecutively is formal, and the blank box counts as the last preference.
 - **Accepting an informal ballot.** This would come with a warning and one explicit confirmation, store the ballot as informal and count it in the informal total. Real informal ballots are votes: they are handed in and counted as informal.
 
+## SR-09: client-side data handling
+
+The elector's selections exist only in the browser tab's memory, and only while a ballot is open. When the session ends, nothing about the ballot is left in the browser.
+
+**Review before every submission.** This was already in place, so SR-09 did not change it:
+- **Submit only from Review.** Ballots are submitted only from the Review screen. It lists every candidate with their preference number and has no submit button for an incomplete ballot. **Submit ballot** works only after the voter ticks "I have checked my numbers".
+- **Change keeps the numbers.** **Change ballot** goes back to the ballot paper with the numbers kept.
+- **The receipt shows no selections.** It shows the receipt code, the time accepted, the election and the division.
+
+**Memory only.**
+- **React state only.** The ballot paper, its one-time ballot token and the ranking are React state in `App.tsx`.
+- **No browser storage.** Nothing about the ballot is written to `localStorage`, `sessionStorage`, IndexedDB, cookies, the URL or the history state. The app never adds a history entry.
+- **No form values kept.** The ballot paper has no form fields, and the confirm box has `autocomplete="off"`, so the browser keeps no form values.
+- **Enforced by a test.** The project has no ESLint, so a test enforces the rule. `src/lib/noBrowserStorage.test.ts` scans every source file under `frontend/src`, except tests. It fails `npm test`, and so CI, if any file uses `localStorage`, `sessionStorage`, `indexedDB` or `document.cookie`.
+
+**Where the ballot is cleared.** `clearBallotState` in `src/lib/clientSession.ts` is the only code that clears it:
+
+| When | How |
+|---|---|
+| The ballot is accepted | `acceptBallot` clears it before the receipt shows |
+| Sign out: top bar, the session warning, the receipt screen and its 60-second timer | `signOut`, then `endSession`: cleared first, then `POST /api/auth/logout`. A failed logout still leaves it cleared |
+| The session timer runs out | The timer calls `signOut` |
+| The session is lost: a 401 when submitting, or any failure to extend the session or load the ballot | `signOut` |
+| The page is left (`pagehide`) | Cleared at once |
+
+Ballot and Review render only while a ballot is open, so their own state goes with it: the undo history, the screen reader announcements, the confirm tick and messages. Closing the tab discards all of it anyway.
+
+**Back/forward cache.** A browser can keep a whole page, memory included, and show it again on Back or Forward. `registerPageLifecycle` clears the ballot on `pagehide`. When `pageshow` reports a page restored from that cache (`event.persisted`), it reloads the page, so the app starts again at sign in. `App.tsx` removes both listeners when it unmounts.
+
+**No caching.**
+- **The API.** One middleware in `app/main.py` adds `Cache-Control: no-store` and `Pragma: no-cache` to every API response. That includes errors from routes, dependencies and FastAPI's own handlers (401, 404, 422, 429, 503) and redirects.
+- **The dev and preview servers.** `npm run dev` and `npm run preview` send `Cache-Control: no-store` for the app's pages and files (`vite.config.ts`).
+
+**Inspection.** After a sign-out, a timeout and a submission, the team inspects the browser by hand in Chrome DevTools, following [docs/SR-09_INSPECTION.md](docs/SR-09_INSPECTION.md). Screenshots go in `docs/sr09-evidence/`.
+
+Run the SR-09 tests. The backend tests run inside `backend/` with PostgreSQL running:
+
+```
+pytest tests/test_sr09_cache_headers.py -v
+```
+
+The frontend tests run inside `frontend/`:
+
+```
+npx vitest run src/lib/clientSession.test.ts src/lib/noBrowserStorage.test.ts
+```
+
+Limits:
+- **Unhandled errors.** A response for an unhandled server error (500) comes from Starlette's outermost error handler, outside the middleware, so it does not get the two headers. It contains only `Internal Server Error`.
+- **The server session after closing a tab.** Leaving or closing the tab clears the ballot but does not end the server session. That session still ends at its fixed time (SR-04), and the next page load starts at sign in.
+- **Production hosting.** The `no-store` header for the app's own files is set only by the Vite dev and preview servers. A production web server would need the same setting.
+
+Design only, not implemented:
+- **A `Clear-Site-Data` header on sign out.** This would tell the browser to drop the site's storage, cache and cookies.
+- **An automated browser-based inspection test.** This would drive a real browser through sign-out, timeout and submission, then check storage, the page and the Back button. The checks are done by hand for now (above).
+
 ## Folder layout
 
 ```
 backend/             FastAPI app, Alembic migrations, seed script and tests
 frontend/            React app
-docs/                MANUAL.md (files and how to run the app); requirements and design notes later
+docs/                MANUAL.md (files and how to run the app), SR-09_INSPECTION.md and sr09-evidence/ (SR-09)
 docker-compose.yml   PostgreSQL 16 for local development
 ```
