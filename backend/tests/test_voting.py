@@ -122,11 +122,12 @@ def test_ballot_needs_a_signed_in_voter(client: TestClient) -> None:
 
 @pytest.mark.parametrize(
     ("kind", "reason"),
-    [({"enrolled": False}, "not_enrolled"), ({"official": True}, "not_a_voter")],
+    [({"enrolled": False}, "not_enrolled"), ({"official": True}, "forbidden")],
 )
 def test_accounts_that_cannot_vote_get_no_ballot(
     client: TestClient, election, make_voter, sign_in, kind: dict, reason: str
 ) -> None:
+    """SR-05: a staff account now gets "forbidden" (it was "not_a_voter")."""
     sign_in(make_voter(**kind))
 
     response = client.get("/api/ballot")

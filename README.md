@@ -150,10 +150,15 @@ After 5 wrong enrolment codes the entry is locked, and the same reset unlocks it
 | `POST /api/auth/logout` | Ends the session |
 | `GET /api/ballot` | The voter's ballot paper and a single-use ballot token, once per election (SR-03) |
 | `POST /api/ballot/submit` | Accepts the ranked ballot once and returns a receipt code. The same token again returns the same receipt (SR-03) |
+| `GET /api/admin/turnout` | Staff (SR-05): electors issued a ballot and electors who voted, per division and in total. Permission `turnout:read` |
+| `POST /api/admin/electors/{roll_id}/reset` | Staff (SR-05): clears an elector's issued ballot, never a vote. Permission `elector:reset` |
+| `GET /api/admin/audit-log` | Staff (SR-05): audit entries in order, `limit` (at most 200) and `offset`. Permission `audit:read` |
+| `GET /api/admin/audit-log/verify` | Staff (SR-05): recomputes the audit hash chain. Permission `audit:verify` |
 
 Errors come back as `{"detail": "<reason>"}`:
 
-- Sign in and voting: `invalid_credentials` and `not_signed_in` (401), `too_many_requests` (429), `not_a_voter` and `not_enrolled` (403), `no_open_election` (404), `already_voted` and `extension_limit` (409), `invalid_ballot` and `ballot_expired` (400).
+- Sign in and voting: `invalid_credentials` and `not_signed_in` (401), `too_many_requests` (429), `forbidden` (staff, SR-05) and `not_enrolled` (403), `no_open_election` (404), `already_voted` and `extension_limit` (409), `invalid_ballot` and `ballot_expired` (400).
+- Admin (SR-05): `not_signed_in` (401), `forbidden` (403), `not_found` (404), `already_voted` (409).
 - Registration: `registration_failed`, `username_invalid`, `password_too_short`, `password_is_username`, `wrong_code` and `too_many_attempts` (400), `registration_session_invalid` (401), `username_taken` and `already_registered` (409).
 
 ## Checks
@@ -401,6 +406,80 @@ pytest tests/test_sr04_sessions.py -v
 ```
 
 Design only, not implemented: binding a session to the client's IP address or device. A copied cookie works from anywhere until the session ends, which the fixed 10-minute expiry and the 30-minute cap limit.
+
+## SR-05: role-based access control
+
+Every account has one role, stored in `accounts.role`. On every administrative request the server reads the role from the database, never from the cookie or the session, and checks it against one permission map in `app/rbac.py`.
+
+| Role | Status | Permissions |
+|---|---|---|
+| `elector` | Implemented. Created only by registration, always with a roll entry | none (the voting routes) |
+| `polling_official` | Implemented. Created by `scripts/create_staff.py`, no roll entry | `turnout:read`, `elector:reset` |
+| `auditor` | Implemented. Created by `scripts/create_staff.py`, no roll entry | `audit:read`, `audit:verify`, `turnout:read` |
+| `returning_officer` | Design only | Dual control for ballot-definition activation, roll replacement and result release |
+| `system_administrator` | Design only | Running the platform, with no access to votes or the roll |
+
+The database refuses any other role, an elector without a roll entry, and staff with one.
+
+**Access matrix** (`tests/test_sr05_access_control.py` checks every cell):
+
+| Caller | turnout | reset | audit-log | verify |
+|---|---|---|---|---|
+| No session, or only the password step done | 401 | 401 | 401 | 401 |
+| elector | 403 | 403 | 403 | 403 |
+| polling_official | 200 | 200 | 403 | 403 |
+| auditor | 200 | 403 | 200 | 200 |
+
+**How the checks work:**
+- **Every route checked.** Each `/api/admin` route is declared through `AdminRouter`, which demands a permission and attaches the check.
+- **Deny by default.** The API refuses to start if any `/api/admin` route lacks a mapped permission, including one inside an included router. There is no setting to skip this.
+- **Denied requests** get `403 {"detail": "forbidden"}` and an `AUTHZ_DENIED` audit entry naming the account and the permission. A caller with no valid session gets the usual `401`, which is not audited.
+- **The voting routes** (`/api/ballot`, `/api/ballot/submit`) accept electors only, so staff get `403 forbidden`. Every role can use `/api/auth/extend` and `/api/auth/logout`.
+
+**Create a staff account**, inside `backend/` with the virtual environment active:
+
+```
+python -m scripts.create_staff --username official.one --role polling_official
+```
+
+The script:
+- asks for the password twice, using the same rules as registration (at least 12 characters, not the username);
+- stores only its Argon2id hash;
+- prints the authenticator setup link and key once;
+- refuses a username already in use, or any role other than `polling_official` and `auditor`;
+- records `STAFF_CREATED` in the audit log.
+
+No API endpoint creates staff, and the seed creates none.
+
+**Try the admin routes:**
+1. Set `COOKIE_SECURE=false` in `backend/.env` for local `http://`.
+2. Open http://127.0.0.1:8000/docs.
+3. Sign in with `POST /api/auth/login` (username and password), then `POST /api/auth/verify` (the 6-digit code from the authenticator app). In this prototype staff use a TOTP code like electors.
+4. Call the `/api/admin` routes from the same page; the browser keeps the session cookie. With curl, keep the cookie in a file:
+
+```
+curl -c jar -H "Content-Type: application/json" -d '{"username":"official.one","password":"..."}' http://127.0.0.1:8000/api/auth/login
+curl -b jar -c jar -H "Content-Type: application/json" -d '{"otp_code":"123456"}' http://127.0.0.1:8000/api/auth/verify
+curl -b jar http://127.0.0.1:8000/api/admin/turnout
+```
+
+The reset route uses the same logic as `python -m scripts.seed --reset-participation`, now shared in `app/participation.py`. It clears an `issued` elector (`ELECTOR_RESET`, actor `staff:<account id>`), answers `409 already_voted` for one who has voted and `404 not_found` otherwise.
+
+Run the SR-05 tests, inside `backend/` with PostgreSQL running:
+
+```
+pytest tests/test_sr05_access_control.py -v
+```
+
+Design only, not implemented:
+
+- The `returning_officer` role, with dual control for ballot-definition activation, roll replacement and result release.
+- The `system_administrator` role.
+- Admin screens. Staff use the API directly.
+- An access review before each election and after any staff change.
+- Separation of privileged services, and least-privilege database roles.
+- Phishing-resistant staff sign in (SR-06). Staff use a password and TOTP for now.
+- Known gap: every `AUTHZ_DENIED` writes an audit row, so a flood of denied requests also floods the log.
 
 ## Folder layout
 

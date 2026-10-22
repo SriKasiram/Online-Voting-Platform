@@ -83,7 +83,7 @@ def test_full_registration_then_a_normal_sign_in(client: TestClient, db_session:
     assert confirmed.content == b""
 
     account = db_session.scalars(select(Account).where(Account.username == "new.voter")).one()
-    assert account.role == AccountRole.VOTER
+    assert account.role == AccountRole.ELECTOR  # SR-05: renamed role member
     assert account.roll_id == person.roll_id
     assert account.password_hash.startswith("$argon2id$")
     assert decrypt(account.totp_secret_enc, "accounts.totp_secret") == secret

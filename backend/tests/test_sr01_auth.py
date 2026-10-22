@@ -207,7 +207,7 @@ def test_parallel_wrong_passwords_are_all_counted(engine: Engine) -> None:
         account = Account(
             username="parallel.voter",
             password_hash=hash_password("the right password"),
-            role=AccountRole.VOTER,
+            role=AccountRole.AUDITOR,  # SR-05: an account with no roll entry must be staff now
             totp_secret_enc=encrypt(new_totp_secret(), "accounts.totp_secret"),
         )
         setup.add(account)

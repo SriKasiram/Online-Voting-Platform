@@ -26,7 +26,7 @@ import uuid
 from datetime import date, datetime
 from typing import Any
 
-from sqlalchemy import BigInteger, Enum, ForeignKey, UniqueConstraint, func, text
+from sqlalchemy import BigInteger, CheckConstraint, Enum, ForeignKey, UniqueConstraint, func, text
 from sqlalchemy.dialects.postgresql import CITEXT
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -102,8 +102,11 @@ class BallotDefinition(Base):
 
 
 class AccountRole(enum.StrEnum):
-    VOTER = "VOTER"
-    ELECTION_OFFICIAL = "ELECTION_OFFICIAL"
+    """SR-05: the implemented roles. What each may do is in app/rbac.py."""
+
+    ELECTOR = "elector"
+    POLLING_OFFICIAL = "polling_official"
+    AUDITOR = "auditor"
 
 
 class ElectoralRollEntry(Base):
@@ -134,13 +137,25 @@ class ElectoralRollEntry(Base):
 
 class Account(Base):
     __tablename__ = "accounts"
+    # SR-05: only known roles, and an elector always has a roll entry while staff never do
+    __table_args__ = (
+        CheckConstraint("role IN ('elector', 'polling_official', 'auditor')", name="role_valid"),
+        CheckConstraint(
+            "(role = 'elector' AND roll_id IS NOT NULL) OR (role <> 'elector' AND roll_id IS NULL)", name="role_roll"
+        ),
+    )
 
     id: Mapped[uuid.UUID] = uuid_pk()
     # citext, so "Voter.One" and "voter.one" are the same username
     username: Mapped[str] = mapped_column(CITEXT(), unique=True)
     password_hash: Mapped[str]
-    role: Mapped[AccountRole] = mapped_column(Enum(AccountRole, name="account_role"))
-    # Election officials are not on the roll. UNIQUE: one account per person on the roll.
+    # SR-05: text checked by role_valid, read from the database on every request, never from a session
+    role: Mapped[AccountRole] = mapped_column(
+        Enum(AccountRole, native_enum=False, length=20, values_callable=lambda e: [m.value for m in e]),
+        default=AccountRole.ELECTOR,
+        server_default="elector",
+    )
+    # Staff are not on the roll. UNIQUE: one account per person on the roll.
     roll_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("electoral_roll.id"), unique=True)
     totp_secret_enc: Mapped[bytes]
     # SR-01: consecutive failed sign-in attempts, at the password or the code step. Reset by a full sign in.

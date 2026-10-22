@@ -324,7 +324,7 @@ def test_ten_simultaneous_extensions_with_one_identifier_allow_one(engine: Engin
         account = Account(
             username="sr04.parallel",
             password_hash=hash_password("a long enough password"),
-            role=AccountRole.VOTER,
+            role=AccountRole.AUDITOR,  # SR-05: an account with no roll entry must be staff now
             totp_secret_enc=encrypt(new_totp_secret(), "accounts.totp_secret"),
         )
         setup.add(account)

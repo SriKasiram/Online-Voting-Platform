@@ -37,8 +37,9 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 
 def display_name(db: Session, account: Account) -> str:
-    if account.role == AccountRole.ELECTION_OFFICIAL:
-        return "Election official"
+    # SR-05: staff have no roll entry, so they see their username. Electors are unchanged.
+    if account.role != AccountRole.ELECTOR:
+        return account.username
     roll = db.get(ElectoralRollEntry, account.roll_id) if account.roll_id else None
     name = decrypt_or_none(roll.full_name_enc, "electoral_roll.full_name") if roll else None
     return name or account.username

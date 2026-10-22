@@ -318,7 +318,8 @@ def make_voter(db_session: Session, make_person: Callable[..., Person]) -> Calla
             username=f"official.{n}" if official else f"voter.{n}",
             password=f"long enough password {n}",
             totp_secret=new_totp_secret(),
-            full_name="Election official" if person is None else f"{person.given_name} {person.surname}",
+            # SR-05: staff see their username after sign in, so that is their display name here too
+            full_name=f"official.{n}" if person is None else f"{person.given_name} {person.surname}",
             division=division,
             account_id=uuid.uuid4(),
         )
@@ -327,7 +328,8 @@ def make_voter(db_session: Session, make_person: Callable[..., Person]) -> Calla
                 id=voter.account_id,
                 username=voter.username,
                 password_hash=hash_password(voter.password),
-                role=AccountRole.ELECTION_OFFICIAL if official else AccountRole.VOTER,
+                # SR-05: "official" now means a polling official, who has no roll entry
+                role=AccountRole.POLLING_OFFICIAL if official else AccountRole.ELECTOR,
                 roll_id=None if person is None else person.roll_id,
                 totp_secret_enc=encrypt(voter.totp_secret, "accounts.totp_secret"),
             )

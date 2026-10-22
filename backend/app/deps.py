@@ -35,14 +35,19 @@ def current_session(request: Request, db: DbSession) -> AuthSession:
 CurrentSession = Annotated[AuthSession, Depends(current_session)]
 
 
-def current_voter(session: CurrentSession, db: DbSession) -> Account:
-    """The signed-in account, if it is a voter account linked to the roll."""
+def current_elector(session: CurrentSession, db: DbSession) -> Account:
+    """
+    The signed-in account, if it is an elector linked to the roll.
+    SR-05: used only by the voting routes. The role is read from the database on
+    every request, and staff get 403 forbidden (previously "not_a_voter").
+    """
     account = db.get_one(Account, session.account_id)
-    if account.role != AccountRole.VOTER or account.roll_id is None:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "not_a_voter")
+    if account.role != AccountRole.ELECTOR or account.roll_id is None:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "forbidden")
     # SR-02: enrolment, division and age now come from the signed roll record
     # (app/eligibility.py), so the unsigned roll row is no longer read here
     return account
 
 
-CurrentVoter = Annotated[Account, Depends(current_voter)]
+# SR-05: renamed from CurrentVoter
+CurrentElector = Annotated[Account, Depends(current_elector)]

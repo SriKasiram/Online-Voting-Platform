@@ -1,5 +1,7 @@
 """Request and response bodies for the API."""
 
+from datetime import datetime
+
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -70,3 +72,33 @@ class RegisterAccountOut(BaseModel):
 
 class RegisterConfirmIn(BaseModel):
     otp_code: str = Field(pattern=r"^\d{6}$")
+
+
+# SR-05: admin responses. Counts and log entries only: no elector names, roll ids or tokens.
+class StateCounts(BaseModel):
+    issued: int
+    voted: int
+
+
+class DivisionTurnout(StateCounts):
+    division: str
+
+
+class TurnoutOut(BaseModel):
+    election: str
+    divisions: list[DivisionTurnout]
+    total: StateCounts
+
+
+class ResetOut(BaseModel):
+    status: str
+
+
+class AuditEntryOut(BaseModel):
+    id: int
+    created_at: datetime
+    actor: str
+    event_type: str
+    # As stored, shown as hex
+    prev_hash: str
+    hash: str

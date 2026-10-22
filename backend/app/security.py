@@ -282,3 +282,27 @@ def audit(db: Session, event_type: str, actor: str, **details: Any) -> None:
     )
     # Written now, so a second entry in the same transaction chains to this one
     db.flush()
+
+
+def verify_audit_chain(db: Session) -> tuple[int, int | None]:
+    """
+    SR-05: recomputes the hash chain exactly as audit() builds it (audit() is
+    unchanged). Returns how many entries checked out and the id of the first one
+    that does not, or None when the whole chain is intact.
+    """
+    prev_hash, checked = _GENESIS_HASH, 0
+    for entry in db.scalars(select(AuditLogEntry).order_by(AuditLogEntry.id)):
+        body = json.dumps(
+            {
+                # The database may hand the time back in another zone, so restore audit()'s UTC form
+                "created_at": entry.created_at.astimezone(UTC).isoformat(),
+                "event_type": entry.event_type,
+                "actor": entry.actor,
+                "details": entry.details,
+            },
+            sort_keys=True,
+        )
+        if entry.prev_hash != prev_hash or entry.hash != hashlib.sha256(prev_hash + body.encode()).digest():
+            return checked, entry.id
+        prev_hash, checked = entry.hash, checked + 1
+    return checked, None

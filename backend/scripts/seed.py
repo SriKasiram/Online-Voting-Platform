@@ -35,11 +35,10 @@ from app.models import (
     Election,
     ElectionStatus,
     ElectoralRollEntry,
-    ParticipationState,
     RegistrationSession,
-    VoterParticipation,
 )
-from app.security import audit, encrypt, enrolment_code_hash, roll_lookup
+from app.participation import reset_issued
+from app.security import encrypt, enrolment_code_hash, roll_lookup
 from scripts.sign_roll import load_or_create_private_key, sign_all
 
 ELECTION_NAME = "House of Representatives"
@@ -221,19 +220,17 @@ def reset_participation(session: Session) -> str:
     entry = session.scalar(select(ElectoralRollEntry).where(ElectoralRollEntry.roll_lookup == lookup))
     if entry is None:
         return "There is no reviewer roll entry yet. Run python -m scripts.seed first."
-    rows = session.scalars(select(VoterParticipation).where(VoterParticipation.roll_id == entry.id)).all()
-    if any(row.state == ParticipationState.VOTED for row in rows):
+    account_id = session.scalar(select(Account.id).where(Account.roll_id == entry.id))
+    # SR-05: the reset itself now lives in app/participation.py, shared with the admin route.
+    # Same outcomes, messages and audit entry as before.
+    result = reset_issued(session, entry.id, actor=f"account:{account_id}" if account_id else "unknown")
+    if result == "voted":
         raise SystemExit(
             "The reviewer has already voted, and a cast ballot cannot be undone, by design. "
             "To start again, re-seed everything: python -m scripts.seed --reset"
         )
-    if not rows:
+    if result == "not_found":
         return "The reviewer has not been issued a ballot. Nothing to reset."
-    for row in rows:
-        session.delete(row)
-    account_id = session.scalar(select(Account.id).where(Account.roll_id == entry.id))
-    audit(session, "ELECTOR_RESET", actor=f"account:{account_id}" if account_id else "unknown")
-    session.commit()
     return (
         "Cleared the reviewer's issued ballot. They can sign in and be issued a new one. "
         "Only one ballot can still be cast: once it is, any other token is refused."

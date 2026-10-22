@@ -206,7 +206,7 @@ def confirm(body: RegisterConfirmIn, request: Request, response: Response, db: D
         Account(
             username=registration.username,
             password_hash=registration.password_hash,
-            role=AccountRole.VOTER,
+            role=AccountRole.ELECTOR,  # SR-05: the role member was renamed; registration only ever makes electors
             roll_id=roll_id,
             totp_secret_enc=encrypt(secret, "accounts.totp_secret"),
         )

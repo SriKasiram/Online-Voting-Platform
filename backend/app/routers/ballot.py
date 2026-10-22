@@ -23,7 +23,8 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.deps import CurrentSession, CurrentVoter, DbSession
+# SR-05: both voting routes take CurrentElector, so staff accounts get 403 here
+from app.deps import CurrentElector, CurrentSession, DbSession
 from app.eligibility import eligible_division
 from app.models import (
     Account,
@@ -124,7 +125,7 @@ def replay(db: Session, voter: Account, receipt_reference: str, session_hash: by
 
 
 @router.get("")
-def get_ballot(voter: CurrentVoter, db: DbSession) -> BallotOut:
+def get_ballot(voter: CurrentElector, db: DbSession) -> BallotOut:
     """The ballot paper for the voter's division, with a one-time token to submit it."""
     election = open_election(db)
     # SR-02: eligibility from the signed roll record, before any ballot token exists. The division
@@ -168,9 +169,9 @@ def get_ballot(voter: CurrentVoter, db: DbSession) -> BallotOut:
 
 
 @router.post("/submit")
-def submit_ballot(body: SubmitIn, voter: CurrentVoter, session: CurrentSession, db: DbSession) -> SubmitOut:
+def submit_ballot(body: SubmitIn, voter: CurrentElector, session: CurrentSession, db: DbSession) -> SubmitOut:
     """Accepts a full preferential ballot once per voter."""
-    # SR-04: the same session CurrentVoter checked, kept here so acceptance can end it
+    # SR-04: the same session CurrentElector checked, kept here so acceptance can end it
     session_hash = session.session_id_hash
     election = open_election(db)
     # SR-02: checked again before the vote is accepted, and the division comes from the signed record
