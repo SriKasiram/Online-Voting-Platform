@@ -10,10 +10,11 @@ a ballot never exists without the elector marked as voted.
 
 Ballot secrecy: the ballot row stores no voter, no token, no reference and no
 time. The token row stores no voter. Participation stores no time.
+SR-11: the ballot itself (division and ranking) is stored only AES-256-GCM encrypted.
 """
 
-import json
 import secrets
+import uuid
 from datetime import timedelta
 from typing import Any, NoReturn
 
@@ -23,6 +24,8 @@ from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
+# SR-11: ballots are encrypted before they are stored
+from app.ballot_crypto import ballot_payload, encrypt_ballot
 # SR-07: ballot papers come only from the verified, signed definition
 from app.ballot_definitions import verified_division
 # SR-08: the House preference rules
@@ -253,17 +256,12 @@ def submit_ballot(body: SubmitIn, voter: CurrentElector, session: CurrentSession
         return replay(db, voter, again.receipt_reference or "", session_hash)
 
     # SR-03 (h): store the ballot with no voter, token, reference or time, and mark the elector
-    # voted, in the same transaction. Stage 2 keeps the preferences as plain JSON in the
-    # ciphertext column; a later stage encrypts them.
-    db.add(
-        Ballot(
-            election_id=election.id,
-            division_id=division_id,
-            ciphertext=json.dumps(ranking).encode(),
-            nonce=b"",
-            key_id="unencrypted",
-        )
-    )
+    # voted, in the same transaction.
+    # SR-11: the id is chosen here because the ciphertext is bound to it. Only the encrypted ballot is
+    # stored; if encryption fails (no usable key) the whole transaction is undone, token included.
+    ballot_id = uuid.uuid4()
+    sealed = encrypt_ballot(ballot_payload(division_id, ranking), ballot_id, election.id)
+    db.add(Ballot(id=ballot_id, election_id=election.id, encrypted_payload=sealed))
     db.execute(
         update(VoterParticipation)
         .where(VoterParticipation.roll_id == voter.roll_id, VoterParticipation.election_id == election.id)

@@ -8,6 +8,7 @@
 secrets/
 keys/
 # SR-02: the electoral roll signing keys (scripts/sign_roll.py). Also covered by keys/ and *.pem above.
+# SR-11: the ballot encryption key, backend/keys/ballot.key (scripts/gen_ballot_key.py), lives here too.
 backend/keys/
 # SR-10: the development TLS certificate and its private key (python -m scripts.dev_certs)
 certs/

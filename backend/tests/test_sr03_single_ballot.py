@@ -8,6 +8,7 @@ simultaneous duplicates add no ballot.
 import hashlib
 import json
 import threading
+import uuid
 from collections.abc import Callable, Iterator
 from datetime import timedelta
 
@@ -193,7 +194,8 @@ def test_only_the_token_hash_is_stored_and_the_tables_share_no_link(
     columns = {t: {c["name"] for c in schema.get_columns(t)} for t in ("voter_participation", "ballot_tokens", "ballots")}
     assert columns["voter_participation"] == {"roll_id", "election_id", "state"}
     assert columns["ballot_tokens"] == {"id", "election_id", "token_hash", "expires_at", "consumed_at", "receipt_reference"}
-    assert columns["ballots"] == {"id", "election_id", "division_id", "ciphertext", "nonce", "key_id"}
+    # SR-11: the division and ranking now live only inside the encrypted payload
+    assert columns["ballots"] == {"id", "election_id", "encrypted_payload"}
     for table in ("ballot_tokens", "ballots"):
         referenced = {fk["referred_table"] for fk in schema.get_foreign_keys(table)}
         assert referenced <= {"elections", "divisions"}
@@ -209,8 +211,9 @@ def test_failure_while_storing_the_ballot_changes_nothing(
     sign_in(voter)
     ballot = client.get("/api/ballot").json()
     real_ballot = ballot_router.Ballot
-    # A division that does not exist makes the database refuse the INSERT
-    monkeypatch.setattr(ballot_router, "Ballot", lambda **fields: real_ballot(**(fields | {"division_id": 999_999})))
+    # An election that does not exist makes the database refuse the INSERT
+    # (SR-11: ballots no longer have a division column to break instead)
+    monkeypatch.setattr(ballot_router, "Ballot", lambda **fields: real_ballot(**(fields | {"election_id": uuid.uuid4()})))
 
     with pytest.raises(IntegrityError):
         submit(client, ballot)

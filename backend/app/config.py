@@ -70,6 +70,10 @@ class Settings(BaseSettings):
     # SR-07: a definition must be activated at least this long before polls open
     min_activation_lead_hours: int = 24
 
+    # SR-11: the AES-256 key that encrypts every stored ballot (python -m scripts.gen_ballot_key).
+    # Kept beside the SR-02 keys and never committed. There is no default key and no plaintext mode.
+    ballot_key_file: Path = BACKEND_DIR / "keys" / "ballot.key"
+
     # SR-10: how long browsers must use HTTPS only for this host. One year by default. HSTS ignores
     # the port, so local development sets it short (.env.example) to avoid locking localhost to HTTPS.
     hsts_max_age: int = 31536000

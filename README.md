@@ -11,7 +11,7 @@ New to the project? [docs/MANUAL.md](docs/MANUAL.md) lists every file and shows 
 | Part | State |
 |---|---|
 | `frontend/` | Register, two-part sign in, tap-to-rank ballot, review and receipt screens. All data comes from the backend |
-| `backend/` | Registration for people on the electoral roll, sign in with a password and an authenticator app, the ballot and submission. Ballot encryption and signing come in later stages |
+| `backend/` | Registration for people on the electoral roll, sign in with a password and an authenticator app, the ballot and submission. Stored ballots are AES-256-GCM encrypted (SR-11); ballot signing comes in a later stage |
 | `docker-compose.yml` | PostgreSQL 16 for local development |
 
 The backend serves the API and the built frontend together, over HTTPS only (TLS 1.3, SR-10), at https://localhost:8443. There is no plaintext address.
@@ -73,7 +73,19 @@ Every seed run ends by signing the electoral roll (SR-02), and the first run cre
 
 The seed also stores version 1 of the election's ballot definition, signed by two development delegates (SR-07). The API will not start while an open election has no valid definition. If your database existed before SR-07, run `alembic upgrade head` and then `python -m scripts.seed`.
 
-### 5. Build the frontend
+**After the SR-11 migration the old test ballots are gone.** If your database existed before SR-11, `alembic upgrade head` discards its plaintext test ballots, together with their receipts and "voted" marks. Assumption: the prototype database contains only seed and test data; old plaintext test ballots are discarded and must be recreated by re-running the seed script and casting new test ballots. So run `python -m scripts.seed` again, then cast new test ballots.
+
+### 5. Create the ballot encryption key (once)
+
+```
+python -m scripts.gen_ballot_key
+```
+
+This creates `backend/keys/ballot.key`: 32 random bytes, the AES-256 key that encrypts every stored ballot (SR-11). The server refuses to start without it. The script never replaces an existing key unless you add `--force`, which makes every ballot already stored unreadable.
+
+> **Back up the key, and never commit it.** Keep a copy somewhere safe and separate from the database and its backups. If the key is lost, every stored ballot is unreadable and nobody can recover them. `backend/keys/` is in `.gitignore`. Never email it or put it in shared documents.
+
+### 6. Build the frontend
 
 ```
 cd ../frontend
@@ -84,7 +96,7 @@ cd ../backend
 
 This writes `frontend/dist`, the voter app and `staff.html`, which the backend serves. Build again after changing the frontend.
 
-### 6. Create and trust the development certificate (once)
+### 7. Create and trust the development certificate (once)
 
 ```
 python -m scripts.dev_certs
@@ -102,7 +114,7 @@ Then trust `certs/dev-cert.pem` once, so the browser accepts it. Run the command
 
 Use Chrome or Edge. If the browser shows a certificate warning, the certificate is not trusted yet: never click through it. A certificate made again with `--force` must be trusted again.
 
-### 7. Start the server
+### 8. Start the server
 
 ```
 python -m app.serve
@@ -115,9 +127,9 @@ Open https://localhost:8443. To vote, register first (see [Registering as a revi
 - https://localhost:8443/api/divisions lists the divisions stored in the database
 - https://localhost:8443/docs lists every endpoint and lets you try them
 
-The server refuses to start without the certificate and key, and never falls back to plain HTTP. It does not reload on code changes: stop it with Ctrl+C and start it again.
+The server refuses to start without the certificate and key, and never falls back to plain HTTP. It also refuses without a usable ballot key (SR-11). It does not reload on code changes: stop it with Ctrl+C and start it again.
 
-### 8. Run the tests
+### 9. Run the tests
 
 ```
 pytest
@@ -211,6 +223,8 @@ pytest
 
 The same checks run on every pull request through GitHub Actions (`.github/workflows/ci.yml`). The backend job runs pytest against a PostgreSQL 16 service container.
 
+Before every release, also run the SR-11 storage audit, `python -m scripts.audit_ballots`, against the release database. It must exit with code 0. See [docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md).
+
 ## Settings
 
 ### Frontend
@@ -241,6 +255,7 @@ Copy `backend/.env.example` to `backend/.env`. Docker Compose reads the same fil
 | `ROLL_PUBLIC_KEY_PATH`, `MIN_VOTING_AGE` | The roll's Ed25519 public key, and the minimum age on polling day. See [SR-02](#sr-02-roll-signing-and-eligibility) | `backend/keys/roll_public.pem`, `18` |
 | `BALLOT_TOKEN_MINUTES` | How long a ballot token stays usable after it is issued. See [SR-03](#sr-03-single-ballot-per-elector) | `10` |
 | `DELEGATE_KEYRING_PATH`, `REQUIRED_DELEGATE_APPROVALS`, `MIN_ACTIVATION_LEAD_HOURS` | The delegates' public keyring, the distinct delegates who must sign, and how long before polls open a definition must be activated. See [SR-07](#sr-07-signed-ballot-definitions) | `backend/keys/delegates/keyring.json`, `2`, `24` |
+| `BALLOT_KEY_FILE` | The 32-byte AES-256 key that encrypts every stored ballot (`python -m scripts.gen_ballot_key`). No default key exists: without this file the API does not start. See [SR-11](#sr-11-ballots-encrypted-at-rest) | `backend/keys/ballot.key` |
 | `HSTS_MAX_AGE` | Seconds the browser must use HTTPS only for this host. `.env.example` sets `300` for local work. See [SR-10](#sr-10-tls-13-for-ballot-transmission) | `31536000` (one year) |
 | `TLS_CERT_FILE`, `TLS_KEY_FILE`, `SERVER_PORT` | The TLS certificate and key `python -m app.serve` uses (relative to the project root), and its single HTTPS port (SR-10) | `certs/dev-cert.pem`, `certs/dev-key.pem`, `8443` |
 
@@ -272,7 +287,7 @@ Never commit a real `.env` file. Only `.env.example` belongs in Git.
 
 ### Limitations, for later stages
 
-- Ballots are stored as plain JSON in the `ciphertext` column, and ballot definitions are not signed yet.
+- Ballots are now stored AES-256-GCM encrypted (SR-11), and ballot definitions are signed (SR-07). The ballot key sits on the same machine as the database (see SR-11's limits).
 - A ballot holds no voter and no time, but it is stored in the same transaction that marks the voter. Someone with direct access to the database could match the two through PostgreSQL's internal transaction ids. A later stage should store ballots separately or in shuffled batches.
 - The rate limiter keeps its counts in memory, so they reset when the API restarts and are not shared between several API processes. Behind the dev server's proxy every request comes from `127.0.0.1`, so the per-IP limit counts all users together.
 - There is no CSRF token yet. `SameSite=Strict` cookies are the only protection. The session cookie is marked `Secure` (SR-10: `.env.example` now sets `COOKIE_SECURE=true`). The registration cookie is not marked `Secure` yet, although it now travels only over TLS (SR-10).
@@ -764,12 +779,68 @@ Limits:
 - **Certificate pinning in a native voting client.**
 - **The plain-HTTP Vite dev server.** Today it is kept to development by instruction only. A deployment would not run it at all; only the TLS entry point would be reachable.
 
+## SR-11: ballots encrypted at rest
+
+Every stored ballot is encrypted with AES-256-GCM. Before each release, a storage audit must find no plaintext ballot record.
+
+**What is encrypted.** The whole ballot is one payload, serialised as canonical JSON (sorted keys, no spaces, UTF-8): `{"division_id": ..., "ranked_candidate_ids": [...]}`.
+- **Encrypted with:** `app/ballot_crypto.py`, using AES-256-GCM from the `cryptography` package and a 32-byte key.
+- **What stays readable:** a `ballots` row keeps only the random ballot id and the election id. The division used to be a readable column and is now inside the ciphertext.
+- **Nothing else held ballot content.** Receipts (`ballot_tokens`), participation (`voter_participation`), the audit log and the application logs held none, and still hold none.
+
+**Stored format** (`ballots.encrypted_payload`, BYTEA): 1 version byte (`0x01`), a 12-byte nonce, then the ciphertext with its 16-byte GCM tag.
+- **A fresh nonce every time.** Each ballot gets a new random nonce from `os.urandom`, so two identical ballots never look alike.
+- **Bound to its own row.** The associated data is `"{ballot_id}|{election_id}"`, so the application chooses the ballot id before the INSERT. A ciphertext copied to another row or election does not decrypt.
+- **One error for every failure.** A wrong key, altered bytes, an unknown version or a short value all raise `BallotDecryptionError`, with a message that contains none of the ballot.
+- **The version byte is the hook for later key rotation.**
+
+**The key.** `python -m scripts.gen_ballot_key` writes 32 random bytes to `BALLOT_KEY_FILE` (default `backend/keys/ballot.key`, which is gitignored).
+- **Created safely.** The file is created owner-only (0600), and the script never overwrites an existing key without `--force`.
+- **No key, no API.** The API refuses to start if the key is missing or is not exactly 32 bytes. On POSIX systems it also refuses if the group or others have any access; that check is skipped on Windows, which has no such permission bits.
+- **No way around it.** There is no default key, no plaintext mode and no setting that turns encryption off.
+- **Never logged.** Nothing logs or prints the key, a plaintext ballot or a ciphertext.
+
+**Counting.** The prototype has no counting or results feature, so none was added. `decrypt_ballot` opens a ballot in memory only. A future count must use it the same way, and never write decrypted ballots to disk, logs or the database.
+
+**Error responses.** FastAPI's default 422 answer repeats the submitted input. For a malformed `POST /api/ballot/submit`, the answer now keeps only where and why validation failed, so it can never repeat the ranking. Other routes are unchanged.
+
+**Migration `0009`.** It removes the readable columns and adds `encrypted_payload`. Assumption: the prototype database contains only seed and test data; old plaintext test ballots are discarded and must be recreated by re-running the seed script and casting new test ballots.
+- **What else is removed:** the used tokens (which hold those ballots' receipts) and the `voted` participation rows.
+- **What is kept:** electors, the roll, elections, ballot definitions, staff, the audit log, unused tokens and `issued` rows.
+- **Downgrade:** it works only while no ballots are stored. Otherwise it stops and explains that SR-11 encryption cannot be reversed without the key, and that the plaintext data was discarded.
+
+**Pre-release audit.** Run `python -m scripts.audit_ballots` inside `backend/` against the release database. It prints PASS, FAIL or SKIPPED for each check, then a summary, and exits with code 1 if any check fails:
+- **a. Ballot records.** Every row starts with `0x01`, is at least 29 bytes, and decrypts with its own ballot and election id. Readable JSON or a ballot field name in the bytes fails.
+- **b. Ballots columns.** The table has only `id`, `election_id` and `encrypted_payload` (bytea), so none of the old plaintext columns.
+- **c. Other tables.** `ballot_tokens`, `voter_participation` and `audit_log` have only their reviewed columns.
+- **d. The key.** The key file exists and is exactly 32 bytes, and git ignores it and does not track it. Without git, or outside a git repository, the git part shows as **SKIPPED with a warning**, never as PASS.
+- **e. Logs.** Neither the audit log nor any `*.log` file in the project contains `division_id` or `ranked_candidate_ids`.
+
+It prints only ballot ids and reasons, never a ballot. The release steps are in [docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md), and the manual checks are in [docs/MANUAL.md](docs/MANUAL.md), section 7.
+
+Run the SR-11 tests, inside `backend/` with PostgreSQL running:
+
+```
+pytest tests/test_sr11_encryption.py -v
+```
+
+The tests use their own temporary key (`tests/conftest.py`), so neither the tests nor CI need a `keys/` folder.
+
+**Limit.** In the prototype the key is on the same machine as the database. This protects against a stolen database dump or backup. It does not protect against a fully compromised application server, which can read both.
+
+**SR-11 design only, not implemented:**
+- **Better key storage.** Keep the key in a KMS or HSM, with envelope encryption and a data key per election.
+- **Key rotation and re-encryption.** The version byte is the hook for this.
+- **Encryption below the application.** Disk or volume encryption, and encrypted backups.
+- **PostgreSQL transparent data encryption (TDE).**
+- **An automatic audit job in the release pipeline.** For now a person runs the audit, as part of the release checklist.
+
 ## Folder layout
 
 ```
 backend/             FastAPI app, Alembic migrations, seed script and tests
 frontend/            React app
-docs/                MANUAL.md (files and how to run the app), SR-09_INSPECTION.md and sr09-evidence/ (SR-09)
+docs/                MANUAL.md (files and how to run the app), SR-09_INSPECTION.md and sr09-evidence/ (SR-09), RELEASE_CHECKLIST.md (SR-11)
 certs/               SR-10: the development TLS certificate and key (python -m scripts.dev_certs). Never committed
 docker-compose.yml   PostgreSQL 16 for local development
 ```

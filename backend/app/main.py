@@ -5,10 +5,15 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Request, Response
+from fastapi.encoders import jsonable_encoder
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select
 
+# SR-11: no usable ballot key, no API
+from app.ballot_crypto import check_ballot_key_at_startup
 from app.ballot_definitions import check_definitions_at_startup
 # SR-10: the HSTS lifetime, and where the built frontend is
 from app.config import PROJECT_DIR, settings
@@ -22,6 +27,9 @@ from app.schemas import DivisionOut
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    # SR-11: first, and before any database work: without a usable ballot key no ballot could be
+    # stored safely, so the API refuses to start rather than fall back to anything weaker
+    check_ballot_key_at_startup()
     # SR-02: the API refuses to start unless every electoral roll record's signature checks out.
     # Uses the routes' database dependency, so tests check their own database.
     sessions = app.dependency_overrides.get(get_db, get_db)()
@@ -36,6 +44,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(title="Electronic voting prototype API", version="0.1.0", lifespan=lifespan)
+
+BALLOT_SUBMIT_PATH = "/api/ballot/submit"
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_failed(request: Request, exc: RequestValidationError) -> Response:
+    # SR-11: FastAPI's default 422 repeats the submitted input, which for a malformed ballot would
+    # send the ranking back out. There only where and why it failed is kept; other routes are unchanged.
+    if request.url.path == BALLOT_SUBMIT_PATH:
+        errors = [{key: error[key] for key in ("type", "loc", "msg") if key in error} for error in exc.errors()]
+        return JSONResponse({"detail": jsonable_encoder(errors)}, status_code=422)
+    return await request_validation_exception_handler(request, exc)
 
 
 @app.middleware("http")

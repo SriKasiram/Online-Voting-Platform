@@ -17,7 +17,9 @@ reference or time.
 Protected columns (helpers in app/security.py): *_enc columns are AES-GCM
 encrypted, password_hash is Argon2id, roll_lookup and enrolment_code_hash are
 keyed hashes, and the token *_hash columns hold SHA-256 hashes of the cookie
-values. Still a placeholder: ballots.ciphertext holds plain JSON.
+values. SR-11: ballots.encrypted_payload holds the whole ballot (division and
+ranking) encrypted with AES-256-GCM (app/ballot_crypto.py); nothing else
+about a ballot is stored in readable form.
 SR-07: ballot_definitions hold payloads signed by two delegates (app/ballot_definitions.py).
 """
 
@@ -280,13 +282,13 @@ class BallotToken(Base):
 class Ballot(Base):
     __tablename__ = "ballots"
 
-    # Random (version 4) UUID, so an id never reveals the order ballots arrived in
+    # Random (version 4) UUID, so an id never reveals the order ballots arrived in.
+    # SR-11: chosen by the application before the INSERT, because it is part of the AES-GCM associated data.
     id: Mapped[uuid.UUID] = uuid_pk()
     election_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("elections.id"))
-    division_id: Mapped[int] = mapped_column(ForeignKey("divisions.id"))
-    ciphertext: Mapped[bytes]
-    nonce: Mapped[bytes]
-    key_id: Mapped[str]
+    # SR-11: the division and the ranking, encrypted: version byte, nonce, ciphertext and tag.
+    # The division is ballot content too, so it has no readable column any more.
+    encrypted_payload: Mapped[bytes]
 
 
 # ---------------------------------------------------------------

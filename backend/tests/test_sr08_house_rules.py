@@ -14,6 +14,8 @@ from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+# SR-11: ballots are stored encrypted
+from app.ballot_crypto import RANKING_FIELD, decrypt_ballot
 from app.ballot_rules import Verdict, evaluate_house_ballot
 from app.models import Account, AuditLogEntry, Ballot, BallotToken, Candidate, ParticipationState, VoterParticipation
 from app.routers import ballot as ballot_router
@@ -134,7 +136,8 @@ def test_formal_ballots_are_stored_in_the_submitted_order(
         assert [c["id"] for c in ballot["candidates"]] == northgate
         assert submit(client, ballot, order).status_code == 200
 
-    stored = [json.loads(b.ciphertext) for b in db_session.scalars(select(Ballot))]
+    # SR-11: the stored bytes are encrypted, so they are read back through decrypt_ballot
+    stored = [decrypt_ballot(b.encrypted_payload, b.id, b.election_id)[RANKING_FIELD] for b in db_session.scalars(select(Ballot))]
     assert sorted(stored) == sorted(orders)
 
 

@@ -12,7 +12,8 @@ from sqlalchemy import Engine, inspect
 EXPECTED_COLUMNS = {
     # SR-03: the rebuilt token table. No elector, no division and no issue time.
     "ballot_tokens": {"id", "election_id", "token_hash", "expires_at", "consumed_at", "receipt_reference"},
-    "ballots": {"id", "election_id", "division_id", "ciphertext", "nonce", "key_id"},
+    # SR-11: the division and the ranking exist only inside the AES-256-GCM encrypted payload
+    "ballots": {"id", "election_id", "encrypted_payload"},
 }
 ANONYMOUS_TABLES = sorted(EXPECTED_COLUMNS)
 

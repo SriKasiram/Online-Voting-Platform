@@ -14,6 +14,7 @@ import uuid
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 
 import pyotp
 import pytest
@@ -44,6 +45,8 @@ from app.security import (
 from scripts import ballot_definition as ballot_definition_script
 from scripts.ballot_definition import build_payload, ensure_delegate_keys, sign, store_active
 from scripts.create_staff import create_staff
+# SR-11: the same key generator the README tells people to run
+from scripts.gen_ballot_key import generate_ballot_key
 from scripts.sign_roll import sign_record
 
 # SR-02: a fixed polling date, so no test depends on today's date
@@ -151,6 +154,18 @@ def roll_key(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Ed25519Privat
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(settings, "roll_public_key_path", public_path)
         yield key
+
+
+@pytest.fixture(scope="session", autouse=True)
+def ballot_key(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path]:
+    """
+    SR-11: a 32-byte ballot key made for this test run by the key script itself (0600, in a temp
+    folder), with BALLOT_KEY_FILE pointed at it. Tests and CI need no keys/ folder.
+    """
+    path = generate_ballot_key(tmp_path_factory.mktemp("ballot_key") / "ballot.key")
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(settings, "ballot_key_file", path)
+        yield path
 
 
 @pytest.fixture(scope="session", autouse=True)
