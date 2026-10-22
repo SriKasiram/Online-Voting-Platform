@@ -18,15 +18,16 @@ from datetime import timedelta
 from typing import NoReturn
 
 from fastapi import APIRouter, HTTPException, status
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.deps import CurrentVoter, DbSession
+from app.deps import CurrentSession, CurrentVoter, DbSession
 from app.eligibility import eligible_division
 from app.models import (
     Account,
+    AuthSession,
     Ballot,
     BallotToken,
     Candidate,
@@ -96,9 +97,27 @@ def reject(db: Session, voter: Account, reason: str, status_code: int, detail: s
     raise HTTPException(status_code, detail)
 
 
-def replay(db: Session, voter: Account, receipt_reference: str) -> SubmitOut:
+def end_session_soon(db: Session, session_hash: bytes) -> None:
+    # SR-04: after an accepted ballot the session lasts at most POST_BALLOT_SESSION_SECONDS more,
+    # enough for a safe retry and the receipt. It is never lengthened and cannot be extended.
+    db.execute(
+        update(AuthSession)
+        .where(AuthSession.session_id_hash == session_hash)
+        .values(
+            expires_at=func.least(
+                AuthSession.expires_at, utc_now() + timedelta(seconds=settings.post_ballot_session_seconds)
+            ),
+            extensions=settings.max_session_extensions,
+        )
+        .execution_options(synchronize_session=False)
+    )
+
+
+def replay(db: Session, voter: Account, receipt_reference: str, session_hash: bytes) -> SubmitOut:
     # SR-03: a used token gets the first answer again, and nothing else changes
     db.rollback()
+    # SR-04: except that a safe retry also ends the session soon, as acceptance did
+    end_session_soon(db, session_hash)
     log(db, "BALLOT_REPLAY_BLOCKED", voter)
     db.commit()
     return SubmitOut(receipt_id=receipt_reference)
@@ -149,8 +168,10 @@ def get_ballot(voter: CurrentVoter, db: DbSession) -> BallotOut:
 
 
 @router.post("/submit")
-def submit_ballot(body: SubmitIn, voter: CurrentVoter, db: DbSession) -> SubmitOut:
+def submit_ballot(body: SubmitIn, voter: CurrentVoter, session: CurrentSession, db: DbSession) -> SubmitOut:
     """Accepts a full preferential ballot once per voter."""
+    # SR-04: the same session CurrentVoter checked, kept here so acceptance can end it
+    session_hash = session.session_id_hash
     election = open_election(db)
     # SR-02: checked again before the vote is accepted, and the division comes from the signed record
     division_id = eligible_division(db, voter, election)
@@ -174,7 +195,7 @@ def submit_ballot(body: SubmitIn, voter: CurrentVoter, db: DbSession) -> SubmitO
         reject(db, voter, "invalid", status.HTTP_400_BAD_REQUEST, "invalid_ballot")
     # SR-03 (c): already used: the same answer as the first time, and no second ballot
     if token.consumed_at is not None:
-        return replay(db, voter, token.receipt_reference or "")
+        return replay(db, voter, token.receipt_reference or "", session_hash)
     # SR-03 (d): expired BALLOT_TOKEN_MINUTES after it was issued
     now = utc_now()
     if token.expires_at <= now:
@@ -202,7 +223,7 @@ def submit_ballot(body: SubmitIn, voter: CurrentVoter, db: DbSession) -> SubmitO
         again = db.scalars(select(BallotToken).where(BallotToken.token_hash == digest)).one()
         if again.consumed_at is None:
             reject(db, voter, "expired", status.HTTP_400_BAD_REQUEST, "ballot_expired")
-        return replay(db, voter, again.receipt_reference or "")
+        return replay(db, voter, again.receipt_reference or "", session_hash)
 
     # SR-03 (h): store the ballot with no voter, token, reference or time, and mark the elector
     # voted, in the same transaction. Stage 2 keeps the preferences as plain JSON in the
@@ -222,6 +243,8 @@ def submit_ballot(body: SubmitIn, voter: CurrentVoter, db: DbSession) -> SubmitO
         .values(state=ParticipationState.VOTED)
         .execution_options(synchronize_session=False)
     )
+    # SR-04: in the same transaction, the session now ends within POST_BALLOT_SESSION_SECONDS
+    end_session_soon(db, session_hash)
     log(db, "BALLOT_ACCEPTED", voter)
     db.commit()
     return SubmitOut(receipt_id=receipt)

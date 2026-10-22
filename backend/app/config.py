@@ -29,7 +29,12 @@ class Settings(BaseSettings):
     postgres_password: SecretStr
 
     # How long a signed-in session lasts. Keep it equal to VITE_SESSION_MINUTES in the frontend.
+    # SR-04: fixed from issue; only an explicit extension starts a new one
     session_minutes: int = 10
+    # SR-04: extensions allowed per sign in, so a session lasts at most (1 + this) x SESSION_MINUTES
+    max_session_extensions: int = 2
+    # SR-04: how long the session survives once a ballot is accepted (safe retry and receipt only)
+    post_ballot_session_seconds: int = 60
 
     # Root secret. app/security.py derives a separate key from it for each purpose.
     secret_key: SecretStr = Field(min_length=32)
@@ -38,7 +43,8 @@ class Settings(BaseSettings):
     max_failed_attempts: int = 5
     lock_minutes: int = 15
     # SR-01: minutes allowed between the password step and the code step of sign in
-    mfa_pending_minutes: int = 5
+    # SR-04: default lowered from 5 to 2
+    mfa_pending_minutes: int = 2
     # SR-01: sign-in requests allowed per client IP in each window
     rate_limit_attempts: int = 20
     rate_limit_window_seconds: int = 300

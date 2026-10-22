@@ -146,14 +146,14 @@ After 5 wrong enrolment codes the entry is locked, and the same reset unlocks it
 | `POST /api/register/confirm` | Step 3: a code from the authenticator app. Creates the account |
 | `POST /api/auth/login` | Sign in, part 1: username and password. `204` and a session cookie that only allows part 2. Every failure answers `401 invalid_credentials` (SR-01) |
 | `POST /api/auth/verify` | Part 2: the code from the authenticator app. Replaces the session with a new signed-in one and returns the voter's name (SR-01) |
-| `POST /api/auth/extend` | Starts a new full session. Called only when the voter chooses Keep voting |
+| `POST /api/auth/extend` | Starts a new full session under a new identifier, at most twice per sign in (SR-04). Called only when the voter chooses Keep voting |
 | `POST /api/auth/logout` | Ends the session |
 | `GET /api/ballot` | The voter's ballot paper and a single-use ballot token, once per election (SR-03) |
 | `POST /api/ballot/submit` | Accepts the ranked ballot once and returns a receipt code. The same token again returns the same receipt (SR-03) |
 
 Errors come back as `{"detail": "<reason>"}`:
 
-- Sign in and voting: `invalid_credentials` and `not_signed_in` (401), `too_many_requests` (429), `not_a_voter` and `not_enrolled` (403), `no_open_election` (404), `already_voted` (409), `invalid_ballot` and `ballot_expired` (400).
+- Sign in and voting: `invalid_credentials` and `not_signed_in` (401), `too_many_requests` (429), `not_a_voter` and `not_enrolled` (403), `no_open_election` (404), `already_voted` and `extension_limit` (409), `invalid_ballot` and `ballot_expired` (400).
 - Registration: `registration_failed`, `username_invalid`, `password_too_short`, `password_is_username`, `wrong_code` and `too_many_attempts` (400), `registration_session_invalid` (401), `username_taken` and `already_registered` (409).
 
 ## Checks
@@ -198,9 +198,10 @@ Copy `backend/.env.example` to `backend/.env`. Docker Compose reads the same fil
 | `POSTGRES_HOST` | Database host. Use `127.0.0.1`, not `localhost`, which stalls on Windows | `127.0.0.1` |
 | `POSTGRES_PORT` | Database port | `5432` |
 | `POSTGRES_TEST_DB` | Database that pytest rebuilds on every run. Must end in `_test` | `evoting_test` |
-| `SESSION_MINUTES` | How long a signed-in session lasts. Keep it equal to `VITE_SESSION_MINUTES` | `10` |
+| `SESSION_MINUTES` | How long a signed-in session lasts, fixed from issue. Keep it equal to `VITE_SESSION_MINUTES` | `10` |
+| `MAX_SESSION_EXTENSIONS`, `POST_BALLOT_SESSION_SECONDS` | Extensions allowed per sign in, and how long a session survives once its ballot is accepted. See [SR-04](#sr-04-session-lifetime-and-binding) | `2`, `60` |
 | `SECRET_KEY` | Root secret for field encryption and keyed hashes, at least 32 characters. Required | none |
-| `MAX_FAILED_ATTEMPTS`, `LOCK_MINUTES`, `MFA_PENDING_MINUTES`, `RATE_LIMIT_ATTEMPTS`, `RATE_LIMIT_WINDOW_SECONDS`, `COOKIE_SECURE` | Sign-in lockout, rate limit and cookie settings. See [SR-01](#sr-01-authentication-and-rate-limiting) | `5`, `15`, `5`, `20`, `300`, `true` |
+| `MAX_FAILED_ATTEMPTS`, `LOCK_MINUTES`, `MFA_PENDING_MINUTES`, `RATE_LIMIT_ATTEMPTS`, `RATE_LIMIT_WINDOW_SECONDS`, `COOKIE_SECURE` | Sign-in lockout, rate limit and cookie settings. See [SR-01](#sr-01-authentication-and-rate-limiting) | `5`, `15`, `2`, `20`, `300`, `true` |
 | `ROLL_PUBLIC_KEY_PATH`, `MIN_VOTING_AGE` | The roll's Ed25519 public key, and the minimum age on polling day. See [SR-02](#sr-02-roll-signing-and-eligibility) | `backend/keys/roll_public.pem`, `18` |
 | `BALLOT_TOKEN_MINUTES` | How long a ballot token stays usable after it is issued. See [SR-03](#sr-03-single-ballot-per-elector) | `10` |
 
@@ -214,7 +215,7 @@ Never commit a real `.env` file. Only `.env.example` belongs in Git.
 - Nothing is stored in `localStorage` or `sessionStorage`. The ballot token, selections and registration details live in memory and are cleared on submit, sign out, session timeout and leaving the register screen.
 - Sign in and registration step 1 each show one generic message for every failure, so the screen never reveals which detail was wrong, or who is on the roll.
 - Passwords are cleared from the page as soon as they are sent. The authenticator secret and QR code exist only while step 3 is on screen.
-- The session timer counts down from sign in. Ordinary activity does not reset it. Only the voter choosing Keep voting in the warning calls `POST /api/auth/extend`, and only that call extends the server session.
+- The session timer counts down from sign in. Ordinary activity does not reset it. Only the voter choosing Keep voting in the warning calls `POST /api/auth/extend`, and only that call extends the server session. The timer restarts only once the server agrees. After the second extension the warning says no more time is available, and the session ends on time (SR-04).
 - The receipt screen signs itself out after 60 seconds, for shared terminals.
 - Fonts are bundled with the app (no font CDN), and the QR code is drawn in the browser, so the page makes no third-party requests.
 - Sessions live in `HttpOnly`, `SameSite=Strict` cookies, so page scripts cannot read them and other sites cannot send them. The frontend and API are served from one origin through the dev server's proxy.
@@ -252,7 +253,7 @@ Every elector must pass two steps before any voting route opens:
 |---|---|---|
 | `MAX_FAILED_ATTEMPTS` | `5` | Failed attempts in a row, at either step, before the account locks. A full sign in resets the count |
 | `LOCK_MINUTES` | `15` | How long the account stays locked. The count starts again once the lock ends |
-| `MFA_PENDING_MINUTES` | `5` | Time allowed between step 1 and step 2 |
+| `MFA_PENDING_MINUTES` | `2` | Time allowed between step 1 and step 2 (5 before SR-04) |
 | `RATE_LIMIT_ATTEMPTS` | `20` | Sign-in requests (both steps together) allowed per client IP in each window |
 | `RATE_LIMIT_WINDOW_SECONDS` | `300` | Length of that window |
 | `COOKIE_SECURE` | `true` | Marks the `session` cookie `Secure`. `backend/.env.example` sets it to `false` because the local demo runs on `http://localhost` |
@@ -365,6 +366,41 @@ Design only, not implemented:
 - Paper and absent-vote channels. They would mark the same `voter_participation` row, so an elector who voted on paper could not vote online, and the reverse.
 - Staff screens for resetting an elector.
 - Binding the token to the elector. A token works for any eligible elector who holds it, and the participation row still allows only one ballot each.
+
+## SR-04: session lifetime and binding
+
+Sessions live on the server. The cookie holds only a 256-bit random identifier, and the database keeps only its SHA-256.
+
+**Fixed expiry.** A signed-in session expires `SESSION_MINUTES` (10) after it is issued. Activity never lengthens it: requests record `last_seen` but leave `expires_at` alone. Every request checks the expiry, for pending and signed-in sessions alike, and an expired session gets the usual `401`. Expired rows are deleted whenever a new sign in starts.
+
+**Login challenge.** The session between the password step and the code step lasts `MFA_PENDING_MINUTES`, now 2 minutes (it was 5 under SR-01). It is accepted only by `POST /api/auth/verify`, and it is deleted once the code is accepted. The signed-in session that replaces it has a new identifier. A signed-in session is refused by `/auth/verify`, and a pending one by every voting route and `/auth/extend`. The account always comes from the session row, never from anything the browser sends.
+
+**Extension with rotation.** `POST /api/auth/extend` is one `UPDATE`. It gives the session a new identifier, sets its expiry to 10 minutes from now and counts the extension, but only while the session is signed in, unexpired and under `MAX_SESSION_EXTENSIONS` (2).
+- The old identifier stops working at once.
+- If several requests arrive with the same identifier, only one succeeds; the others get `401`.
+- Past the limit the answer is `409 extension_limit`.
+- An expired or unknown identifier gets `401`.
+
+Each extension needs an unexpired session, so a sign in lasts at most 30 minutes before the voter must sign in again. In the frontend the timer restarts only after the server agrees. After the limit, the warning says no more time is available and the session ends on time.
+
+**After a ballot.** In the same transaction that accepts the ballot (SR-03), the session's expiry becomes the earlier of its current expiry and `POST_BALLOT_SESSION_SECONDS` (60) from now. Its extensions are also used up. A safe retry of the used token does the same and never lengthens the session. The receipt screen already signs out after 60 seconds.
+
+**Audit.** `SESSION_EXTENDED`, and `SESSION_EXTENSION_REFUSED` with a reason (`limit` or `expired`), each by account only and never with an identifier. Ordinary expired-session rejections are not audited, so they cannot flood the log.
+
+| Setting | Default |
+|---|---|
+| `SESSION_MINUTES` | `10` |
+| `MAX_SESSION_EXTENSIONS` | `2` |
+| `MFA_PENDING_MINUTES` | `2` |
+| `POST_BALLOT_SESSION_SECONDS` | `60` |
+
+Run the SR-04 tests, inside `backend/` with PostgreSQL running:
+
+```
+pytest tests/test_sr04_sessions.py -v
+```
+
+Design only, not implemented: binding a session to the client's IP address or device. A copied cookie works from anywhere until the session ends, which the fixed 10-minute expiry and the 30-minute cap limit.
 
 ## Folder layout
 

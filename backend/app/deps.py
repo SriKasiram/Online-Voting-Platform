@@ -27,6 +27,7 @@ def current_session(request: Request, db: DbSession) -> AuthSession:
     # /ballot/submit and /auth/extend. A session waiting for its code gets 401 here.
     if session is None or session.stage != SessionStage.AUTHENTICATED or session.expires_at <= utc_now():
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "not_signed_in")
+    # SR-04: activity is recorded, but never moves expires_at
     session.last_seen = utc_now()
     return session
 

@@ -171,7 +171,10 @@ class AuthSession(Base):
     )
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     last_seen: Mapped[datetime] = mapped_column(server_default=func.now())
+    # SR-04: set when the session is issued, and changed only by an extension or by an accepted ballot
     expires_at: Mapped[datetime]
+    # SR-04: extensions used so far. Each one also gives the session a new identifier.
+    extensions: Mapped[int] = mapped_column(default=0, server_default=text("0"))
 
 
 class RegistrationStage(enum.StrEnum):

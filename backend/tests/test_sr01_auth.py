@@ -337,13 +337,13 @@ def test_audit_records_each_event_without_secrets(
 
 
 def test_settings_defaults() -> None:
-    """SR-01: the defaults used when the environment sets nothing."""
+    """SR-01: the defaults used when the environment sets nothing. SR-04: the pending default is now 2 minutes."""
     defaults = {name: field.default for name, field in Settings.model_fields.items()}
 
     assert {k: defaults[k] for k in ("max_failed_attempts", "lock_minutes", "mfa_pending_minutes")} == {
         "max_failed_attempts": 5,
         "lock_minutes": 15,
-        "mfa_pending_minutes": 5,
+        "mfa_pending_minutes": 2,
     }
     assert (defaults["rate_limit_attempts"], defaults["rate_limit_window_seconds"]) == (20, 300)
     assert defaults["cookie_secure"] is True

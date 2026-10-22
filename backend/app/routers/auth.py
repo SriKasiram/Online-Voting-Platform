@@ -15,7 +15,7 @@ from sqlalchemy import case, delete, or_, select, update
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.deps import CurrentSession, DbSession
+from app.deps import DbSession
 from app.models import Account, AccountRole, AuthSession, ElectoralRollEntry, SessionStage
 from app.schemas import LoginIn, VerifyIn, VerifyOut
 from app.security import (
@@ -49,9 +49,10 @@ def rejected() -> HTTPException:
     return HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid_credentials")
 
 
-def log(db: Session, event_type: str, account_id: UUID | None) -> None:
+def log(db: Session, event_type: str, account_id: UUID | None, **details: str) -> None:
     # SR-01: an audit entry names the account (or "unknown") and the event, never anything typed
-    audit(db, event_type, actor=f"account:{account_id}" if account_id else "unknown")
+    # SR-04: `details` added for a short reason code
+    audit(db, event_type, actor=f"account:{account_id}" if account_id else "unknown", **details)
 
 
 def check_ip_limit(request: Request, db: Session) -> None:
@@ -119,6 +120,9 @@ def start_session(db: Session, response: Response, account_id: UUID, stage: Sess
 def login(body: LoginIn, request: Request, response: Response, db: DbSession) -> None:
     """Part 1. SR-01: checks the password against its Argon2id hash, then waits for the code."""
     check_ip_limit(request, db)
+    # SR-04: every new sign in clears out expired sessions, so the table does not grow.
+    # Committed with whatever this request commits next.
+    db.execute(delete(AuthSession).where(AuthSession.expires_at < utc_now()))
     account = db.scalar(select(Account).where(Account.username == body.username.strip()))
     if account is None or (account.locked_until is not None and account.locked_until > utc_now()):
         # SR-01: the same Argon2id work as a real check, so the response time reveals neither case
@@ -183,11 +187,52 @@ def verify(body: VerifyIn, request: Request, response: Response, db: DbSession) 
 
 
 @router.post("/extend", status_code=status.HTTP_204_NO_CONTENT)
-def extend(session: CurrentSession, db: DbSession) -> None:
-    """Starts a new full session. Called only when the voter chooses Keep voting."""
-    # SR-01: CurrentSession accepts only a session that passed both sign-in steps
-    session.expires_at = utc_now() + timedelta(minutes=settings.session_minutes)
+def extend(request: Request, response: Response, db: DbSession) -> None:
+    """
+    Starts a new full session. Called only when the voter chooses Keep voting.
+    SR-04: one UPDATE moves the session to a new identifier with a new expiry,
+    and only if it is signed in, unexpired and under MAX_SESSION_EXTENSIONS. The
+    old identifier stops working at once, and of several requests carrying it
+    only the first can match.
+    """
+    old = request.cookies.get(SESSION_COOKIE)
+    now = utc_now()
+    token = new_token()
+    rotated = (
+        db.execute(
+            update(AuthSession)
+            .where(
+                AuthSession.session_id_hash == hash_token(old),
+                AuthSession.stage == SessionStage.AUTHENTICATED,
+                AuthSession.expires_at > now,
+                AuthSession.extensions < settings.max_session_extensions,
+            )
+            .values(
+                session_id_hash=hash_token(token),
+                expires_at=now + timedelta(minutes=settings.session_minutes),
+                extensions=AuthSession.extensions + 1,
+            )
+            .returning(AuthSession.account_id)
+            .execution_options(synchronize_session=False)
+        ).first()
+        if old
+        else None
+    )
+    if rotated is None:
+        # SR-04: say why only when the session is really this voter's: the limit gets 409,
+        # and an expired or unknown identifier gets the same 401 as everywhere else
+        current = db.get(AuthSession, hash_token(old)) if old else None
+        if current is not None and current.stage == SessionStage.AUTHENTICATED:
+            limit = current.expires_at > now
+            log(db, "SESSION_EXTENSION_REFUSED", current.account_id, reason="limit" if limit else "expired")
+            db.commit()
+            if limit:
+                raise HTTPException(status.HTTP_409_CONFLICT, "extension_limit")
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "not_signed_in")
+
+    log(db, "SESSION_EXTENDED", rotated.account_id)
     db.commit()
+    set_cookie(response, SESSION_COOKIE, token, SESSION_PATH, secure=settings.cookie_secure)
 
 
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)

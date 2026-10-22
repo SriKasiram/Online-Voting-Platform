@@ -55,6 +55,9 @@ export default function App() {
   const [notice, setNotice] = useState("");
   // Changing this gives the sign-in form a fresh start, so nothing typed is left behind
   const [loginKey, setLoginKey] = useState(0);
+  // SR-04: "refused" once the server says the session cannot be extended again,
+  // "acknowledged" once the voter has closed that warning
+  const [extension, setExtension] = useState<"allowed" | "refused" | "acknowledged">("allowed");
 
   // Clears everything held in the browser, so the next voter on a shared
   // terminal starts from a blank screen.
@@ -66,6 +69,7 @@ export default function App() {
     setReceipt(null);
     setNotice(message);
     setLoginKey((key) => key + 1);
+    setExtension("allowed"); // SR-04: the next sign in starts with its extensions unused
     try {
       await logout();
     } catch {
@@ -88,13 +92,26 @@ export default function App() {
   }
 
   const ballotOpen = screen === "ballot" || screen === "review";
-  const warningOpen = ballotOpen && session.secondsLeft > 0 && session.secondsLeft <= WARN_SECONDS;
+  // SR-04: once the voter has read that no more time is available, the warning stays closed
+  const warningOpen =
+    ballotOpen && session.secondsLeft > 0 && session.secondsLeft <= WARN_SECONDS && extension !== "acknowledged";
 
   async function handleKeepVoting() {
-    session.extend();
+    // SR-04: after a refusal the button only closes the warning, and the session ends on time
+    if (extension !== "allowed") {
+      setExtension("acknowledged");
+      return;
+    }
     try {
       await extendSession();
-    } catch {
+      // SR-04: restart the timer only once the server has issued the new session
+      session.extend();
+    } catch (error) {
+      // SR-04: limit reached: say so, and let the time that is left run out
+      if (error instanceof ApiError && error.code === "extension_limit") {
+        setExtension("refused");
+        return;
+      }
       void signOut(SESSION_ENDED);
     }
   }
@@ -189,6 +206,8 @@ export default function App() {
         open={warningOpen}
         secondsLeft={session.secondsLeft}
         minutes={SESSION_MINUTES}
+        // SR-04: the warning offers more time only while the server still allows it
+        canExtend={extension === "allowed"}
         onKeep={() => void handleKeepVoting()}
         onSignOut={() => void signOut("You have signed out.")}
       />
