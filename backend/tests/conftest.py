@@ -86,7 +86,8 @@ def alembic_config() -> Config:
 def engine(alembic_config: Config) -> Iterator[Engine]:
     name = settings.postgres_test_db
     recreate_test_database(name)
-    test_engine = create_engine(settings.database_url(name))
+    # SR-12: like the app's engine, so tests see the same (parameter-free) database errors
+    test_engine = create_engine(settings.database_url(name), hide_parameters=True)
     with test_engine.begin() as connection:
         alembic_config.attributes["connection"] = connection
         command.upgrade(alembic_config, "head")

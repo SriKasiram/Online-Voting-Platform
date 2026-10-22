@@ -12,6 +12,9 @@ keys/
 backend/keys/
 # SR-10: the development TLS certificate and its private key (python -m scripts.dev_certs)
 certs/
+# SR-12: ballot-side exports (python -m scripts.export_ballots) and server log files (LOG_DIR)
+exports/
+logs/
 
 # Databases and dumps
 *.sqlite

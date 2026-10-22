@@ -30,6 +30,7 @@ from app.ballot_crypto import (
 )
 from app.config import PROJECT_DIR, settings
 from app.db import SessionLocal
+from app.stores import ballot_rows
 
 # SR-11: the only columns ballots may have. Any other column could hold a readable ballot.
 BALLOT_COLUMNS = {"id", "election_id", "encrypted_payload"}
@@ -37,7 +38,8 @@ LEGACY_BALLOT_COLUMNS = {"division_id", "ciphertext", "nonce", "key_id"}
 # SR-11: the other tables that touch ballots (receipts, participation, the audit log), with the
 # columns they may have. A new column there has to be reviewed before a release.
 OTHER_TABLES = {
-    "ballot_tokens": {"id", "election_id", "token_hash", "expires_at", "consumed_at", "receipt_reference"},
+    # SR-12: tokens no longer hold expires_at or consumed_at
+    "ballot_tokens": {"id", "election_id", "token_hash", "receipt_reference"},
     "voter_participation": {"roll_id", "election_id", "state"},
     "audit_log": {"id", "created_at", "event_type", "actor", "details", "prev_hash", "hash"},
 }
@@ -81,7 +83,8 @@ def check_ballot_records(db: Session) -> Check:
     name = "a. ballot records"
     if "encrypted_payload" not in columns_of(db, "ballots"):
         return Check(name, "FAIL", "ballots has no encrypted_payload column (run alembic upgrade head)")
-    rows = db.execute(text("SELECT id, election_id, encrypted_payload FROM ballots")).all()
+    # SR-12: in ballot id order, so the failing ids it prints do not show the order ballots arrived in
+    rows = list(ballot_rows(db))
     problems: list[str] = []
     for ballot_id, election_id, stored in rows:
         blob = bytes(stored)

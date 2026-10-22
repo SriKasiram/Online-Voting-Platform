@@ -9,7 +9,9 @@ from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 from app.config import settings
 
-engine = create_engine(settings.database_url(), pool_pre_ping=True)
+# SR-12: database errors never show their SQL parameters, which for the ballot routes are ballot ids,
+# token hashes and receipts. Unhandled errors end up in the server log in full.
+engine = create_engine(settings.database_url(), pool_pre_ping=True, hide_parameters=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
 
 

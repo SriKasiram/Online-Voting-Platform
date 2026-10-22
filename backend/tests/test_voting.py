@@ -69,7 +69,7 @@ def test_stored_ballot_holds_the_preferences_and_nothing_about_the_voter(
     assert decrypt_ballot(stored.encrypted_payload, stored.id, stored.election_id)[RANKING_FIELD] == ranking  # SR-11
     token_hash = hash_token(ballot["ballot_token"]).hex()
     token = db_session.scalars(select(BallotToken).where(BallotToken.token_hash == token_hash)).one()
-    assert token.consumed_at is not None
+    assert token.receipt_reference is not None  # SR-12: the receipt marks the token used; no time is kept
     roll_id = db_session.get_one(Account, voter.account_id).roll_id
     participation = db_session.get_one(VoterParticipation, (roll_id, election.election.id))
     assert participation.state == ParticipationState.VOTED

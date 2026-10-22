@@ -21,6 +21,10 @@ values. SR-11: ballots.encrypted_payload holds the whole ballot (division and
 ranking) encrypted with AES-256-GCM (app/ballot_crypto.py); nothing else
 about a ballot is stored in readable form.
 SR-07: ballot_definitions hold payloads signed by two delegates (app/ballot_definitions.py).
+SR-12: app/stores.py puts every table on the identity side or the ballot side.
+The ballot side (ballot_tokens, ballots) has no foreign key, no time column
+and no serial id: its election_id is a plain value, so nothing joins it to the
+identity side, and no timestamp can be matched against the audit log.
 """
 
 import enum
@@ -266,16 +270,19 @@ class BallotToken(Base):
     SR-03: a single-use authorisation to cast one ballot. No elector reference
     and no issue time. receipt_reference is set when the token is used, and is
     the only way to find the row again.
+    SR-12: no expiry and no "used at" time any more: those matched the audit
+    log's issue and acceptance times to the second. A token is unused while
+    receipt_reference is empty, and usable only while its election is open and
+    the elector is signed in.
     """
 
     __tablename__ = "ballot_tokens"
 
     id: Mapped[uuid.UUID] = uuid_pk()
-    election_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("elections.id"))
+    # SR-12: a plain value, no foreign key: the ballot side does not join the identity side
+    election_id: Mapped[uuid.UUID]
     # SHA-256 of the token as hex. The token itself is never stored.
     token_hash: Mapped[str] = mapped_column(unique=True)
-    expires_at: Mapped[datetime]
-    consumed_at: Mapped[datetime | None]
     receipt_reference: Mapped[str | None]
 
 
@@ -285,7 +292,8 @@ class Ballot(Base):
     # Random (version 4) UUID, so an id never reveals the order ballots arrived in.
     # SR-11: chosen by the application before the INSERT, because it is part of the AES-GCM associated data.
     id: Mapped[uuid.UUID] = uuid_pk()
-    election_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("elections.id"))
+    # SR-12: a plain value, no foreign key: the ballot side does not join the identity side
+    election_id: Mapped[uuid.UUID]
     # SR-11: the division and the ranking, encrypted: version byte, nonce, ciphertext and tag.
     # The division is ballot content too, so it has no readable column any more.
     encrypted_payload: Mapped[bytes]

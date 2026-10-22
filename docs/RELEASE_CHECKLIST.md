@@ -9,5 +9,9 @@ Work through every step, in order, before a release. A release needs every requi
 3. **Ballot storage audit (required, SR-11).** Run `python -m scripts.audit_ballots` against the release database. It must exit with code 0. Attach the output to the release record.
    - Run it inside the git repository, with git installed, so the key check reports PASS rather than SKIPPED.
    - A FAIL blocks the release until the cause is found and fixed.
-4. **Ballot key (SR-11).** `BALLOT_KEY_FILE` exists on the server, and a backup of it is kept separately from the database and its backups. It is never in the repository.
-5. **TLS (SR-10).** The server starts with `python -m app.serve`, and `docs/MANUAL.md` section 6 still passes.
+4. **Separation audit before each election (required, SR-12).**
+   - First make the two separate backup dumps (identity side and ballot side) and the ballot export, as described in the README's SR-12 section.
+   - Then run `python -m scripts.audit_separation --file <each backup and export file>` against the release database. It must exit with code 0, ending in `SR-12 separation audit: PASS`. Attach the output to the release record.
+   - Store and encrypt the two dumps separately, never in the repository.
+5. **Ballot key (SR-11).** `BALLOT_KEY_FILE` exists on the server, and a backup of it is kept separately from the database and its backups. It is never in the repository.
+6. **TLS (SR-10).** The server starts with `python -m app.serve`, and `docs/MANUAL.md` section 6 still passes.

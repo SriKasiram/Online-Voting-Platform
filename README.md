@@ -200,7 +200,7 @@ After 5 wrong enrolment codes the entry is locked, and the same reset unlocks it
 
 Errors come back as `{"detail": "<reason>"}`:
 
-- Sign in and voting: `invalid_credentials` and `not_signed_in` (401), `too_many_requests` (429), `forbidden` (staff, SR-05) and `not_enrolled` (403), `no_open_election` (404), `already_voted` and `extension_limit` (409), `invalid_ballot` (400 for a ballot token problem) and `ballot_expired` (400), `informal_ballot` and `invalid_ballot` (422 for the ranking, SR-08), `ballot_unavailable` (503, SR-07).
+- Sign in and voting: `invalid_credentials` and `not_signed_in` (401), `too_many_requests` (429), `forbidden` (staff, SR-05) and `not_enrolled` (403), `no_open_election` (404), `already_voted` and `extension_limit` (409), `invalid_ballot` (400 for a ballot token problem; SR-12 removed `ballot_expired`), `informal_ballot` and `invalid_ballot` (422 for the ranking, SR-08), `ballot_unavailable` (503, SR-07).
 - Admin (SR-05): `not_signed_in` (401), `forbidden` (403), `not_found` (404), `already_voted` (409).
 - Registration: `registration_failed`, `username_invalid`, `password_too_short`, `password_is_username`, `wrong_code` and `too_many_attempts` (400), `registration_session_invalid` (401), `username_taken` and `already_registered` (409).
 
@@ -224,6 +224,8 @@ pytest
 The same checks run on every pull request through GitHub Actions (`.github/workflows/ci.yml`). The backend job runs pytest against a PostgreSQL 16 service container.
 
 Before every release, also run the SR-11 storage audit, `python -m scripts.audit_ballots`, against the release database. It must exit with code 0. See [docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md).
+
+Before each election, export the ballot side (`python -m scripts.export_ballots`) and take backups as two separate dump files, one for each side ([SR-12](#sr-12-identity-and-ballots-kept-apart)). Then run `python -m scripts.audit_separation --file <each backup and export file>`. It must also exit with code 0.
 
 ## Settings
 
@@ -253,8 +255,8 @@ Copy `backend/.env.example` to `backend/.env`. Docker Compose reads the same fil
 | `SECRET_KEY` | Root secret for field encryption and keyed hashes, at least 32 characters. Required | none |
 | `MAX_FAILED_ATTEMPTS`, `LOCK_MINUTES`, `MFA_PENDING_MINUTES`, `RATE_LIMIT_ATTEMPTS`, `RATE_LIMIT_WINDOW_SECONDS`, `COOKIE_SECURE` | Sign-in lockout, rate limit and cookie settings. See [SR-01](#sr-01-authentication-and-rate-limiting) | `5`, `15`, `2`, `20`, `300`, `true` |
 | `ROLL_PUBLIC_KEY_PATH`, `MIN_VOTING_AGE` | The roll's Ed25519 public key, and the minimum age on polling day. See [SR-02](#sr-02-roll-signing-and-eligibility) | `backend/keys/roll_public.pem`, `18` |
-| `BALLOT_TOKEN_MINUTES` | How long a ballot token stays usable after it is issued. See [SR-03](#sr-03-single-ballot-per-elector) | `10` |
 | `DELEGATE_KEYRING_PATH`, `REQUIRED_DELEGATE_APPROVALS`, `MIN_ACTIVATION_LEAD_HOURS` | The delegates' public keyring, the distinct delegates who must sign, and how long before polls open a definition must be activated. See [SR-07](#sr-07-signed-ballot-definitions) | `backend/keys/delegates/keyring.json`, `2`, `24` |
+| `LOG_DIR` | Folder of the server's log files, if its output is saved to files. The SR-12 separation audit scans it | `logs/` at the project root |
 | `BALLOT_KEY_FILE` | The 32-byte AES-256 key that encrypts every stored ballot (`python -m scripts.gen_ballot_key`). No default key exists: without this file the API does not start. See [SR-11](#sr-11-ballots-encrypted-at-rest) | `backend/keys/ballot.key` |
 | `HSTS_MAX_AGE` | Seconds the browser must use HTTPS only for this host. `.env.example` sets `300` for local work. See [SR-10](#sr-10-tls-13-for-ballot-transmission) | `31536000` (one year) |
 | `TLS_CERT_FILE`, `TLS_KEY_FILE`, `SERVER_PORT` | The TLS certificate and key `python -m app.serve` uses (relative to the project root), and its single HTTPS port (SR-10) | `certs/dev-cert.pem`, `certs/dev-key.pem`, `8443` |
@@ -382,22 +384,22 @@ Design only, not implemented:
 
 No elector can have more than one ballot accepted in an election, however many requests, devices or replays there are.
 
-**Issue** (`GET /api/ballot`). First the SR-01 signed-in session, then the SR-02 eligibility check. Then, in one transaction, the elector's row is inserted into `voter_participation` with state `issued` (`INSERT ... ON CONFLICT DO NOTHING`). If the row already exists, the elector already has a token or has voted: the answer is `409 already_voted` and nothing is issued. Otherwise the server creates a token of 256 random bits (`secrets.token_urlsafe(32)`), stores only its SHA-256 (hex) and an expiry `BALLOT_TOKEN_MINUTES` (10) minutes away, and returns the token once in `ballot_token`. The token itself is never stored or logged.
+**Issue** (`GET /api/ballot`). First the SR-01 signed-in session, then the SR-02 eligibility check. Then, in one transaction, the elector's row is inserted into `voter_participation` with state `issued` (`INSERT ... ON CONFLICT DO NOTHING`). If the row already exists, the elector already has a token or has voted: the answer is `409 already_voted` and nothing is issued. Otherwise the server creates a token of 256 random bits (`secrets.token_urlsafe(32)`), stores only its SHA-256 (hex), and returns the token once in `ballot_token`. SR-12: no expiry is stored; the token is usable while the election is open and the elector is signed in. The token itself is never stored or logged.
 
 **Accept** (`POST /api/ballot/submit`). Again, the signed-in session and eligibility come first. Then, in one transaction:
 
 1. lock the elector's participation row (`SELECT ... FOR UPDATE`), then the token row, always in that order;
 2. reject an unknown or altered token (`400 invalid_ballot`);
 3. if the token was already used, return the first answer again (`200`, same receipt reference) and store nothing;
-4. reject an expired token (`400 ballot_expired`);
+4. (SR-12: there is no separate token expiry any more; a closed election gives `404 no_open_election`, and an ended session `401 not_signed_in`);
 5. reject an elector who is not `issued`: `409 already_voted` if they have voted, `400 invalid_ballot` if they were never issued a ballot;
 6. check the ballot content as before;
-7. consume the token with one conditional `UPDATE` that must change exactly one row, recording when it was used and a random receipt reference;
+7. consume the token with one conditional `UPDATE` that must change exactly one row, recording a random receipt reference (SR-12: no time);
 8. store the ballot and mark the elector `voted`, then commit.
 
 Any failure rolls everything back: a token is never used without a ballot, and a ballot never exists without the elector marked voted. A token stays unused after a rejected ballot, so the voter can correct it and submit again.
 
-**Reloading the ballot page loses the token.** The token is returned once and lives only in the page's memory, and a second ballot request gets `already_voted`. The same happens if the 10 minutes pass. During development, clear the reviewer's `issued` state with:
+**Reloading the ballot page loses the token.** The token is returned once and lives only in the page's memory, and a second ballot request gets `already_voted`. The same happens if the session ends before the ballot is submitted. During development, clear the reviewer's `issued` state with:
 
 ```
 python -m scripts.seed --reset-participation
@@ -405,9 +407,9 @@ python -m scripts.seed --reset-participation
 
 It refuses once the reviewer has voted, because a cast ballot cannot be undone by design. Only `python -m scripts.seed --reset` (all data) starts that over. Each reset is audited as `ELECTOR_RESET`. There is no API endpoint or staff screen for it.
 
-**Unlinked tables.** `voter_participation` (roll entry, election, state) has no timestamp. `ballot_tokens` (id, election, hash, expiry, when used, receipt reference) has no elector and no issue time. `ballots` (id, election, division, content) has no token, no reference and no time. So the database cannot match a ballot to a token, or a token to an elector. The receipt reference on the used token row is the only handle, and it points at no ballot.
+**Unlinked tables.** `voter_participation` (roll entry, election, state) has no timestamp. `ballot_tokens` (id, election, hash, receipt reference) has no elector and no time at all (SR-12). `ballots` (id, election, division, content) has no token, no reference and no time. So the database cannot match a ballot to a token, or a token to an elector. The receipt reference on the used token row is the only handle, and it points at no ballot.
 
-**Audit.** `BALLOT_TOKEN_ISSUED`, `BALLOT_ACCEPTED`, `BALLOT_REPLAY_BLOCKED`, and `BALLOT_TOKEN_REJECTED` with a reason (`invalid`, `expired`, `wrong_state`), each with the account and the event only. No token, hash, receipt reference or ballot content.
+**Audit.** `BALLOT_TOKEN_ISSUED`, `BALLOT_ACCEPTED`, `BALLOT_REPLAY_BLOCKED`, and `BALLOT_TOKEN_REJECTED` with a reason (`invalid`, `wrong_state`; SR-12 removed `expired`), each with the account and the event only. No token, hash, receipt reference or ballot content.
 
 Run the SR-03 tests, inside `backend/` with PostgreSQL running:
 
@@ -835,6 +837,81 @@ The tests use their own temporary key (`tests/conftest.py`), so neither the test
 - **PostgreSQL transparent data encryption (TDE).**
 - **An automatic audit job in the release pipeline.** For now a person runs the audit, as part of the release checklist.
 
+## SR-12: identity and ballots kept apart
+
+From the moment a ballot is accepted, and for as long as it is kept, no persistent record or identifier can link an elector to their ballot. Before each election, checks of the schema, data, logs, backups and exports confirm it.
+
+**Two stores.** `app/stores.py` puts every table on one side. `tests/test_sr12_separation.py` fails if a new table has no side.
+
+| Side | Tables |
+|---|---|
+| Identity (`IDENTITY_TABLES`) | `electoral_roll`, `accounts` (electors and staff), `sessions`, `registration_sessions`, `voter_participation` (issued or voted, never how), `audit_log`. Also the public election setup: `elections`, `divisions`, `candidates` and `ballot_definitions`. These hold no ballot content and are referenced by the roll and participation |
+| Ballot (`BALLOT_TABLES`) | `ballots` (random id, election id, SR-11 ciphertext) and `ballot_tokens` (random id, election id, token hash, receipt) |
+
+Sign-in rate-limit counts are identity-side too, but they live in memory only. `alembic_version` is Alembic's own bookkeeping and belongs to neither side.
+
+**What changed (migration `0010`).** Existing data is assumed to be test data only, and it is kept.
+- **Times on the ballot side.** `ballot_tokens.expires_at` and `consumed_at` matched the `BALLOT_TOKEN_ISSUED` and `BALLOT_ACCEPTED` audit entries, which name the elector, to the second. Both are removed.
+- **Token validity.** A token is now unused while its receipt is empty. It is usable while its election is open and the elector is signed in (SR-04), so `BALLOT_TOKEN_MINUTES` and `400 ballot_expired` are gone.
+- **Exact times stay on the identity side.** The audit log, sessions and participation keep theirs.
+- **Foreign keys.** `ballots` and `ballot_tokens` no longer have foreign keys to `elections`: the election id is a plain value. So the ballot side has no foreign key at all.
+- **Database errors.** They no longer show their SQL parameters (`hide_parameters=True`). If storing an accepted ballot fails, the error raised carries none of the database's text about the row, so the server log cannot repeat a ballot id, token hash or receipt.
+- **Bulk reads.** Every bulk read of ballots (`stores.ballot_rows`: the export, the SR-11 audit, any future count) is ordered by the random ballot id, never by arrival order or time.
+- **Audit events.** `BALLOT_TOKEN_ISSUED` and `BALLOT_ACCEPTED` hold only the event type and the elector's account. The access log has request lines only, and no exception handler includes a ballot value.
+
+**Export the ballot side.** Inside `backend/`:
+
+```
+python -m scripts.export_ballots --out exports/ballots.jsonl
+```
+
+This writes one line per ballot, `{"ballot_id", "election_id", "encrypted_payload_b64"}`, ordered by ballot id. It reads the `ballots` table only and never decrypts. `exports/` is in `.gitignore`.
+
+**Backups: always two separate dump files.** Never back up the whole database as one file. Run these from the repository folder (PowerShell). Change `-U` and `-d` if your settings differ:
+
+```powershell
+New-Item -ItemType Directory -Force ..\evoting-backups | Out-Null
+docker compose exec db pg_dump -U evoting -d evoting --no-owner -f /tmp/identity.sql -t public.accounts -t public.audit_log -t public.ballot_definitions -t public.candidates -t public.divisions -t public.elections -t public.electoral_roll -t public.registration_sessions -t public.sessions -t public.voter_participation -t public.alembic_version
+docker compose exec db pg_dump -U evoting -d evoting --no-owner -f /tmp/ballots.sql -t public.ballots -t public.ballot_tokens
+docker compose cp db:/tmp/identity.sql ..\evoting-backups\identity.sql
+docker compose cp db:/tmp/ballots.sql ..\evoting-backups\ballots.sql
+docker compose exec db rm /tmp/identity.sql /tmp/ballots.sql
+```
+
+- **What each file holds.** The identity dump holds `IDENTITY_TABLES` (plus `alembic_version`, so a restore knows its revision). The ballot dump holds `BALLOT_TABLES` only.
+- **Encrypt them separately.** Use a different key for each, for example `gpg --symmetric --cipher-algo AES256`. Store them in different places, never in the repository, and never together with the SR-11 ballot key.
+
+**Separation audit.** Inside `backend/`, before each election:
+
+```
+python -m scripts.audit_separation --file ..\..\evoting-backups\identity.sql --file ..\..\evoting-backups\ballots.sql --file exports\ballots.jsonl
+```
+
+It prints PASS, FAIL or SKIPPED per check, then `SR-12 separation audit: PASS` or `FAIL (n checks)`, and exits with code 1 if any check fails:
+- **a. Foreign keys.** Every table has a side, and no foreign key joins the sides.
+- **b. Ballot-side columns.** No ballot-side column name contains `elector`, `roll`, `user`, `session` or `agent`, or has the word `ip`. No ballot-side column has a timestamp or time type, and none is serial or identity.
+- **c. Identity-side data.** Every ballot id, token id, token hash and receipt is checked against every identity-side row and the audit log. The text is scanned with patterns for 64-hex hashes, UUIDs and receipts, and each match is looked up in a set.
+- **d. Logs.** The same scan runs on the audit log, every file in `LOG_DIR` (default `logs/`), and every `*.log` file in the project.
+- **e. Files given with `--file`.**
+  - In a plain SQL dump, ballot identifiers may appear only inside the ballot tables' own `COPY` blocks or `INSERT` lines.
+  - Any other file (an export) fails if it holds a ballot identifier together with an identity marker: an e-mail address, an elector's or staff member's username, or an account or roll id.
+  - Without `--file`, this check is SKIPPED.
+
+It prints only counts and table or file names.
+
+Run the SR-12 tests, inside `backend/` with PostgreSQL running:
+
+```
+pytest tests/test_sr12_separation.py -v
+```
+
+**Residual risks, and SR-12 design only (not implemented):**
+- **Timing correlation from outside the system.** An observer who watches live network traffic or the web server's access log can match an elector's sign-in to the moment a ballot is stored. The defence is a shuffled batch queue with a minimum batch size, so ballots are written in groups in random order. It is not implemented: it needs a background worker and a flush rule at election close, and it would conflict with immediate receipts in a small demo.
+- **Separate databases or schemas with separate database roles.** For now both sides share one database and one role; only the application keeps them apart.
+- **Scheduled destruction at the end of the retention period.** The retention period itself is an assumption taken from the electoral rules. The prototype deletes nothing automatically.
+- **Physical row order.** PostgreSQL stores rows in pages roughly in insertion order, so someone with raw disk access may still see part of the arrival order. Counting and export never rely on it: they order by the random ballot id.
+- **Encrypted separate backups.** The two dump files and how to encrypt them are documented above. No tool makes or encrypts them automatically.
+
 ## Folder layout
 
 ```
@@ -842,5 +919,6 @@ backend/             FastAPI app, Alembic migrations, seed script and tests
 frontend/            React app
 docs/                MANUAL.md (files and how to run the app), SR-09_INSPECTION.md and sr09-evidence/ (SR-09), RELEASE_CHECKLIST.md (SR-11)
 certs/               SR-10: the development TLS certificate and key (python -m scripts.dev_certs). Never committed
+exports/, logs/      SR-12: ballot-side exports and server log files. Never committed
 docker-compose.yml   PostgreSQL 16 for local development
 ```

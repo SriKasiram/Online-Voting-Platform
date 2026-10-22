@@ -59,8 +59,8 @@ class Settings(BaseSettings):
     # SR-02: minimum age on the election's polling date
     min_voting_age: int = 18
 
-    # SR-03: a ballot token must be used within this many minutes of being issued
-    ballot_token_minutes: int = 10
+    # SR-12: BALLOT_TOKEN_MINUTES is gone. A per-token expiry had to be stored as a time on the ballot
+    # side; a token is now usable while its election is open and the elector is signed in (SR-04).
 
     # SR-07: public keys of the ballot definition delegates, as {key_id: {delegate, public_key}}.
     # The app reads only this file; the delegates' private keys never belong on the API server.
@@ -73,6 +73,10 @@ class Settings(BaseSettings):
     # SR-11: the AES-256 key that encrypts every stored ballot (python -m scripts.gen_ballot_key).
     # Kept beside the SR-02 keys and never committed. There is no default key and no plaintext mode.
     ballot_key_file: Path = BACKEND_DIR / "keys" / "ballot.key"
+
+    # SR-12: where the server's log files go if its output is saved to files. The separation audit
+    # scans this folder, and any *.log file in the project, for ballot identifiers.
+    log_dir: Path = PROJECT_DIR / "logs"
 
     # SR-10: how long browsers must use HTTPS only for this host. One year by default. HSTS ignores
     # the port, so local development sets it short (.env.example) to avoid locking localhost to HTTPS.

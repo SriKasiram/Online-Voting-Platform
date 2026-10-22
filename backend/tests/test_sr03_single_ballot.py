@@ -1,21 +1,21 @@
 """
 SR-03: no more than one ballot per elector per election. A ballot token is
-single use, 256 random bits, expires BALLOT_TOKEN_MINUTES after issue, and is
-consumed in the same transaction that stores the ballot. Replays and
-simultaneous duplicates add no ballot.
+single use, 256 random bits, and is consumed in the same transaction that
+stores the ballot. Replays and simultaneous duplicates add no ballot.
+SR-12: a token has no stored expiry any more. It is usable while its election
+is open and the elector is signed in, and "used" means its receipt is set.
 """
 
 import hashlib
 import json
 import threading
-import uuid
+import traceback
 from collections.abc import Callable, Iterator
 from datetime import timedelta
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import Engine, func, inspect, select, text
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -41,7 +41,9 @@ from scripts.seed import reset_participation, seed
 SUBMIT = "/api/ballot/submit"
 ALREADY_VOTED = (409, {"detail": "already_voted"})
 INVALID = (400, {"detail": "invalid_ballot"})
-EXPIRED = (400, {"detail": "ballot_expired"})
+# SR-12: a token is refused once the session or the election has ended, not after a stored expiry
+SIGNED_OUT = (401, {"detail": "not_signed_in"})
+CLOSED = (404, {"detail": "no_open_election"})
 
 
 def submit(client: TestClient, ballot: dict, token: str | None = None, ranking: list[int] | None = None):
@@ -97,7 +99,8 @@ def test_valid_token_records_exactly_one_ballot(client: TestClient, db_session: 
     assert count(db_session, Ballot) == 1
     assert state_of(db_session, voter, election) == ParticipationState.VOTED
     token = token_row(db_session, ballot["ballot_token"])
-    assert token.consumed_at is not None and token.receipt_reference == response.json()["receipt_id"]
+    # SR-12: the stored receipt is what marks the token used
+    assert token.receipt_reference == response.json()["receipt_id"]
 
 
 def test_replayed_token_gets_the_first_answer_and_no_new_ballot(
@@ -128,30 +131,40 @@ def test_second_ballot_request_is_refused_after_issue_and_after_voting(
     assert count(db_session, BallotToken) == 1
 
 
-def test_token_expires_ten_minutes_after_issue(
+def test_token_lasts_while_the_session_and_the_election_do(
     client: TestClient, db_session: Session, election, make_voter, sign_in, clock
 ) -> None:
-    """SR-03 test 6: accepted at 9 minutes 59 seconds after issue, rejected at 10 minutes 1 second."""
-    assert settings.ballot_token_minutes == 10
-    on_time, late = make_voter(), make_voter()
-    sign_in(on_time)
+    """
+    SR-03 test 6, SR-12: there is no stored token expiry. A token is accepted after 10 minutes while
+    the session is extended, and refused, changing nothing, once the session or the election has ended.
+    """
+    late, signed_out, closed = make_voter(), make_voter(), make_voter()
+    sign_in(late)
     ballot = client.get("/api/ballot").json()
-    clock.advance(minutes=9, seconds=59)
+    clock.advance(minutes=9)
+    assert client.post("/api/auth/extend").status_code == 204
+    clock.advance(minutes=9)
     assert submit(client, ballot).status_code == 200
     client.post("/api/auth/logout")
 
-    sign_in(late)
-    ballot = client.get("/api/ballot").json()
-    # Keeping the session alive does not keep the token alive
-    clock.advance(minutes=5)
-    assert client.post("/api/auth/extend").status_code == 204
-    clock.advance(minutes=5, seconds=1)
-    response = submit(client, ballot)
+    refused = []
+    sign_in(signed_out)
+    after_session = client.get("/api/ballot").json()
+    clock.advance(minutes=settings.session_minutes, seconds=1)
+    refused.append((signed_out, after_session, submit(client, after_session), SIGNED_OUT))
+    client.post("/api/auth/logout")
 
-    assert outcome(response) == EXPIRED
+    sign_in(closed)
+    after_close = client.get("/api/ballot").json()
+    election.election.ends_at = clock.now
+    db_session.commit()
+    refused.append((closed, after_close, submit(client, after_close), CLOSED))
+
+    for voter, paper, response, expected in refused:
+        assert outcome(response) == expected
+        assert state_of(db_session, voter, election) == ParticipationState.ISSUED
+        assert token_row(db_session, paper["ballot_token"]).receipt_reference is None
     assert count(db_session, Ballot) == 1
-    assert state_of(db_session, late, election) == ParticipationState.ISSUED
-    assert token_row(db_session, ballot["ballot_token"]).consumed_at is None
 
 
 @pytest.mark.parametrize("kind", ["unknown", "tampered"])
@@ -168,7 +181,7 @@ def test_unknown_or_tampered_token_changes_nothing(
     assert outcome(submit(client, ballot, token=bad)) == INVALID
     assert count(db_session, Ballot) == 0
     assert state_of(db_session, voter, election) == ParticipationState.ISSUED
-    assert token_row(db_session, real).consumed_at is None
+    assert token_row(db_session, real).receipt_reference is None  # SR-12: still unused
     assert submit(client, ballot).status_code == 200
 
 
@@ -193,12 +206,13 @@ def test_only_the_token_hash_is_stored_and_the_tables_share_no_link(
     schema = inspect(engine)
     columns = {t: {c["name"] for c in schema.get_columns(t)} for t in ("voter_participation", "ballot_tokens", "ballots")}
     assert columns["voter_participation"] == {"roll_id", "election_id", "state"}
-    assert columns["ballot_tokens"] == {"id", "election_id", "token_hash", "expires_at", "consumed_at", "receipt_reference"}
+    # SR-12: no expiry or "used at" time on the token any more
+    assert columns["ballot_tokens"] == {"id", "election_id", "token_hash", "receipt_reference"}
     # SR-11: the division and ranking now live only inside the encrypted payload
     assert columns["ballots"] == {"id", "election_id", "encrypted_payload"}
     for table in ("ballot_tokens", "ballots"):
-        referenced = {fk["referred_table"] for fk in schema.get_foreign_keys(table)}
-        assert referenced <= {"elections", "divisions"}
+        # SR-12: the ballot side has no foreign key at all
+        assert schema.get_foreign_keys(table) == []
     assert {fk["referred_table"] for fk in schema.get_foreign_keys("voter_participation")} == {"electoral_roll", "elections"}
     assert "created_at" not in columns["ballot_tokens"] | columns["ballots"] | columns["voter_participation"]
 
@@ -211,17 +225,21 @@ def test_failure_while_storing_the_ballot_changes_nothing(
     sign_in(voter)
     ballot = client.get("/api/ballot").json()
     real_ballot = ballot_router.Ballot
-    # An election that does not exist makes the database refuse the INSERT
-    # (SR-11: ballots no longer have a division column to break instead)
-    monkeypatch.setattr(ballot_router, "Ballot", lambda **fields: real_ballot(**(fields | {"election_id": uuid.uuid4()})))
+    # A missing ciphertext makes the database refuse the INSERT (SR-11 removed the division column and
+    # SR-12 the election foreign key, which earlier versions of this test broke instead)
+    monkeypatch.setattr(ballot_router, "Ballot", lambda **fields: real_ballot(**(fields | {"encrypted_payload": None})))
 
-    with pytest.raises(IntegrityError):
+    # SR-12: the error that reaches the server log carries none of the database's text about the row
+    with pytest.raises(ballot_router.BallotStoreError) as failed:
         submit(client, ballot)
+    assert str(failed.value) == "the accepted ballot could not be stored"
+    # Everything a server log would print for it, causes and contexts included
+    logged = "".join(traceback.format_exception(failed.value))
+    assert not any(word in logged for word in ("IntegrityError", "NotNullViolation", "Failing row", "DETAIL"))
 
     assert count(db_session, Ballot) == 0
     assert state_of(db_session, voter, election) == ParticipationState.ISSUED
-    token = token_row(db_session, ballot["ballot_token"])
-    assert (token.consumed_at, token.receipt_reference) == (None, None)
+    assert token_row(db_session, ballot["ballot_token"]).receipt_reference is None
     monkeypatch.undo()
     assert submit(client, ballot).status_code == 200
 
@@ -284,7 +302,7 @@ def test_voted_elector_with_another_unused_token_is_refused(
 
     assert outcome(response) == ALREADY_VOTED
     assert count(db_session, Ballot) == 1
-    assert token_row(db_session, other_ballot["ballot_token"]).consumed_at is None
+    assert token_row(db_session, other_ballot["ballot_token"]).receipt_reference is None  # SR-12: unused
 
 
 def test_audit_events_hold_no_token_reference_or_ballot_content(
@@ -292,7 +310,7 @@ def test_audit_events_hold_no_token_reference_or_ballot_content(
 ) -> None:
     """SR-03 test 13: issue, accept, replay and each rejection are audited by account and event type only."""
     before = db_session.scalar(select(func.coalesce(func.max(AuditLogEntry.id), 0)))
-    voted, expired, unissued = make_voter(), make_voter(), make_voter()
+    voted, late_voter, unissued = make_voter(), make_voter(), make_voter()
 
     sign_in(voted)
     ballot = client.get("/api/ballot").json()
@@ -300,12 +318,13 @@ def test_audit_events_hold_no_token_reference_or_ballot_content(
     submit(client, ballot)
     submit(client, ballot, token=new_token())
     client.post("/api/auth/logout")
-    sign_in(expired)
+    # SR-12: tokens no longer expire on their own, so this late ballot is accepted, not rejected
+    sign_in(late_voter)
     late = client.get("/api/ballot").json()
     clock.advance(minutes=5)
     client.post("/api/auth/extend")
     clock.advance(minutes=5, seconds=1)
-    submit(client, late)
+    late_receipt = submit(client, late).json()["receipt_id"]
     client.post("/api/auth/logout")
     sign_in(unissued)
     submit(client, late)
@@ -319,15 +338,17 @@ def test_audit_events_hold_no_token_reference_or_ballot_content(
         "BALLOT_REPLAY_BLOCKED",
         "BALLOT_TOKEN_REJECTED",
     }
-    assert {r.details.get("reason") for r in rows if r.event_type == "BALLOT_TOKEN_REJECTED"} == {
-        "invalid",
-        "expired",
-        "wrong_state",
-    }
-    assert {r.actor for r in rows} == {f"account:{v.account_id}" for v in (voted, expired, unissued)}
+    assert {r.details.get("reason") for r in rows if r.event_type == "BALLOT_TOKEN_REJECTED"} == {"invalid", "wrong_state"}
+    assert {r.actor for r in rows} == {f"account:{v.account_id}" for v in (voted, late_voter, unissued)}
     assert all(set(r.details) <= {"reason"} for r in rows)
     recorded = json.dumps([[r.event_type, r.actor, r.details] for r in rows])
-    secrets = [ballot["ballot_token"], late["ballot_token"], receipt, hashlib.sha256(late["ballot_token"].encode()).hexdigest()]
+    secrets = [
+        ballot["ballot_token"],
+        late["ballot_token"],
+        receipt,
+        late_receipt,
+        hashlib.sha256(late["ballot_token"].encode()).hexdigest(),
+    ]
     assert [s for s in secrets if s in recorded] == []
 
 

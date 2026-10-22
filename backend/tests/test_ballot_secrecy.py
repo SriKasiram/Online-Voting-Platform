@@ -11,17 +11,18 @@ from sqlalchemy import Engine, inspect
 
 EXPECTED_COLUMNS = {
     # SR-03: the rebuilt token table. No elector, no division and no issue time.
-    "ballot_tokens": {"id", "election_id", "token_hash", "expires_at", "consumed_at", "receipt_reference"},
+    # SR-12: and no expiry or "used at" time either
+    "ballot_tokens": {"id", "election_id", "token_hash", "receipt_reference"},
     # SR-11: the division and the ranking exist only inside the AES-256-GCM encrypted payload
     "ballots": {"id", "election_id", "encrypted_payload"},
 }
 ANONYMOUS_TABLES = sorted(EXPECTED_COLUMNS)
 
-# The only tables an anonymous row may point to
-ALLOWED_REFERENCES = {"elections", "divisions"}
+# SR-12: an anonymous row points to no table at all (elections are identity-side, app/stores.py)
+ALLOWED_REFERENCES: set[str] = set()
 
-# SR-03: a token has to expire and record when it was used. Nothing else may hold a time.
-ALLOWED_TIME_COLUMNS = {"ballot_tokens": {"expires_at", "consumed_at"}, "ballots": set()}
+# SR-12: no time of any kind on the ballot side (SR-03 used to allow a token's expiry and use time)
+ALLOWED_TIME_COLUMNS: dict[str, set[str]] = {"ballot_tokens": set(), "ballots": set()}
 
 
 @pytest.mark.parametrize("table", ANONYMOUS_TABLES)
@@ -40,7 +41,7 @@ def test_no_reference_to_accounts_or_the_roll(engine: Engine, table: str) -> Non
 
 @pytest.mark.parametrize("table", ANONYMOUS_TABLES)
 def test_no_date_or_time_columns(engine: Engine, table: str) -> None:
-    """SR-03: ballots hold no time at all, and tokens only their expiry and when they were used."""
+    """SR-03, SR-12: neither ballots nor tokens hold any date or time."""
     for column in inspect(engine).get_columns(table):
         sql_type = column["type"].compile(dialect=engine.dialect).upper()
         if column["name"] in ALLOWED_TIME_COLUMNS[table]:

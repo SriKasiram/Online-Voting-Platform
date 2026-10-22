@@ -159,7 +159,7 @@ def test_a_refused_ballot_changes_nothing_and_can_be_corrected(
 
     assert outcome(submit(client, ballot, make_ranking(northgate))) == (422, expected)
 
-    assert db_session.scalars(select(BallotToken.consumed_at)).one() is None
+    assert db_session.scalars(select(BallotToken.receipt_reference)).one() is None  # SR-12: still unused
     assert state_of(db_session, voter) == ParticipationState.ISSUED
     assert count(db_session, Ballot) == 0
     assert submit(client, ballot, northgate).status_code == 200
