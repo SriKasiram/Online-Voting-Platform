@@ -13,7 +13,7 @@ import re
 import uuid
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 import pyotp
 import pytest
@@ -23,10 +23,10 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from fastapi.testclient import TestClient
 from httpx2 import Response
-from sqlalchemy import Connection, Engine, create_engine, text
+from sqlalchemy import Connection, Engine, create_engine, select, text
 from sqlalchemy.orm import Session
 
-from app import deps, security
+from app import ballot_definitions, deps, security
 from app.config import BACKEND_DIR, settings
 from app.deps import get_db
 from app.main import app
@@ -41,10 +41,16 @@ from app.security import (
     roll_lookup,
     utc_now,
 )
+from scripts import ballot_definition as ballot_definition_script
+from scripts.ballot_definition import build_payload, ensure_delegate_keys, sign, store_active
+from scripts.create_staff import create_staff
 from scripts.sign_roll import sign_record
 
 # SR-02: a fixed polling date, so no test depends on today's date
 POLLING_DATE = date(2027, 5, 15)
+# SR-07: the fixture definition's validity, wide enough for every clock the tests use
+DEFINITION_VALID_FROM = datetime(2000, 1, 1, tzinfo=UTC)
+DEFINITION_VALID_UNTIL = datetime(2100, 1, 1, tzinfo=UTC)
 
 CANDIDATE_NAMES = [
     ("Hana", "Ortega", "Harbour Party"),
@@ -147,6 +153,19 @@ def roll_key(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Ed25519Privat
         yield key
 
 
+@pytest.fixture(scope="session", autouse=True)
+def delegate_keys(tmp_path_factory: pytest.TempPathFactory) -> Iterator[dict[str, Ed25519PrivateKey]]:
+    """
+    SR-07: the three delegates' keys for this test run, made by the delegate script itself,
+    with the API's keyring setting pointed at their keyring. backend/keys/ is never touched.
+    """
+    folder = tmp_path_factory.mktemp("delegates")
+    keys = ensure_delegate_keys(folder)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(settings, "delegate_keyring_path", folder / "keyring.json")
+        yield keys
+
+
 @dataclass
 class Clock:
     now: datetime
@@ -163,7 +182,8 @@ def clock(monkeypatch: pytest.MonkeyPatch) -> Clock:
     and it now sets the time the ballot router sees too.
     """
     fake = Clock(utc_now())
-    for module in (security, deps, auth, ballot):
+    # SR-07: the ballot definition module and the delegate script read the same clock
+    for module in (security, deps, auth, ballot, ballot_definitions, ballot_definition_script):
         monkeypatch.setattr(module, "utc_now", lambda: fake.now)
     return fake
 
@@ -181,8 +201,8 @@ class ElectionData:
 
 
 @pytest.fixture
-def election(db_session: Session) -> ElectionData:
-    """An open election with two divisions of three candidates each."""
+def election(db_session: Session, delegate_keys: dict[str, Ed25519PrivateKey]) -> ElectionData:
+    """An open election with two divisions of three candidates each, and an active signed definition (SR-07)."""
     now = utc_now()
     election = Election(
         name="Test election",
@@ -211,6 +231,13 @@ def election(db_session: Session) -> ElectionData:
         for name, division in divisions.items()
     }
     db_session.add_all([c for rows in candidates.values() for c in rows])
+    db_session.commit()
+    # SR-07: ballots now come only from a signed definition, so every test election has version 1,
+    # signed by two delegates and stored directly as fixture data (as the seed does). Valid from
+    # 2000 to 2100, so tests that move the clock still have a valid definition.
+    payload = build_payload(db_session, election, DEFINITION_VALID_FROM, DEFINITION_VALID_UNTIL)
+    signatures = [sign(delegate_keys[d], payload) for d in ("delegate_a", "delegate_b")]
+    store_active(db_session, election.id, payload, signatures, election.starts_at - timedelta(hours=25))
     db_session.commit()
     return ElectionData(election=election, divisions=divisions, candidates=candidates)
 
@@ -336,6 +363,24 @@ def make_voter(db_session: Session, make_person: Callable[..., Person]) -> Calla
         )
         db_session.commit()
         return voter
+
+    return make
+
+
+@pytest.fixture
+def make_staff(db_session: Session) -> Callable[[str], RegisteredVoter]:
+    """
+    SR-05: a staff account, made by the create_staff script's own function.
+    SR-06: moved here from test_sr05_access_control.py so the SR-06 tests share it.
+    """
+    counter = itertools.count(1)
+
+    def make(role: str) -> RegisteredVoter:
+        n = next(counter)
+        username, password = f"{role}.{n}", f"staff password number {n}"
+        _, secret = create_staff(db_session, username, role, password)
+        account_id = db_session.scalars(select(Account.id).where(Account.username == username)).one()
+        return RegisteredVoter(username, password, secret, full_name=username, division="", account_id=account_id)
 
     return make
 

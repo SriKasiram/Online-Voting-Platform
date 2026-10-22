@@ -25,6 +25,12 @@ class VerifyOut(BaseModel):
     display_name: str
 
 
+class StaffVerifyOut(BaseModel):
+    """SR-06: what /auth/verify returns to a privileged account: only its role."""
+
+    role: str
+
+
 class CandidateOut(BaseModel):
     id: int
     given_name: str

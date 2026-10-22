@@ -5,12 +5,9 @@ permission map. Unmapped admin routes cannot exist, and voting routes accept
 electors only.
 """
 
-import itertools
 import json
 import uuid
-from collections.abc import Callable
 from contextlib import nullcontext
-from dataclasses import dataclass
 
 import pyotp
 import pytest
@@ -21,7 +18,7 @@ from sqlalchemy import func, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app import rbac, security
+from app import rbac
 from app.main import app
 from app.models import Account, AccountRole, AuditLogEntry, ParticipationState, VoterParticipation
 from app.rbac import ROLE_PERMISSIONS, TURNOUT_READ, AdminRouter, check_admin_routes
@@ -45,31 +42,7 @@ EXPECTED = {
 }
 FORBIDDEN = (403, {"detail": "forbidden"})
 
-
-@dataclass
-class Staff:
-    username: str
-    password: str
-    totp_secret: str
-    account_id: uuid.UUID
-
-    def code(self) -> str:
-        return pyotp.TOTP(self.totp_secret).at(security.utc_now())
-
-
-@pytest.fixture
-def make_staff(db_session: Session) -> Callable[[str], Staff]:
-    """SR-05: a staff account, made by the create_staff script's own function."""
-    counter = itertools.count(1)
-
-    def make(role: str) -> Staff:
-        n = next(counter)
-        username, password = f"{role}.{n}", f"staff password number {n}"
-        _, secret = create_staff_script.create_staff(db_session, username, role, password)
-        account_id = db_session.scalars(select(Account.id).where(Account.username == username)).one()
-        return Staff(username, password, secret, account_id)
-
-    return make
+# SR-06: the make_staff fixture moved to conftest.py so the SR-06 tests share it. Behaviour unchanged.
 
 
 @pytest.fixture
@@ -140,25 +113,31 @@ def test_access_control_matrix(
 
 
 def test_staff_cannot_vote_but_can_extend_and_sign_out(client: TestClient, make_staff, sign_in) -> None:
-    """SR-05 test 2: the voting routes accept electors only; extension and sign out work for every role."""
+    """
+    SR-05 test 2: the voting routes accept electors only; extension and sign out work for every role.
+    SR-06: a staff session can no longer be extended, so extension now answers 409 extension_limit.
+    """
     sign_in(make_staff("polling_official"))
 
     assert (client.get("/api/ballot").status_code, client.get("/api/ballot").json()) == FORBIDDEN
     submitted = client.post("/api/ballot/submit", json={"ballot_token": "any", "ranked_candidate_ids": [1]})
     assert (submitted.status_code, submitted.json()) == FORBIDDEN
-    assert client.post("/api/auth/extend").status_code == 204
+    assert client.post("/api/auth/extend").json() == {"detail": "extension_limit"}
     assert client.post("/api/auth/logout").status_code == 204
     assert client.get("/api/admin/turnout").status_code == 401
 
 
 def test_staff_sign_in_end_to_end(client: TestClient, make_staff) -> None:
-    """SR-05 test 3: a staff account signs in with password and code like anyone else, and sees its username."""
+    """
+    SR-05 test 3: a staff account signs in with password and code like anyone else.
+    SR-06: verify now returns the staff member's role instead of their username.
+    """
     staff = make_staff("auditor")
 
     assert client.post("/api/auth/login", json={"username": staff.username, "password": staff.password}).status_code == 204
     verified = client.post("/api/auth/verify", json={"otp_code": staff.code()})
 
-    assert (verified.status_code, verified.json()) == (200, {"display_name": staff.username})
+    assert (verified.status_code, verified.json()) == (200, {"role": "auditor"})
     assert SESSION_COOKIE in verified.cookies
     assert client.get("/api/admin/audit-log/verify").status_code == 200
 

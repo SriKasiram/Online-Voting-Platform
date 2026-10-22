@@ -43,28 +43,39 @@ def record_message(entry: ElectoralRollEntry) -> bytes:
     return DOMAIN_TAG + b"\n" + json.dumps(fields, sort_keys=True, separators=(",", ":")).encode()
 
 
+def parse_public_key(pem: bytes) -> Ed25519PublicKey:
+    # SR-07: split out of load_public_key so the ballot definition keyring uses it too
+    key = load_pem_public_key(pem)
+    if not isinstance(key, Ed25519PublicKey):
+        raise ValueError("not an Ed25519 public key")
+    return key
+
+
 @lru_cache
 def load_public_key(path: Path) -> Ed25519PublicKey:
     # SR-02: read once per path. Raises if the file is missing or is not an Ed25519 public key.
-    key = load_pem_public_key(path.read_bytes())
-    if not isinstance(key, Ed25519PublicKey):
-        raise ValueError("ROLL_PUBLIC_KEY_PATH is not an Ed25519 public key")
-    return key
+    return parse_public_key(path.read_bytes())
 
 
 def public_key() -> Ed25519PublicKey:
     return load_public_key(settings.roll_public_key_path)
 
 
+def verify_signature(key: Ed25519PublicKey, signature: bytes, message: bytes) -> bool:
+    # SR-07: the one Ed25519 check, shared by roll records (SR-02) and ballot definitions. Never raises.
+    try:
+        key.verify(signature, message)
+    except InvalidSignature:
+        return False
+    return True
+
+
 def verify_record(key: Ed25519PublicKey, entry: ElectoralRollEntry) -> bool:
     """SR-02: True only if the record's signature matches its current fields. Never raises on a bad signature."""
     if not entry.record_signature:
         return False
-    try:
-        key.verify(entry.record_signature, record_message(entry))
-    except InvalidSignature:
-        return False
-    return True
+    # SR-07: now through the shared verify_signature; same result as before
+    return verify_signature(key, entry.record_signature, record_message(entry))
 
 
 def check_roll_at_startup(db: Session) -> None:

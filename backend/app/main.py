@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from sqlalchemy import select
 
+from app.ballot_definitions import check_definitions_at_startup
 from app.deps import DbSession, get_db
 from app.models import Division
 from app.rbac import check_admin_routes
@@ -20,7 +21,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Uses the routes' database dependency, so tests check their own database.
     sessions = app.dependency_overrides.get(get_db, get_db)()
     try:
-        check_roll_at_startup(next(sessions))
+        db = next(sessions)
+        check_roll_at_startup(db)
+        # SR-07: and every election whose polls are not closed must have a valid signed definition
+        check_definitions_at_startup(db)
     finally:
         sessions.close()
     yield
