@@ -1,24 +1,43 @@
 """
 The ballot: give a signed-in voter their division's ballot paper, then accept it once.
 
-Ballot secrecy: the ballot row stores no voter and no time. Marking the voter,
-spending the one-time token and storing the ballot happen in one transaction,
-so a vote is never half recorded.
+SR-03: one ballot per elector per election. Issuing a ballot marks the
+elector "issued" and creates a single-use token that expires
+BALLOT_TOKEN_MINUTES later. Accepting it locks the elector's row, then the
+token row, consumes the token, stores the ballot and marks the elector
+"voted", all in one transaction: a token is never used without a ballot, and
+a ballot never exists without the elector marked as voted.
+
+Ballot secrecy: the ballot row stores no voter, no token, no reference and no
+time. The token row stores no voter. Participation stores no time.
 """
 
 import json
 import secrets
+from datetime import timedelta
+from typing import NoReturn
 
 from fastapi import APIRouter, HTTPException, status
-from sqlalchemy import insert, select, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import select, update
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.deps import CurrentVoter, DbSession
 from app.eligibility import eligible_division
-from app.models import Ballot, BallotToken, Candidate, Division, Election, ElectionStatus, VoterParticipation
+from app.models import (
+    Account,
+    Ballot,
+    BallotToken,
+    Candidate,
+    Division,
+    Election,
+    ElectionStatus,
+    ParticipationState,
+    VoterParticipation,
+)
 from app.schemas import BallotOut, CandidateOut, SubmitIn, SubmitOut
-from app.security import hash_token, new_token, utc_now
+from app.security import audit, hash_token, new_token, utc_now
 
 router = APIRouter(prefix="/ballot", tags=["ballot"])
 
@@ -52,11 +71,37 @@ def ballot_candidates(db: Session, election: Election, division_id: int) -> list
 
 def receipt_code() -> str:
     """
-    Stage 2: random, not stored and not linked to the ballot, so it confirms
-    acceptance without revealing the vote. A later stage can make it checkable.
+    Random, so it confirms acceptance without revealing the vote.
+    SR-03: stored only on the used token row, and never derived from the ballot.
     """
     chars = "".join(secrets.choice(RECEIPT_ALPHABET) for _ in range(8))
     return f"{chars[:4]}-{chars[4:]}"
+
+
+def token_hash(token: str) -> str:
+    # SR-03: the SHA-256 of the token, as hex, is all that is ever stored
+    return hash_token(token).hex()
+
+
+def log(db: Session, event_type: str, voter: Account, **details: str) -> None:
+    # SR-03: names the account and the event only, never a token, reference or ballot content
+    audit(db, event_type, actor=f"account:{voter.id}", **details)
+
+
+def reject(db: Session, voter: Account, reason: str, status_code: int, detail: str) -> NoReturn:
+    # SR-03: undoes everything and releases the row locks, then records why. The answer stays generic.
+    db.rollback()
+    log(db, "BALLOT_TOKEN_REJECTED", voter, reason=reason)
+    db.commit()
+    raise HTTPException(status_code, detail)
+
+
+def replay(db: Session, voter: Account, receipt_reference: str) -> SubmitOut:
+    # SR-03: a used token gets the first answer again, and nothing else changes
+    db.rollback()
+    log(db, "BALLOT_REPLAY_BLOCKED", voter)
+    db.commit()
+    return SubmitOut(receipt_id=receipt_reference)
 
 
 @router.get("")
@@ -66,10 +111,20 @@ def get_ballot(voter: CurrentVoter, db: DbSession) -> BallotOut:
     # SR-02: eligibility from the signed roll record, before any ballot token exists. The division
     # comes only from that record; any division the browser sends is never read.
     division_id = eligible_division(db, voter, election)
-    if db.get(VoterParticipation, (voter.id, election.id)) is not None:
+    # SR-03: one participation row per elector per election. If it already exists, the elector
+    # has a token or has voted, so nothing more is issued.
+    issued = db.execute(
+        insert(VoterParticipation)
+        .values(roll_id=voter.roll_id, election_id=election.id, state=ParticipationState.ISSUED)
+        .on_conflict_do_nothing()
+        .returning(VoterParticipation.roll_id)
+    ).first()
+    if issued is None:
+        db.rollback()
         raise HTTPException(status.HTTP_409_CONFLICT, "already_voted")
 
     division = db.get_one(Division, division_id)
+    # SR-03: 256 random bits, returned once. Only its hash and expiry are stored, never who received it.
     token = new_token()
     ballot = BallotOut(
         ballot_token=token,
@@ -81,8 +136,14 @@ def get_ballot(voter: CurrentVoter, db: DbSession) -> BallotOut:
             for c in ballot_candidates(db, election, division.id)
         ],
     )
-    # The token row records the election and division only, never who received it
-    db.add(BallotToken(token_hash=hash_token(token), election_id=election.id, division_id=division.id))
+    db.add(
+        BallotToken(
+            election_id=election.id,
+            token_hash=token_hash(token),
+            expires_at=utc_now() + timedelta(minutes=settings.ballot_token_minutes),
+        )
+    )
+    log(db, "BALLOT_TOKEN_ISSUED", voter)
     db.commit()
     return ballot
 
@@ -94,39 +155,58 @@ def submit_ballot(body: SubmitIn, voter: CurrentVoter, db: DbSession) -> SubmitO
     # SR-02: checked again before the vote is accepted, and the division comes from the signed record
     division_id = eligible_division(db, voter, election)
 
+    # SR-03 (a): lock the elector's participation row first, then the token row, always in that order
+    participation = db.scalars(
+        select(VoterParticipation)
+        .where(VoterParticipation.roll_id == voter.roll_id, VoterParticipation.election_id == election.id)
+        .with_for_update()
+    ).first()
+    if participation is None:
+        reject(db, voter, "wrong_state", status.HTTP_400_BAD_REQUEST, "invalid_ballot")
+    # SR-03 (b): unknown or altered tokens change nothing
+    digest = token_hash(body.ballot_token)
+    token = db.scalars(
+        select(BallotToken)
+        .where(BallotToken.token_hash == digest, BallotToken.election_id == election.id)
+        .with_for_update()
+    ).first()
+    if token is None:
+        reject(db, voter, "invalid", status.HTTP_400_BAD_REQUEST, "invalid_ballot")
+    # SR-03 (c): already used: the same answer as the first time, and no second ballot
+    if token.consumed_at is not None:
+        return replay(db, voter, token.receipt_reference or "")
+    # SR-03 (d): expired BALLOT_TOKEN_MINUTES after it was issued
+    now = utc_now()
+    if token.expires_at <= now:
+        reject(db, voter, "expired", status.HTTP_400_BAD_REQUEST, "ballot_expired")
+    # SR-03 (e): only an elector whose ballot is issued, not yet voted, can use a token
+    if participation.state != ParticipationState.ISSUED:
+        reject(db, voter, "wrong_state", status.HTTP_409_CONFLICT, "already_voted")
+
     # Every candidate numbered exactly once. The frontend checks this too, but only this check counts.
     expected = {c.id for c in ballot_candidates(db, election, division_id)}
     ranking = body.ranked_candidate_ids
     if len(ranking) != len(expected) or set(ranking) != expected:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid_ballot")
 
-    # 1. Mark the voter. The primary key (account_id, election_id) refuses a second vote.
-    try:
-        # SR-02: CurrentVoter is now the account itself
-        db.execute(insert(VoterParticipation).values(account_id=voter.id, election_id=election.id))
-    except IntegrityError:
-        db.rollback()
-        raise HTTPException(status.HTTP_409_CONFLICT, "already_voted") from None
-
-    # 2. Spend the token. It must be unused and issued for this election and division.
-    spent = db.execute(
+    # SR-03 (g): consume the token with one conditional UPDATE. Exactly one row must change.
+    receipt = receipt_code()
+    consumed = db.execute(
         update(BallotToken)
-        .where(
-            BallotToken.token_hash == hash_token(body.ballot_token),
-            BallotToken.election_id == election.id,
-            BallotToken.division_id == division_id,
-            BallotToken.used.is_(False),
-        )
-        .values(used=True)
-        .returning(BallotToken.token_hash)
+        .where(BallotToken.token_hash == digest, BallotToken.consumed_at.is_(None), BallotToken.expires_at > now)
+        .values(consumed_at=now, receipt_reference=receipt)
         .execution_options(synchronize_session=False)
-    ).first()
-    if spent is None:
+    ).rowcount
+    if consumed != 1:
         db.rollback()
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid_ballot")
+        again = db.scalars(select(BallotToken).where(BallotToken.token_hash == digest)).one()
+        if again.consumed_at is None:
+            reject(db, voter, "expired", status.HTTP_400_BAD_REQUEST, "ballot_expired")
+        return replay(db, voter, again.receipt_reference or "")
 
-    # 3. Store the ballot with no voter and no time. Stage 2 keeps the preferences
-    #    as plain JSON in the ciphertext column; a later stage encrypts them.
+    # SR-03 (h): store the ballot with no voter, token, reference or time, and mark the elector
+    # voted, in the same transaction. Stage 2 keeps the preferences as plain JSON in the
+    # ciphertext column; a later stage encrypts them.
     db.add(
         Ballot(
             election_id=election.id,
@@ -136,5 +216,12 @@ def submit_ballot(body: SubmitIn, voter: CurrentVoter, db: DbSession) -> SubmitO
             key_id="unencrypted",
         )
     )
+    db.execute(
+        update(VoterParticipation)
+        .where(VoterParticipation.roll_id == voter.roll_id, VoterParticipation.election_id == election.id)
+        .values(state=ParticipationState.VOTED)
+        .execution_options(synchronize_session=False)
+    )
+    log(db, "BALLOT_ACCEPTED", voter)
     db.commit()
-    return SubmitOut(receipt_id=receipt_code())
+    return SubmitOut(receipt_id=receipt)

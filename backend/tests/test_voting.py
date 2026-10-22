@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import Ballot, BallotToken, ElectionStatus, VoterParticipation
+from app.models import Account, Ballot, BallotToken, ElectionStatus, ParticipationState, VoterParticipation
 from app.security import hash_token
 
 
@@ -56,6 +56,7 @@ def test_voter_can_vote_once(client: TestClient, make_voter, sign_in) -> None:
 def test_stored_ballot_holds_the_preferences_and_nothing_about_the_voter(
     client: TestClient, db_session: Session, election, make_voter, sign_in
 ) -> None:
+    """SR-03: the token is found by its hex hash, and participation by the roll entry."""
     voter = make_voter()
     sign_in(voter)
     ballot = get_ballot(client)
@@ -65,9 +66,12 @@ def test_stored_ballot_holds_the_preferences_and_nothing_about_the_voter(
 
     stored = db_session.scalars(select(Ballot)).one()
     assert json.loads(stored.ciphertext) == ranking  # Stage 2: plain JSON placeholder
-    token = db_session.get(BallotToken, hash_token(ballot["ballot_token"]))
-    assert token is not None and token.used
-    assert db_session.get(VoterParticipation, (voter.account_id, election.election.id)) is not None
+    token_hash = hash_token(ballot["ballot_token"]).hex()
+    token = db_session.scalars(select(BallotToken).where(BallotToken.token_hash == token_hash)).one()
+    assert token.consumed_at is not None
+    roll_id = db_session.get_one(Account, voter.account_id).roll_id
+    participation = db_session.get_one(VoterParticipation, (roll_id, election.election.id))
+    assert participation.state == ParticipationState.VOTED
 
 
 def test_ballot_token_works_only_once(client: TestClient, make_voter, sign_in) -> None:
@@ -90,6 +94,7 @@ def test_ballot_token_works_only_once(client: TestClient, make_voter, sign_in) -
 def test_ballot_must_number_every_candidate_once(
     client: TestClient, election, make_voter, sign_in, problem: str
 ) -> None:
+    """SR-03: after a rejected ballot the same token still works, since a second ballot request is refused."""
     sign_in(make_voter())
     ballot = get_ballot(client)
     ids = [c["id"] for c in ballot["candidates"]]
@@ -105,7 +110,7 @@ def test_ballot_must_number_every_candidate_once(
     assert response.status_code == 400
     assert response.json() == {"detail": "invalid_ballot"}
     # A rejected ballot does not use up the voter's vote
-    assert client.get("/api/ballot").status_code == 200
+    assert submit(client, ballot).status_code == 200
 
 
 def test_ballot_needs_a_signed_in_voter(client: TestClient) -> None:

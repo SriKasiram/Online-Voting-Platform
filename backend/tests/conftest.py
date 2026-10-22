@@ -295,7 +295,8 @@ class RegisteredVoter:
     account_id: uuid.UUID
 
     def code(self) -> str:
-        return pyotp.TOTP(self.totp_secret).now()
+        # SR-03: the app's clock, so sign_in also works while the clock fixture controls time
+        return pyotp.TOTP(self.totp_secret).at(security.utc_now())
 
 
 @pytest.fixture

@@ -131,7 +131,7 @@ The enrolment code works once. To register again, for example to repeat the revi
 python -m scripts.seed --reset-reviewer
 ```
 
-It deletes the reviewer's account, clears the registration and wrong-code count, and restores the code with a fresh one-year expiry. A ballot already cast stays in the ballot box: ballots are not linked to voters, so it cannot be found and removed.
+It deletes the reviewer's account, clears the registration and wrong-code count, and restores the code with a fresh one-year expiry. A ballot already cast stays in the ballot box: ballots are not linked to voters, so it cannot be found and removed. The reviewer's participation record stays too (SR-03), so a reviewer who has voted cannot vote again; only `python -m scripts.seed --reset` starts that over. If the reviewer was issued a ballot but lost it, for example by reloading the page, `python -m scripts.seed --reset-participation` lets them be issued a new one (see [SR-03](#sr-03-single-ballot-per-elector)).
 
 After 5 wrong enrolment codes the entry is locked, and the same reset unlocks it. A registration must be finished within 10 minutes of step 1.
 
@@ -148,12 +148,12 @@ After 5 wrong enrolment codes the entry is locked, and the same reset unlocks it
 | `POST /api/auth/verify` | Part 2: the code from the authenticator app. Replaces the session with a new signed-in one and returns the voter's name (SR-01) |
 | `POST /api/auth/extend` | Starts a new full session. Called only when the voter chooses Keep voting |
 | `POST /api/auth/logout` | Ends the session |
-| `GET /api/ballot` | The voter's ballot paper and a one-time ballot token |
-| `POST /api/ballot/submit` | Accepts the ranked ballot once and returns a receipt code |
+| `GET /api/ballot` | The voter's ballot paper and a single-use ballot token, once per election (SR-03) |
+| `POST /api/ballot/submit` | Accepts the ranked ballot once and returns a receipt code. The same token again returns the same receipt (SR-03) |
 
 Errors come back as `{"detail": "<reason>"}`:
 
-- Sign in and voting: `invalid_credentials` and `not_signed_in` (401), `too_many_requests` (429), `not_a_voter` and `not_enrolled` (403), `no_open_election` (404), `already_voted` (409), `invalid_ballot` (400).
+- Sign in and voting: `invalid_credentials` and `not_signed_in` (401), `too_many_requests` (429), `not_a_voter` and `not_enrolled` (403), `no_open_election` (404), `already_voted` (409), `invalid_ballot` and `ballot_expired` (400).
 - Registration: `registration_failed`, `username_invalid`, `password_too_short`, `password_is_username`, `wrong_code` and `too_many_attempts` (400), `registration_session_invalid` (401), `username_taken` and `already_registered` (409).
 
 ## Checks
@@ -202,6 +202,7 @@ Copy `backend/.env.example` to `backend/.env`. Docker Compose reads the same fil
 | `SECRET_KEY` | Root secret for field encryption and keyed hashes, at least 32 characters. Required | none |
 | `MAX_FAILED_ATTEMPTS`, `LOCK_MINUTES`, `MFA_PENDING_MINUTES`, `RATE_LIMIT_ATTEMPTS`, `RATE_LIMIT_WINDOW_SECONDS`, `COOKIE_SECURE` | Sign-in lockout, rate limit and cookie settings. See [SR-01](#sr-01-authentication-and-rate-limiting) | `5`, `15`, `5`, `20`, `300`, `true` |
 | `ROLL_PUBLIC_KEY_PATH`, `MIN_VOTING_AGE` | The roll's Ed25519 public key, and the minimum age on polling day. See [SR-02](#sr-02-roll-signing-and-eligibility) | `backend/keys/roll_public.pem`, `18` |
+| `BALLOT_TOKEN_MINUTES` | How long a ballot token stays usable after it is issued. See [SR-03](#sr-03-single-ballot-per-elector) | `10` |
 
 The fixed limits (registration time, wrong-code limits, rate limits, password length) are named constants in `backend/app/config.py`.
 
@@ -220,8 +221,8 @@ Never commit a real `.env` file. Only `.env.example` belongs in Git.
 
 ## Backend security notes
 
-- Voter identity (`electoral_roll`, `accounts`, `sessions`, `registration_sessions`, `voter_participation`) is kept apart from the anonymous ballot box (`ballot_tokens`, `ballots`). The ballot tables have no account column and no timestamp, and ballot ids are random UUIDs. `tests/test_ballot_secrecy.py` fails if anyone adds a column to those tables.
-- `voter_participation` records that someone voted, never how. Its primary key `(account_id, election_id)` makes the database refuse a second vote. Submitting marks the voter, spends the one-time ballot token and stores the ballot in one transaction, so a vote is never half recorded.
+- Voter identity (`electoral_roll`, `accounts`, `sessions`, `registration_sessions`, `voter_participation`) is kept apart from the anonymous ballot box (`ballot_tokens`, `ballots`). The ballot tables have no account or roll column, ballots have no timestamp, and ballot ids are random UUIDs. `tests/test_ballot_secrecy.py` fails if anyone adds a column to those tables.
+- `voter_participation` records that an elector was issued a ballot or voted, never how. Its primary key `(roll_id, election_id)` makes the database refuse a second record. Submitting consumes the ballot token, stores the ballot and marks the elector voted in one transaction, so a vote is never half recorded (SR-03).
 - Personal data on the roll (name, address, date of birth, postcode) and every authenticator secret are encrypted with AES-256-GCM, bound to their column. Registration finds a roll entry through a blind index (a keyed hash of the normalised name, date of birth and postcode), so nothing is decrypted to search.
 - Passwords are hashed with Argon2id. Enrolment codes are stored as keyed hashes and compared in constant time. Session, sign-in, registration and ballot tokens are stored only as SHA-256 hashes.
 - All keys are derived from `SECRET_KEY` with HKDF, one per purpose.
@@ -236,7 +237,7 @@ Never commit a real `.env` file. Only `.env.example` belongs in Git.
 - The rate limiter keeps its counts in memory, so they reset when the API restarts and are not shared between several API processes. Behind the dev server's proxy every request comes from `127.0.0.1`, so the per-IP limit counts all users together.
 - There is no CSRF token yet. `SameSite=Strict` cookies are the only protection. The session cookie is marked `Secure` unless `COOKIE_SECURE=false` (the local setting); the registration cookie is not marked `Secure` yet.
 - Docker Compose passes all of `backend/.env` into the database container, including `SECRET_KEY`, which the database does not need.
-- The receipt code is random and not stored, so it cannot be checked yet.
+- The receipt code is random and stored only on the used token row (SR-03). There is no way for a voter to check it yet.
 
 ## SR-01: authentication and rate limiting
 
@@ -321,6 +322,49 @@ Design only, not implemented:
 - Approval of roll changes by two distinct delegate signatures.
 - Workflows for changing the eligibility rules or division boundaries.
 - Role restrictions and admin approval screens for roll changes.
+
+## SR-03: single ballot per elector
+
+No elector can have more than one ballot accepted in an election, however many requests, devices or replays there are.
+
+**Issue** (`GET /api/ballot`). First the SR-01 signed-in session, then the SR-02 eligibility check. Then, in one transaction, the elector's row is inserted into `voter_participation` with state `issued` (`INSERT ... ON CONFLICT DO NOTHING`). If the row already exists, the elector already has a token or has voted: the answer is `409 already_voted` and nothing is issued. Otherwise the server creates a token of 256 random bits (`secrets.token_urlsafe(32)`), stores only its SHA-256 (hex) and an expiry `BALLOT_TOKEN_MINUTES` (10) minutes away, and returns the token once in `ballot_token`. The token itself is never stored or logged.
+
+**Accept** (`POST /api/ballot/submit`). Again, the signed-in session and eligibility come first. Then, in one transaction:
+
+1. lock the elector's participation row (`SELECT ... FOR UPDATE`), then the token row, always in that order;
+2. reject an unknown or altered token (`400 invalid_ballot`);
+3. if the token was already used, return the first answer again (`200`, same receipt reference) and store nothing;
+4. reject an expired token (`400 ballot_expired`);
+5. reject an elector who is not `issued`: `409 already_voted` if they have voted, `400 invalid_ballot` if they were never issued a ballot;
+6. check the ballot content as before;
+7. consume the token with one conditional `UPDATE` that must change exactly one row, recording when it was used and a random receipt reference;
+8. store the ballot and mark the elector `voted`, then commit.
+
+Any failure rolls everything back: a token is never used without a ballot, and a ballot never exists without the elector marked voted. A token stays unused after a rejected ballot, so the voter can correct it and submit again.
+
+**Reloading the ballot page loses the token.** The token is returned once and lives only in the page's memory, and a second ballot request gets `already_voted`. The same happens if the 10 minutes pass. During development, clear the reviewer's `issued` state with:
+
+```
+python -m scripts.seed --reset-participation
+```
+
+It refuses once the reviewer has voted, because a cast ballot cannot be undone by design. Only `python -m scripts.seed --reset` (all data) starts that over. Each reset is audited as `ELECTOR_RESET`. There is no API endpoint or staff screen for it.
+
+**Unlinked tables.** `voter_participation` (roll entry, election, state) has no timestamp. `ballot_tokens` (id, election, hash, expiry, when used, receipt reference) has no elector and no issue time. `ballots` (id, election, division, content) has no token, no reference and no time. So the database cannot match a ballot to a token, or a token to an elector. The receipt reference on the used token row is the only handle, and it points at no ballot.
+
+**Audit.** `BALLOT_TOKEN_ISSUED`, `BALLOT_ACCEPTED`, `BALLOT_REPLAY_BLOCKED`, and `BALLOT_TOKEN_REJECTED` with a reason (`invalid`, `expired`, `wrong_state`), each with the account and the event only. No token, hash, receipt reference or ballot content.
+
+Run the SR-03 tests, inside `backend/` with PostgreSQL running:
+
+```
+pytest tests/test_sr03_single_ballot.py -v
+```
+
+Design only, not implemented:
+
+- Paper and absent-vote channels. They would mark the same `voter_participation` row, so an elector who voted on paper could not vote online, and the reverse.
+- Staff screens for resetting an elector.
+- Binding the token to the elector. A token works for any eligible elector who holds it, and the participation row still allows only one ballot each.
 
 ## Folder layout
 

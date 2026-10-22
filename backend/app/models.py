@@ -6,9 +6,13 @@ Every table, in three groups that must stay apart:
 - The anonymous ballot box: one-time ballot tokens and the ballots.
 
 Nothing in the ballot box may point to voter identity: no account or roll
-reference, and no timestamp that could be matched against
-voter_participation.marked_at. tests/test_ballot_secrecy.py fails if a column
-is added there, so every new column gets a deliberate review.
+reference. tests/test_ballot_secrecy.py fails if a column is added there, so
+every new column gets a deliberate review.
+
+SR-03: voter_participation, ballot_tokens and ballots share no column that
+links them. Participation has no timestamp, a token has no elector and its
+receipt reference is the only handle on it, and a ballot has no token,
+reference or time.
 
 Protected columns (helpers in app/security.py): *_enc columns are AES-GCM
 encrypted, password_hash is Argon2id, roll_lookup and enrolment_code_hash are
@@ -22,7 +26,7 @@ import uuid
 from datetime import date, datetime
 from typing import Any
 
-from sqlalchemy import BigInteger, Enum, ForeignKey, UniqueConstraint, false, func, text
+from sqlalchemy import BigInteger, Enum, ForeignKey, UniqueConstraint, func, text
 from sqlalchemy.dialects.postgresql import CITEXT
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -196,30 +200,51 @@ class RegistrationSession(Base):
     expires_at: Mapped[datetime]
 
 
+class ParticipationState(enum.StrEnum):
+    """SR-03: issued when the elector receives a ballot token, voted once their ballot is accepted."""
+
+    ISSUED = "issued"
+    VOTED = "voted"
+
+
 class VoterParticipation(Base):
-    """Records that a voter has voted in an election. Never records how."""
+    """
+    Records that an elector was issued a ballot or has voted in an election. Never records how.
+    SR-03: keyed by the roll entry rather than the online account, so every voting channel would
+    share it, and it has no timestamp that could be matched against a token or a ballot.
+    """
 
     __tablename__ = "voter_participation"
 
-    # The composite primary key is UNIQUE(account_id, election_id):
-    # the database itself refuses a second vote from the same voter
-    account_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("accounts.id"), primary_key=True)
+    # SR-03: the composite primary key is UNIQUE(roll_id, election_id): one row per elector per election
+    roll_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("electoral_roll.id"), primary_key=True)
     election_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("elections.id"), primary_key=True)
-    marked_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    state: Mapped[ParticipationState] = mapped_column(
+        Enum(ParticipationState, name="participation_state", values_callable=lambda e: [m.value for m in e])
+    )
 
 
 # ---------------------------------------------------------------
-# The anonymous ballot box. No voter reference and no timestamp, by design.
+# The anonymous ballot box. No voter reference, by design.
 # ---------------------------------------------------------------
 
 
 class BallotToken(Base):
+    """
+    SR-03: a single-use authorisation to cast one ballot. No elector reference
+    and no issue time. receipt_reference is set when the token is used, and is
+    the only way to find the row again.
+    """
+
     __tablename__ = "ballot_tokens"
 
-    token_hash: Mapped[bytes] = mapped_column(primary_key=True)
+    id: Mapped[uuid.UUID] = uuid_pk()
     election_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("elections.id"))
-    division_id: Mapped[int] = mapped_column(ForeignKey("divisions.id"))
-    used: Mapped[bool] = mapped_column(default=False, server_default=false())
+    # SHA-256 of the token as hex. The token itself is never stored.
+    token_hash: Mapped[str] = mapped_column(unique=True)
+    expires_at: Mapped[datetime]
+    consumed_at: Mapped[datetime | None]
+    receipt_reference: Mapped[str | None]
 
 
 class Ballot(Base):

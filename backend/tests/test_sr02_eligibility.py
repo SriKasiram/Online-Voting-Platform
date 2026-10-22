@@ -21,7 +21,15 @@ from sqlalchemy.orm import Session
 from app.config import BACKEND_DIR, settings
 from app.eligibility import age_on
 from app.main import app
-from app.models import Account, AuditLogEntry, BallotToken, ElectoralRollEntry, VoterParticipation
+from app.models import (
+    Account,
+    AuditLogEntry,
+    Ballot,
+    BallotToken,
+    ElectoralRollEntry,
+    ParticipationState,
+    VoterParticipation,
+)
 from app.roll_signing import DOMAIN_TAG, load_public_key, public_key, record_message, verify_record
 from app.security import encrypt
 from scripts.seed import seed
@@ -222,7 +230,9 @@ def test_submission_is_refused_once_removed_from_the_roll(
     )
 
     assert outcome(response) == NOT_ENROLLED
-    assert db_session.scalar(select(func.count()).select_from(VoterParticipation)) == 0
+    # SR-03: participation now exists from issue, so check that no vote was recorded instead
+    assert db_session.scalar(select(func.count()).select_from(Ballot)) == 0
+    assert db_session.scalars(select(VoterParticipation)).one().state == ParticipationState.ISSUED
 
 
 # ---------------------------------------------------------------

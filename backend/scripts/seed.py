@@ -10,6 +10,9 @@ code would arrive by post or email.
 Run from the backend folder, with the virtual environment active:
     python -m scripts.seed                    loads the data, safe to repeat
     python -m scripts.seed --reset-reviewer   lets the reviewer register again
+    python -m scripts.seed --reset-participation
+                                              SR-03: lets the reviewer be issued a ballot again,
+                                              if they have not voted (development only)
     python -m scripts.seed --reset            deletes all data, then loads it again
 
 SR-02: every run ends by signing the roll (scripts/sign_roll.py), creating
@@ -32,10 +35,11 @@ from app.models import (
     Election,
     ElectionStatus,
     ElectoralRollEntry,
+    ParticipationState,
     RegistrationSession,
     VoterParticipation,
 )
-from app.security import encrypt, enrolment_code_hash, roll_lookup
+from app.security import audit, encrypt, enrolment_code_hash, roll_lookup
 from scripts.sign_roll import load_or_create_private_key, sign_all
 
 ELECTION_NAME = "House of Representatives"
@@ -180,6 +184,8 @@ def reset_reviewer(session: Session) -> None:
     Deletes the reviewer's account and restores their entry and code, so they
     can register again. A ballot they already cast stays in the ballot box:
     ballots are not linked to voters, so it cannot be found and removed.
+    SR-03: their participation record stays too, because it belongs to the
+    roll entry, not the account: a reviewer who voted cannot vote again.
     """
     now = datetime.now(UTC)
     seed_election(session, now)
@@ -187,10 +193,10 @@ def reset_reviewer(session: Session) -> None:
 
     accounts = select(Account.id).where(Account.roll_id == entry.id)
     # SR-01: half-finished sign ins are sessions now, so AuthSession covers them too
-    for table in (AuthSession, VoterParticipation):
-        session.execute(
-            delete(table).where(table.account_id.in_(accounts)).execution_options(synchronize_session=False)
-        )
+    # SR-03: VoterParticipation is no longer deleted here (see the docstring)
+    session.execute(
+        delete(AuthSession).where(AuthSession.account_id.in_(accounts)).execution_options(synchronize_session=False)
+    )
     for statement in (
         delete(Account).where(Account.roll_id == entry.id),
         delete(RegistrationSession).where(RegistrationSession.roll_id == entry.id),
@@ -202,6 +208,36 @@ def reset_reviewer(session: Session) -> None:
     entry.enrolment_code_hash = enrolment_code_hash(REVIEWER_ENROLMENT_CODE)
     entry.code_expires_at = now + timedelta(days=CODE_VALID_DAYS)
     session.commit()
+
+
+def reset_participation(session: Session) -> str:
+    """
+    SR-03, development only: clears the reviewer's "issued" ballot, for example
+    after reloading the ballot page lost the token, so they can be issued a new
+    one. A "voted" reviewer is refused: a cast ballot cannot be undone, by design.
+    Returns what it did.
+    """
+    lookup = roll_lookup(REVIEWER_GIVEN_NAME, REVIEWER_SURNAME, REVIEWER_DATE_OF_BIRTH, REVIEWER_POSTCODE)
+    entry = session.scalar(select(ElectoralRollEntry).where(ElectoralRollEntry.roll_lookup == lookup))
+    if entry is None:
+        return "There is no reviewer roll entry yet. Run python -m scripts.seed first."
+    rows = session.scalars(select(VoterParticipation).where(VoterParticipation.roll_id == entry.id)).all()
+    if any(row.state == ParticipationState.VOTED for row in rows):
+        raise SystemExit(
+            "The reviewer has already voted, and a cast ballot cannot be undone, by design. "
+            "To start again, re-seed everything: python -m scripts.seed --reset"
+        )
+    if not rows:
+        return "The reviewer has not been issued a ballot. Nothing to reset."
+    for row in rows:
+        session.delete(row)
+    account_id = session.scalar(select(Account.id).where(Account.roll_id == entry.id))
+    audit(session, "ELECTOR_RESET", actor=f"account:{account_id}" if account_id else "unknown")
+    session.commit()
+    return (
+        "Cleared the reviewer's issued ballot. They can sign in and be issued a new one. "
+        "Only one ballot can still be cast: once it is, any other token is refused."
+    )
 
 
 def reset(session: Session) -> None:
@@ -222,9 +258,16 @@ def main() -> None:
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--reset", action="store_true", help="delete all data first, including votes cast")
     group.add_argument("--reset-reviewer", action="store_true", help="let the reviewer register again")
+    # SR-03: development only, never an API endpoint or a staff screen
+    group.add_argument(
+        "--reset-participation", action="store_true", help="clear the reviewer's issued ballot, if not yet voted"
+    )
     args = parser.parse_args()
 
     with SessionLocal() as session:
+        if args.reset_participation:
+            print(reset_participation(session))
+            return
         if args.reset_reviewer:
             reset_reviewer(session)
             sign_roll(session)

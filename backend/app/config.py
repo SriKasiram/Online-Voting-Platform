@@ -50,6 +50,9 @@ class Settings(BaseSettings):
     # SR-02: minimum age on the election's polling date
     min_voting_age: int = 18
 
+    # SR-03: a ballot token must be used within this many minutes of being issued
+    ballot_token_minutes: int = 10
+
     def database_url(self, database: str | None = None) -> URL:
         """Connection URL for the app database, or for another database on the same server."""
         return URL.create(
