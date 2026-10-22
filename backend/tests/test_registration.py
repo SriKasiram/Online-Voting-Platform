@@ -147,7 +147,8 @@ def test_enrolment_code_works_only_once(client: TestClient, make_person) -> None
     person = make_person()
     assert client.post(VERIFY, json=person.verify_body()).status_code == 204
 
-    again = TestClient(app).post(VERIFY, json=person.verify_body())
+    # SR-10: every client speaks HTTPS; plain http:// now gets 400 tls_required
+    again = TestClient(app, base_url="https://testserver").post(VERIFY, json=person.verify_body())
 
     assert again.status_code == 400
     assert again.content == GENERIC_FAILURE
@@ -297,7 +298,8 @@ def test_usernames_are_unique_ignoring_case(client: TestClient, make_person, mak
 
 def test_username_held_by_a_registration_in_progress_is_taken(client: TestClient, make_person) -> None:
     # Two browsers, both using the test's database through the client fixture
-    first, second = client, TestClient(app)
+    # SR-10: the second one over HTTPS too
+    first, second = client, TestClient(app, base_url="https://testserver")
     first.post(VERIFY, json=make_person().verify_body())
     assert choose_account(first, "pending.name").status_code == 200
     second.post(VERIFY, json=make_person().verify_body())
@@ -417,7 +419,8 @@ def test_two_simultaneous_registrations_create_one_account(engine, roll_key) -> 
 
     app.dependency_overrides[get_db] = real_db
     try:
-        first, second = TestClient(app), TestClient(app)
+        # SR-10: both over HTTPS
+        first, second = TestClient(app, base_url="https://testserver"), TestClient(app, base_url="https://testserver")
 
         # Both send step 1 at the same moment: the code can be spent only once
         results = run_together(lambda: first.post(VERIFY, json=body), lambda: second.post(VERIFY, json=body))

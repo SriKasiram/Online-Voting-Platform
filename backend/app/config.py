@@ -10,6 +10,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import URL
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
+# SR-10: the certificate lives in certs/ at the project root, outside backend/, and is never committed
+PROJECT_DIR = BACKEND_DIR.parent
 
 
 class Settings(BaseSettings):
@@ -48,7 +50,8 @@ class Settings(BaseSettings):
     # SR-01: sign-in requests allowed per client IP in each window
     rate_limit_attempts: int = 20
     rate_limit_window_seconds: int = 300
-    # SR-01: marks the session cookie Secure. Set false only for local http:// development.
+    # SR-01: marks the session cookie Secure.
+    # SR-10: the app is served only over HTTPS now, so there is no reason to set it false.
     cookie_secure: bool = True
 
     # SR-02: the Ed25519 public key that checks electoral roll signatures. The API never holds the private key.
@@ -66,6 +69,19 @@ class Settings(BaseSettings):
     required_delegate_approvals: int = 2
     # SR-07: a definition must be activated at least this long before polls open
     min_activation_lead_hours: int = 24
+
+    # SR-10: how long browsers must use HTTPS only for this host. One year by default. HSTS ignores
+    # the port, so local development sets it short (.env.example) to avoid locking localhost to HTTPS.
+    hsts_max_age: int = 31536000
+    # SR-10: the TLS certificate and key (python -m scripts.dev_certs), relative to the project root
+    tls_cert_file: Path = Path("certs/dev-cert.pem")
+    tls_key_file: Path = Path("certs/dev-key.pem")
+    # SR-10: the single HTTPS port for the API and the built frontend. There is no plaintext port.
+    server_port: int = 8443
+
+    def tls_path(self, path: Path) -> Path:
+        """SR-10: a certificate or key path, with relative paths taken from the project root."""
+        return path if path.is_absolute() else PROJECT_DIR / path
 
     def database_url(self, database: str | None = None) -> URL:
         """Connection URL for the app database, or for another database on the same server."""

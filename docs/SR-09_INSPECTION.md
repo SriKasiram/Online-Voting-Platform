@@ -4,8 +4,8 @@ SR-09 requires that, once a session ends, inspecting the browser finds no ballot
 
 ## Before you start
 
-1. Start the database, backend and frontend as in [MANUAL.md](MANUAL.md), section 4. The reviewer must already be registered.
-2. Open a new Chrome window and go to any other page first (for example `https://example.com`), then open http://localhost:5173 in the same tab. The Back button test needs a page to go back to.
+1. Start the database and the app as in [MANUAL.md](MANUAL.md), section 4 (SR-10: the app is at https://localhost:8443). The reviewer must already be registered.
+2. Open a new Chrome window and go to any other page first (for example `https://example.com`), then open https://localhost:8443 in the same tab. The Back button test needs a page to go back to.
 3. Press **F12** to open DevTools. In the **Network** tab, tick **Preserve log**. Leave **Disable cache** unticked, so the browser behaves as it would for a voter.
 4. Note the surname of one candidate you will number, for example `ORTEGA`. You will search for it after the session ends.
 
@@ -13,7 +13,7 @@ Run the scenarios in this order. Each elector gets one ballot (SR-03): after A a
 
 ## The checks
 
-After the session ends, do each check below. In the **Application** tab, select `http://localhost:5173` under each storage heading.
+After the session ends, do each check below. In the **Application** tab, select `https://localhost:8443` under each storage heading.
 
 | Check | Where | Expected result |
 |---|---|---|
@@ -36,7 +36,7 @@ After the session ends, do each check below. In the **Application** tab, select 
 ## Scenario B: after a timeout
 
 1. Sign in and number some boxes.
-2. Wait for the session to end without selecting **Keep voting** (10 minutes). The sign-in screen then says your session ended. To wait less, set `SESSION_MINUTES=2` in `backend/.env` and `VITE_SESSION_MINUTES=2` in `frontend/.env`, restart both, and put both back afterwards. Never commit either file.
+2. Wait for the session to end without selecting **Keep voting** (10 minutes). The sign-in screen then says your session ended. To wait less, set `SESSION_MINUTES=2` in `backend/.env` and `VITE_SESSION_MINUTES=2` in `frontend/.env`, run `npm run build` in `frontend/` and restart the server, and put both back afterwards. Never commit either file.
 3. Do the checks and record them below.
 
 ## Scenario C: after a successful submission

@@ -97,5 +97,5 @@ def test_reset_reviewer_restores_the_entry(client: TestClient, db_session: Sessi
     assert entry.code_attempts == 0
     assert entry.enrolment_code_hash == enrolment_code_hash(REVIEWER_ENROLMENT_CODE)
     assert entry.code_expires_at is not None and entry.code_expires_at > utc_now() + timedelta(days=CODE_VALID_DAYS - 1)
-    # And the code works again
-    assert TestClient(client.app).post("/api/register/verify", json=REVIEWER).status_code == 204
+    # And the code works again (SR-10: over HTTPS, like every client)
+    assert TestClient(client.app, base_url="https://testserver").post("/api/register/verify", json=REVIEWER).status_code == 204

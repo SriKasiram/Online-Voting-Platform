@@ -18,8 +18,9 @@ export default defineConfig(({ mode }) => {
       headers: noStore, // SR-09
       proxy: {
         "/api": {
-          // 127.0.0.1 rather than localhost: on Windows, localhost can try IPv6 first and stall
-          target: env.VITE_API_TARGET || "http://127.0.0.1:8000",
+          // SR-10: the backend speaks only TLS 1.3, and the proxy checks its certificate as usual.
+          // Start the dev server with NODE_EXTRA_CA_CERTS pointing at certs/dev-cert.pem (see README).
+          target: env.VITE_API_TARGET || "https://localhost:8443",
           changeOrigin: false,
         },
       },

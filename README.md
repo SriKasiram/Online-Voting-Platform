@@ -14,15 +14,15 @@ New to the project? [docs/MANUAL.md](docs/MANUAL.md) lists every file and shows 
 | `backend/` | Registration for people on the electoral roll, sign in with a password and an authenticator app, the ballot and submission. Ballot encryption and signing come in later stages |
 | `docker-compose.yml` | PostgreSQL 16 for local development |
 
-The frontend gets all its data from the backend, so start the backend first, then the frontend.
+The backend serves the API and the built frontend together, over HTTPS only (TLS 1.3, SR-10), at https://localhost:8443. There is no plaintext address.
 
 ```
-Browser -> frontend dev server (5173) -> /api proxy -> FastAPI (8000) -> PostgreSQL (5432)
+Browser -> https://localhost:8443 (TLS 1.3) -> FastAPI: /api and the built frontend -> PostgreSQL (5432)
 ```
 
-## Run the backend
+## Run the app
 
-You need Docker (for PostgreSQL) and Python 3.12. Start from the repository root.
+You need Docker (for PostgreSQL), Python 3.12 and Node 22 or newer. Start from the repository root.
 
 ### 1. Settings
 
@@ -34,6 +34,7 @@ Copy-Item backend\.env.example backend\.env    # Windows PowerShell
 Open `backend/.env` and set two values:
 
 - `POSTGRES_PASSWORD`: a long random value. Do this before step 2: PostgreSQL stores the password the first time the database starts and ignores later changes to `.env`. If you see `password authentication failed for user "evoting"`, the two have drifted apart (see step 2).
+- `HSTS_MAX_AGE=300` and `COOKIE_SECURE=true` come from `.env.example` (SR-10). If your `.env` is older, add `HSTS_MAX_AGE=300` and set `COOKIE_SECURE=true`. Without `HSTS_MAX_AGE` the browser is told to use HTTPS for `localhost` for a whole year (see [SR-10](#sr-10-tls-13-for-ballot-transmission)).
 - `SECRET_KEY`: at least 32 random characters, for example from `python -c "import secrets; print(secrets.token_urlsafe(48))"`. It protects the encrypted personal data and the enrolment codes. If you change it later, reseed (`python -m scripts.seed --reset`), because data written with the old key can no longer be read.
 
 ### 2. Start PostgreSQL
@@ -57,15 +58,10 @@ pip install -r requirements.txt
 
 The remaining commands run inside `backend/` with the virtual environment active.
 
-### 4. Create the tables
+### 4. Create the tables and load the seed data
 
 ```
 alembic upgrade head
-```
-
-### 5. Load the seed data
-
-```
 python -m scripts.seed
 ```
 
@@ -77,17 +73,51 @@ Every seed run ends by signing the electoral roll (SR-02), and the first run cre
 
 The seed also stores version 1 of the election's ballot definition, signed by two development delegates (SR-07). The API will not start while an open election has no valid definition. If your database existed before SR-07, run `alembic upgrade head` and then `python -m scripts.seed`.
 
-### 6. Run the API
+### 5. Build the frontend
 
 ```
-uvicorn app.main:app --reload
+cd ../frontend
+npm ci
+npm run build
+cd ../backend
 ```
 
-- http://127.0.0.1:8000/api/health returns `{"status": "ok"}`
-- http://127.0.0.1:8000/api/divisions lists the divisions stored in the database
-- http://127.0.0.1:8000/docs lists every endpoint and lets you try them
+This writes `frontend/dist`, the voter app and `staff.html`, which the backend serves. Build again after changing the frontend.
 
-### 7. Run the tests
+### 6. Create and trust the development certificate (once)
+
+```
+python -m scripts.dev_certs
+```
+
+This creates `certs/dev-cert.pem` and `certs/dev-key.pem` at the project root: one self-signed certificate for `localhost` and `127.0.0.1`, valid for 365 days. `certs/` is never committed. The script will not replace existing files unless you add `--force`.
+
+Then trust `certs/dev-cert.pem` once, so the browser accepts it. Run the command for your system from the project root (the script prints the same commands):
+
+| System | Command |
+|---|---|
+| Windows | `certutil -user -addstore Root certs\dev-cert.pem`, confirm the prompt, then restart the browser |
+| macOS | `security add-trusted-cert -r trustRoot -k ~/Library/Keychains/login.keychain-db certs/dev-cert.pem` |
+| Linux | Chrome: `certutil -d sql:$HOME/.pki/nssdb -A -t "P,," -n evoting-dev -i certs/dev-cert.pem` (package `libnss3-tools`). System-wide: copy it to `/usr/local/share/ca-certificates/evoting-dev.crt` and run `sudo update-ca-certificates` |
+
+Use Chrome or Edge. If the browser shows a certificate warning, the certificate is not trusted yet: never click through it. A certificate made again with `--force` must be trusted again.
+
+### 7. Start the server
+
+```
+python -m app.serve
+```
+
+Open https://localhost:8443. To vote, register first (see [Registering as a reviewer](#registering-as-a-reviewer)), then sign in.
+
+- https://localhost:8443/staff.html is the staff sign-in page (SR-06)
+- https://localhost:8443/api/health returns `{"status": "ok"}`
+- https://localhost:8443/api/divisions lists the divisions stored in the database
+- https://localhost:8443/docs lists every endpoint and lets you try them
+
+The server refuses to start without the certificate and key, and never falls back to plain HTTP. It does not reload on code changes: stop it with Ctrl+C and start it again.
+
+### 8. Run the tests
 
 ```
 pytest
@@ -95,17 +125,16 @@ pytest
 
 PostgreSQL must be running. Every run deletes and rebuilds a separate `evoting_test` database from the migrations. The tests create their own data and never rely on the seed, so your development data is never touched.
 
-## Run the frontend
+## Vite dev server (development only)
 
-Start PostgreSQL and the API first, with the seed data loaded (see [Run the backend](#run-the-backend)). Then, with Node 22 or newer:
+For working on the frontend. `npm run dev` serves the app over **plain HTTP** at http://localhost:5173 with live reload, and forwards `/api` to https://localhost:8443, checking the backend's certificate. It is a development tool only: the ballot casting demo always uses https://localhost:8443. Start the backend first, then inside `frontend/`:
 
 ```
-cd frontend
-npm install
-npm run dev
+NODE_EXTRA_CA_CERTS=../certs/dev-cert.pem npm run dev              # macOS / Linux
+$env:NODE_EXTRA_CA_CERTS = "..\certs\dev-cert.pem"; npm run dev    # Windows PowerShell
 ```
 
-Open http://localhost:5173. To vote, register first (next section), then sign in.
+Without `NODE_EXTRA_CA_CERTS` the proxy rejects the self-signed certificate and every `/api` call fails. After you have opened https://localhost:8443, the browser may switch http://localhost:5173 to HTTPS for `HSTS_MAX_AGE` seconds (see [SR-10](#sr-10-tls-13-for-ballot-transmission)).
 
 ## Registering as a reviewer
 
@@ -191,7 +220,7 @@ Optional. The defaults work as they are. To change them, copy `frontend/.env.exa
 | Variable | Purpose | Default |
 |---|---|---|
 | `VITE_SESSION_MINUTES` | Length of a voting session. The voter is warned 1 minute before it ends. Keep it equal to `SESSION_MINUTES` | `10` |
-| `VITE_API_TARGET` | Where the dev server forwards `/api` requests | `http://127.0.0.1:8000` |
+| `VITE_API_TARGET` | Where the dev server forwards `/api` requests (SR-10: HTTPS) | `https://localhost:8443` |
 
 ### Backend
 
@@ -212,6 +241,8 @@ Copy `backend/.env.example` to `backend/.env`. Docker Compose reads the same fil
 | `ROLL_PUBLIC_KEY_PATH`, `MIN_VOTING_AGE` | The roll's Ed25519 public key, and the minimum age on polling day. See [SR-02](#sr-02-roll-signing-and-eligibility) | `backend/keys/roll_public.pem`, `18` |
 | `BALLOT_TOKEN_MINUTES` | How long a ballot token stays usable after it is issued. See [SR-03](#sr-03-single-ballot-per-elector) | `10` |
 | `DELEGATE_KEYRING_PATH`, `REQUIRED_DELEGATE_APPROVALS`, `MIN_ACTIVATION_LEAD_HOURS` | The delegates' public keyring, the distinct delegates who must sign, and how long before polls open a definition must be activated. See [SR-07](#sr-07-signed-ballot-definitions) | `backend/keys/delegates/keyring.json`, `2`, `24` |
+| `HSTS_MAX_AGE` | Seconds the browser must use HTTPS only for this host. `.env.example` sets `300` for local work. See [SR-10](#sr-10-tls-13-for-ballot-transmission) | `31536000` (one year) |
+| `TLS_CERT_FILE`, `TLS_KEY_FILE`, `SERVER_PORT` | The TLS certificate and key `python -m app.serve` uses (relative to the project root), and its single HTTPS port (SR-10) | `certs/dev-cert.pem`, `certs/dev-key.pem`, `8443` |
 
 The fixed limits (registration time, wrong-code limits, rate limits, password length) are named constants in `backend/app/config.py`.
 
@@ -226,7 +257,7 @@ Never commit a real `.env` file. Only `.env.example` belongs in Git.
 - The session timer counts down from sign in. Ordinary activity does not reset it. Only the voter choosing Keep voting in the warning calls `POST /api/auth/extend`, and only that call extends the server session. The timer restarts only once the server agrees. After the second extension the warning says no more time is available, and the session ends on time (SR-04).
 - The receipt screen signs itself out after 60 seconds, for shared terminals.
 - Fonts are bundled with the app (no font CDN), and the QR code is drawn in the browser, so the page makes no third-party requests.
-- Sessions live in `HttpOnly`, `SameSite=Strict` cookies, so page scripts cannot read them and other sites cannot send them. The frontend and API are served from one origin through the dev server's proxy.
+- Sessions live in `HttpOnly`, `SameSite=Strict` cookies, so page scripts cannot read them and other sites cannot send them. The frontend and API are served from one origin, https://localhost:8443 (SR-10).
 
 ## Backend security notes
 
@@ -244,7 +275,7 @@ Never commit a real `.env` file. Only `.env.example` belongs in Git.
 - Ballots are stored as plain JSON in the `ciphertext` column, and ballot definitions are not signed yet.
 - A ballot holds no voter and no time, but it is stored in the same transaction that marks the voter. Someone with direct access to the database could match the two through PostgreSQL's internal transaction ids. A later stage should store ballots separately or in shuffled batches.
 - The rate limiter keeps its counts in memory, so they reset when the API restarts and are not shared between several API processes. Behind the dev server's proxy every request comes from `127.0.0.1`, so the per-IP limit counts all users together.
-- There is no CSRF token yet. `SameSite=Strict` cookies are the only protection. The session cookie is marked `Secure` unless `COOKIE_SECURE=false` (the local setting); the registration cookie is not marked `Secure` yet.
+- There is no CSRF token yet. `SameSite=Strict` cookies are the only protection. The session cookie is marked `Secure` (SR-10: `.env.example` now sets `COOKIE_SECURE=true`). The registration cookie is not marked `Secure` yet, although it now travels only over TLS (SR-10).
 - Docker Compose passes all of `backend/.env` into the database container, including `SECRET_KEY`, which the database does not need.
 - The receipt code is random and stored only on the used token row (SR-03). There is no way for a voter to check it yet.
 
@@ -264,7 +295,7 @@ Every elector must pass two steps before any voting route opens:
 | `MFA_PENDING_MINUTES` | `2` | Time allowed between step 1 and step 2 (5 before SR-04) |
 | `RATE_LIMIT_ATTEMPTS` | `20` | Sign-in requests (both steps together) allowed per client IP in each window |
 | `RATE_LIMIT_WINDOW_SECONDS` | `300` | Length of that window |
-| `COOKIE_SECURE` | `true` | Marks the `session` cookie `Secure`. `backend/.env.example` sets it to `false` because the local demo runs on `http://localhost` |
+| `COOKIE_SECURE` | `true` | Marks the `session` cookie `Secure`. SR-10: the app runs only over HTTPS, so `backend/.env.example` sets it to `true` as well |
 
 Responses:
 
@@ -455,15 +486,15 @@ The script:
 No API endpoint creates staff, and the seed creates none.
 
 **Try the admin routes:**
-1. Set `COOKIE_SECURE=false` in `backend/.env` for local `http://`.
-2. Open http://127.0.0.1:8000/docs.
+1. Start the server (`python -m app.serve`, SR-10).
+2. Open https://localhost:8443/docs.
 3. Sign in with `POST /api/auth/login` (username and password), then `POST /api/auth/verify` (the 6-digit code from the authenticator app). In this prototype staff use a TOTP code like electors. The staff sign-in page (SR-06) does the same.
 4. Call the `/api/admin` routes from the same page; the browser keeps the session cookie. With curl, keep the cookie in a file:
 
 ```
-curl -c jar -H "Content-Type: application/json" -d '{"username":"official.one","password":"..."}' http://127.0.0.1:8000/api/auth/login
-curl -b jar -c jar -H "Content-Type: application/json" -d '{"otp_code":"123456"}' http://127.0.0.1:8000/api/auth/verify
-curl -b jar http://127.0.0.1:8000/api/admin/turnout
+curl --cacert certs/dev-cert.pem -c jar -H "Content-Type: application/json" -d '{"username":"official.one","password":"..."}' https://localhost:8443/api/auth/login
+curl --cacert certs/dev-cert.pem -b jar -c jar -H "Content-Type: application/json" -d '{"otp_code":"123456"}' https://localhost:8443/api/auth/verify
+curl --cacert certs/dev-cert.pem -b jar https://localhost:8443/api/admin/turnout
 ```
 
 The reset route uses the same logic as `python -m scripts.seed --reset-participation`, now shared in `app/participation.py`. It clears an `issued` elector (`ELECTOR_RESET`, actor `staff:<account id>`), answers `409 already_voted` for one who has voted and `404 not_found` otherwise.
@@ -504,9 +535,9 @@ Every account must have a TOTP secret: `accounts.totp_secret_enc` is `NOT NULL`,
    python -m scripts.create_staff --username official.one --role polling_official
    ```
 2. Add the setup link or key it prints, shown only once, to an authenticator app.
-3. With the backend and the frontend dev server running, open http://localhost:5173/staff.html. This page is separate from the voter app.
+3. With the server running (`python -m app.serve`), open https://localhost:8443/staff.html. This page is separate from the voter app.
 4. Enter the username and password, then the 6-digit code. The page shows your role and when the session ends, and signs you out after 10 minutes. It does not call any admin route.
-5. Use the admin routes from the API docs page (http://localhost:8000/docs) or curl (see SR-05). The session cookie also works on `localhost:8000`, because cookies are shared across ports of the same host. Set `COOKIE_SECURE=false` in `backend/.env` for local `http://`.
+5. Use the admin routes from the API docs page (https://localhost:8443/docs) or curl (see SR-05). The docs page is on the same address, so the session cookie works there too.
 
 Run the SR-06 tests, inside `backend/` with PostgreSQL running:
 
@@ -686,11 +717,59 @@ Design only, not implemented:
 - **A `Clear-Site-Data` header on sign out.** This would tell the browser to drop the site's storage, cache and cookies.
 - **An automated browser-based inspection test.** This would drive a real browser through sign-out, timeout and submission, then check storage, the page and the Back button. The checks are done by hand for now (above).
 
+## SR-10: TLS 1.3 for ballot transmission
+
+Every request between the browser and the server travels over TLS 1.3, including the ballot itself, the sign-in and the staff page.
+
+**Approved protocols: TLS 1.3 only.** The system security specification approves no other protocol for this prototype. TLS 1.2 and older are refused.
+
+**One TLS entry point.** `python -m app.serve` (`app/serve.py`) serves the API and the built frontend (`frontend/dist`, including `staff.html`) at https://localhost:8443. There is no plaintext listener and no fallback.
+- **TLS 1.3 only.** uvicorn has no setting for the minimum TLS version, so `serve.py` loads the uvicorn configuration and then sets the minimum on the SSL context uvicorn built. A TLS 1.2 client fails the handshake.
+- **This computer only, no forwarded headers.** It listens on 127.0.0.1 only. It ignores `X-Forwarded-*` headers, which uvicorn would otherwise trust from 127.0.0.1, so no client can claim another scheme or address. SR-01's per-IP limit keeps using the real connection.
+- **No certificate, no server.** It refuses to start (exit code 1) if the certificate or the key is missing, and says how to create them.
+- **Plaintext gets no HTTP response.** A plain HTTP request sent to port 8443 is ended by the TLS layer itself.
+- **The frontend never shadows the API.** The built frontend is the router's fallback: it answers only when no API route matched, so it can never hide an API path. Without `frontend/dist` (tests, CI) the API runs on its own.
+
+**Plaintext refused inside the app.**
+- **`tls_required`.** The `require_tls` middleware in `app/main.py` is the outermost middleware. A request that did not arrive over HTTPS gets `400 {"detail": "tls_required"}` before any other middleware or route runs. That covers a plain `uvicorn app.main:app`.
+- **HSTS on every HTTPS response.** Errors and redirects included, each HTTPS response carries `Strict-Transport-Security: max-age=<HSTS_MAX_AGE>`, next to SR-09's `Cache-Control: no-store`.
+
+**Strict certificate validation.**
+- **One development certificate.** `python -m scripts.dev_certs` creates one self-signed certificate in `certs/`. It covers `localhost` and `127.0.0.1`, uses ECDSA P-256 with SHA-256, and is valid for 365 days. It is a server certificate, not a CA, so trusting it vouches for nothing else.
+- **The key.** It is readable by its owner only where the operating system supports that (not on Windows). Existing files are kept unless `--force` is given.
+- **Validation is never turned off.** Browsers, curl and the Vite proxy check the certificate as usual once it is trusted. No setting, flag or environment variable anywhere in the project disables the check.
+
+**HSTS on localhost.**
+- **Why it is short locally.** HSTS is remembered per host name and ignores the port. A long value would make the browser insist on HTTPS for every `localhost` port, including the Vite dev server on 5173.
+- **The two values.** `.env.example` sets `HSTS_MAX_AGE=300` (5 minutes). The code default is one year (`31536000`), for a real deployment.
+- **To clear it in Chrome:** open `chrome://net-internals/#hsts`, enter `localhost` under "Delete domain security policies" and select Delete.
+
+To verify all of this by hand (the browser's Security panel and six curl checks), see [docs/MANUAL.md](docs/MANUAL.md), section 6.
+
+Run the SR-10 tests, inside `backend/` with PostgreSQL running. The handshakes run in memory, so no port is opened:
+
+```
+pytest tests/test_sr10_tls.py -v
+```
+
+Limits:
+- **The registration cookie** is still not marked `Secure` (unchanged since registration was added), although it now travels only over TLS.
+- **Unhandled server errors.** A 500 response comes from Starlette's outermost error handler, outside the middleware, so it carries neither HSTS nor `no-store` (as in SR-09).
+- **`backend/Dockerfile`** still starts a plain `uvicorn` on port 8000, so that image would answer every request with `tls_required`. Nothing uses it yet (not Docker Compose, not CI), and SR-10 does not change Docker.
+
+**SR-10 design only, not implemented:**
+- **Internal connections.** TLS for the database connection and for internal services.
+- **Certificate lifecycle.** Certificate rotation, and certificates issued by a real certificate authority instead of a self-signed one.
+- **OCSP stapling.**
+- **Certificate pinning in a native voting client.**
+- **The plain-HTTP Vite dev server.** Today it is kept to development by instruction only. A deployment would not run it at all; only the TLS entry point would be reachable.
+
 ## Folder layout
 
 ```
 backend/             FastAPI app, Alembic migrations, seed script and tests
 frontend/            React app
 docs/                MANUAL.md (files and how to run the app), SR-09_INSPECTION.md and sr09-evidence/ (SR-09)
+certs/               SR-10: the development TLS certificate and key (python -m scripts.dev_certs). Never committed
 docker-compose.yml   PostgreSQL 16 for local development
 ```
