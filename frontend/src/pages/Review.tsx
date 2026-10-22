@@ -1,9 +1,11 @@
 import { useRef, useState } from "react";
+import { ApiError } from "../api/client";
 import type { BallotDefinition } from "../api/types";
 import BallotName from "../components/BallotName";
 import { ArrowLeftIcon } from "../components/Icons";
 import { ErrorAlert, Spinner } from "../components/Messages";
-import { checkRanking, type Ranking } from "../lib/ballotRules";
+// SR-08: submitProblem turns the server's 422 answers into the voter's message
+import { checkRanking, submitProblem, type Ranking } from "../lib/ballotRules";
 import { useFocusOnMount } from "../lib/hooks";
 
 type Props = {
@@ -34,8 +36,10 @@ export default function Review({ ballot, ranking, onBack, onSubmit }: Props) {
     setBusy(true);
     try {
       await onSubmit(ballot.ballotToken, ranking);
-    } catch {
-      setError("Your ballot could not be submitted. Try again, or ask a polling official for help.");
+    } catch (problem) {
+      // SR-08: a 422 says what to fix. The voter stays here with their ranking and a token that still works.
+      const code = problem instanceof ApiError && problem.status === 422 ? problem.code : undefined;
+      setError(submitProblem(code, ballot.candidates.length));
       setBusy(false);
     }
   }

@@ -50,3 +50,11 @@ export function checkRanking(candidateIds: number[], ranking: Ranking): RankingC
   const remaining = candidateIds.filter((id) => !seen.has(id)).length;
   return { valid: clean && remaining === 0, remaining };
 }
+
+// SR-08: what the voter is told when the server refuses the ballot's content (422). The ballot
+// token still works and the ranking is kept, so the voter can fix it and submit again.
+export function submitProblem(code: string | undefined, total: number): string {
+  if (code === "informal_ballot") return `Your preferences are incomplete: number every box from 1 to ${total}.`;
+  if (code === "invalid_ballot") return "Your ballot could not be accepted. Please check your preferences.";
+  return "Your ballot could not be submitted. Try again, or ask a polling official for help.";
+}

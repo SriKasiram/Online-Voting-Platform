@@ -90,11 +90,21 @@ def test_ballot_token_works_only_once(client: TestClient, make_voter, sign_in) -
     assert client.get("/api/ballot").status_code == 200
 
 
-@pytest.mark.parametrize("problem", ["missing a candidate", "candidate twice", "other division"])
+@pytest.mark.parametrize(
+    ("problem", "expected"),
+    [
+        ("missing a candidate", {"detail": "informal_ballot", "reason": "incomplete_order"}),
+        ("candidate twice", {"detail": "invalid_ballot"}),
+        ("other division", {"detail": "invalid_ballot"}),
+    ],
+)
 def test_ballot_must_number_every_candidate_once(
-    client: TestClient, election, make_voter, sign_in, problem: str
+    client: TestClient, election, make_voter, sign_in, problem: str, expected: dict
 ) -> None:
-    """SR-03: after a rejected ballot the same token still works, since a second ballot request is refused."""
+    """
+    SR-03: after a rejected ballot the same token still works, since a second ballot request is refused.
+    SR-08: content refusals are now 422, and a missing candidate is informal rather than invalid.
+    """
     sign_in(make_voter())
     ballot = get_ballot(client)
     ids = [c["id"] for c in ballot["candidates"]]
@@ -107,8 +117,8 @@ def test_ballot_must_number_every_candidate_once(
 
     response = submit(client, ballot, ranking)
 
-    assert response.status_code == 400
-    assert response.json() == {"detail": "invalid_ballot"}
+    assert response.status_code == 422
+    assert response.json() == expected
     # A rejected ballot does not use up the voter's vote
     assert submit(client, ballot).status_code == 200
 

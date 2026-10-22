@@ -15,13 +15,18 @@ time. The token row stores no voter. Participation stores no time.
 import json
 import secrets
 from datetime import timedelta
-from typing import NoReturn
+from typing import Any, NoReturn
 
 from fastapi import APIRouter, HTTPException, status
+from fastapi.responses import JSONResponse
 from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
+# SR-07: ballot papers come only from the verified, signed definition
+from app.ballot_definitions import verified_division
+# SR-08: the House preference rules
+from app.ballot_rules import evaluate_house_ballot
 from app.config import settings
 # SR-05: both voting routes take CurrentElector, so staff accounts get 403 here
 from app.deps import CurrentElector, CurrentSession, DbSession
@@ -31,8 +36,6 @@ from app.models import (
     AuthSession,
     Ballot,
     BallotToken,
-    Candidate,
-    Division,
     Election,
     ElectionStatus,
     ParticipationState,
@@ -61,14 +64,20 @@ def open_election(db: Session) -> Election:
     return election
 
 
-def ballot_candidates(db: Session, election: Election, division_id: int) -> list[Candidate]:
-    return list(
-        db.scalars(
-            select(Candidate)
-            .where(Candidate.election_id == election.id, Candidate.division_id == division_id)
-            .order_by(Candidate.ballot_position)
-        )
-    )
+def definition_entry(db: Session, voter: Account, election: Election, division_id: int) -> dict[str, Any]:
+    """
+    SR-07: the elector's ballot paper, taken only from the election's active
+    definition after verifying it, never from the candidates table. Without a
+    verified definition nothing is served (fail closed): anything this request
+    changed is undone, the problem is audited and the answer is 503.
+    """
+    entry, reason = verified_division(db, election, division_id)
+    if entry is None:
+        db.rollback()
+        log(db, "BALLOT_DEFINITION_INVALID", voter, reason=reason)
+        db.commit()
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "ballot_unavailable")
+    return entry
 
 
 def receipt_code() -> str:
@@ -143,17 +152,18 @@ def get_ballot(voter: CurrentElector, db: DbSession) -> BallotOut:
         db.rollback()
         raise HTTPException(status.HTTP_409_CONFLICT, "already_voted")
 
-    division = db.get_one(Division, division_id)
+    # SR-07: the paper comes from the verified definition, in the same response shape as before
+    entry = definition_entry(db, voter, election, division_id)
     # SR-03: 256 random bits, returned once. Only its hash and expiry are stored, never who received it.
     token = new_token()
     ballot = BallotOut(
         ballot_token=token,
         election_name=election.name,
-        division_name=division.name,
-        state_name=division.state,
+        division_name=entry["name"],
+        state_name=entry["state"],
         candidates=[
-            CandidateOut(id=c.id, given_name=c.given_name, surname=c.surname, party=c.party)
-            for c in ballot_candidates(db, election, division.id)
+            CandidateOut(id=c["candidate_id"], given_name=c["given_name"], surname=c["surname"], party=c["party"])
+            for c in entry["candidates"]
         ],
     )
     db.add(
@@ -206,10 +216,26 @@ def submit_ballot(body: SubmitIn, voter: CurrentElector, session: CurrentSession
         reject(db, voter, "wrong_state", status.HTTP_409_CONFLICT, "already_voted")
 
     # Every candidate numbered exactly once. The frontend checks this too, but only this check counts.
-    expected = {c.id for c in ballot_candidates(db, election, division_id)}
+    # SR-07: "every candidate" means the candidates of this division in the verified definition
+    candidate_ids = [c["candidate_id"] for c in definition_entry(db, voter, election, division_id)["candidates"]]
     ranking = body.ranked_candidate_ids
-    if len(ranking) != len(expected) or set(ranking) != expected:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid_ballot")
+    # SR-08: the House rules, after the replay check and before the token is used. A refusal changes
+    # nothing (token unused, elector still "issued", no ballot), so the same token can be used again.
+    # The server never trusts the client on formality.
+    verdict = evaluate_house_ballot(candidate_ids, ranking)
+    if verdict.outcome == "invalid":
+        # Possible tampering: audited, without saying which candidate or rule
+        db.rollback()
+        log(db, "BALLOT_REJECTED_INVALID", voter)
+        db.commit()
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "invalid_ballot")
+    if verdict.outcome == "informal":
+        # Deliberately not audited: an entry would record what this elector was trying to vote
+        db.rollback()
+        return JSONResponse(  # type: ignore[return-value]
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            content={"detail": "informal_ballot", "reason": verdict.reason},
+        )
 
     # SR-03 (g): consume the token with one conditional UPDATE. Exactly one row must change.
     receipt = receipt_code()

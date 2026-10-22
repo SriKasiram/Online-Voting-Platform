@@ -75,6 +75,8 @@ This adds one open House of Representatives election, three Victorian divisions 
 
 Every seed run ends by signing the electoral roll (SR-02), and the first run creates development keys in `backend/keys/`. The API will not start until the roll is signed. If your database existed before SR-02, run `alembic upgrade head` and then `python -m scripts.sign_roll` (or reseed).
 
+The seed also stores version 1 of the election's ballot definition, signed by two development delegates (SR-07). The API will not start while an open election has no valid definition. If your database existed before SR-07, run `alembic upgrade head` and then `python -m scripts.seed`.
+
 ### 6. Run the API
 
 ```
@@ -148,8 +150,8 @@ After 5 wrong enrolment codes the entry is locked, and the same reset unlocks it
 | `POST /api/auth/verify` | Part 2: the code from the authenticator app. Replaces the session with a new signed-in one and returns the voter's name (SR-01) |
 | `POST /api/auth/extend` | Starts a new full session under a new identifier, at most twice per sign in (SR-04). Called only when the voter chooses Keep voting |
 | `POST /api/auth/logout` | Ends the session |
-| `GET /api/ballot` | The voter's ballot paper and a single-use ballot token, once per election (SR-03) |
-| `POST /api/ballot/submit` | Accepts the ranked ballot once and returns a receipt code. The same token again returns the same receipt (SR-03) |
+| `GET /api/ballot` | The voter's ballot paper, taken only from the verified signed definition (SR-07), and a single-use ballot token, once per election (SR-03) |
+| `POST /api/ballot/submit` | Accepts the ranked ballot once and returns a receipt code. The same token again returns the same receipt (SR-03). An informal or invalid ranking gets 422 and can be corrected (SR-08) |
 | `GET /api/admin/turnout` | Staff (SR-05): electors issued a ballot and electors who voted, per division and in total. Permission `turnout:read` |
 | `POST /api/admin/electors/{roll_id}/reset` | Staff (SR-05): clears an elector's issued ballot, never a vote. Permission `elector:reset` |
 | `GET /api/admin/audit-log` | Staff (SR-05): audit entries in order, `limit` (at most 200) and `offset`. Permission `audit:read` |
@@ -157,7 +159,7 @@ After 5 wrong enrolment codes the entry is locked, and the same reset unlocks it
 
 Errors come back as `{"detail": "<reason>"}`:
 
-- Sign in and voting: `invalid_credentials` and `not_signed_in` (401), `too_many_requests` (429), `forbidden` (staff, SR-05) and `not_enrolled` (403), `no_open_election` (404), `already_voted` and `extension_limit` (409), `invalid_ballot` and `ballot_expired` (400).
+- Sign in and voting: `invalid_credentials` and `not_signed_in` (401), `too_many_requests` (429), `forbidden` (staff, SR-05) and `not_enrolled` (403), `no_open_election` (404), `already_voted` and `extension_limit` (409), `invalid_ballot` (400 for a ballot token problem) and `ballot_expired` (400), `informal_ballot` and `invalid_ballot` (422 for the ranking, SR-08), `ballot_unavailable` (503, SR-07).
 - Admin (SR-05): `not_signed_in` (401), `forbidden` (403), `not_found` (404), `already_voted` (409).
 - Registration: `registration_failed`, `username_invalid`, `password_too_short`, `password_is_username`, `wrong_code` and `too_many_attempts` (400), `registration_session_invalid` (401), `username_taken` and `already_registered` (409).
 
@@ -209,6 +211,7 @@ Copy `backend/.env.example` to `backend/.env`. Docker Compose reads the same fil
 | `MAX_FAILED_ATTEMPTS`, `LOCK_MINUTES`, `MFA_PENDING_MINUTES`, `RATE_LIMIT_ATTEMPTS`, `RATE_LIMIT_WINDOW_SECONDS`, `COOKIE_SECURE` | Sign-in lockout, rate limit and cookie settings. See [SR-01](#sr-01-authentication-and-rate-limiting) | `5`, `15`, `2`, `20`, `300`, `true` |
 | `ROLL_PUBLIC_KEY_PATH`, `MIN_VOTING_AGE` | The roll's Ed25519 public key, and the minimum age on polling day. See [SR-02](#sr-02-roll-signing-and-eligibility) | `backend/keys/roll_public.pem`, `18` |
 | `BALLOT_TOKEN_MINUTES` | How long a ballot token stays usable after it is issued. See [SR-03](#sr-03-single-ballot-per-elector) | `10` |
+| `DELEGATE_KEYRING_PATH`, `REQUIRED_DELEGATE_APPROVALS`, `MIN_ACTIVATION_LEAD_HOURS` | The delegates' public keyring, the distinct delegates who must sign, and how long before polls open a definition must be activated. See [SR-07](#sr-07-signed-ballot-definitions) | `backend/keys/delegates/keyring.json`, `2`, `24` |
 
 The fixed limits (registration time, wrong-code limits, rate limits, password length) are named constants in `backend/app/config.py`.
 
@@ -434,7 +437,7 @@ The database refuses any other role, an elector without a roll entry, and staff 
 - **Every route checked.** Each `/api/admin` route is declared through `AdminRouter`, which demands a permission and attaches the check.
 - **Deny by default.** The API refuses to start if any `/api/admin` route lacks a mapped permission, including one inside an included router. There is no setting to skip this.
 - **Denied requests** get `403 {"detail": "forbidden"}` and an `AUTHZ_DENIED` audit entry naming the account and the permission. A caller with no valid session gets the usual `401`, which is not audited.
-- **The voting routes** (`/api/ballot`, `/api/ballot/submit`) accept electors only, so staff get `403 forbidden`. Every role can use `/api/auth/extend` and `/api/auth/logout`.
+- **The voting routes** (`/api/ballot`, `/api/ballot/submit`) accept electors only, so staff get `403 forbidden`. Every role can use `/api/auth/logout`. `/api/auth/extend` works for electors; staff sessions cannot be extended (SR-06).
 
 **Create a staff account**, inside `backend/` with the virtual environment active:
 
@@ -454,7 +457,7 @@ No API endpoint creates staff, and the seed creates none.
 **Try the admin routes:**
 1. Set `COOKIE_SECURE=false` in `backend/.env` for local `http://`.
 2. Open http://127.0.0.1:8000/docs.
-3. Sign in with `POST /api/auth/login` (username and password), then `POST /api/auth/verify` (the 6-digit code from the authenticator app). In this prototype staff use a TOTP code like electors.
+3. Sign in with `POST /api/auth/login` (username and password), then `POST /api/auth/verify` (the 6-digit code from the authenticator app). In this prototype staff use a TOTP code like electors. The staff sign-in page (SR-06) does the same.
 4. Call the `/api/admin` routes from the same page; the browser keeps the session cookie. With curl, keep the cookie in a file:
 
 ```
@@ -478,8 +481,154 @@ Design only, not implemented:
 - Admin screens. Staff use the API directly.
 - An access review before each election and after any staff change.
 - Separation of privileged services, and least-privilege database roles.
-- Phishing-resistant staff sign in (SR-06). Staff use a password and TOTP for now.
+- Phishing-resistant passkeys (WebAuthn) for staff. SR-06 requires a password and a TOTP code for every staff sign in, but TOTP is not phishing-resistant, and passkeys remain design only.
 - Known gap: every `AUTHZ_DENIED` writes an audit row, so a flood of denied requests also floods the log.
+
+## SR-06: multi-factor sign-in for privileged users
+
+Every privileged user (any role except `elector`) signs in with two factors: a password and a 6-digit time-based code (TOTP) from an authenticator app. The admin routes accept only a session that passed both steps; after the password alone they answer `401`. Every SR-01 rule applies to staff exactly as to electors: the generic failure, one use per code, the lockout after 5 failures and the per-IP limit.
+
+| | Electors | Staff |
+|---|---|---|
+| Sign in | Password, then TOTP code | Password, then TOTP code |
+| Session | 10 minutes, extendable twice (SR-04) | 10 minutes, fixed, cannot be extended (`/api/auth/extend` answers `409 extension_limit`) |
+| `/api/auth/verify` answers | `{"display_name": ...}` (unchanged) | `{"role": ...}` |
+| Audit on success | `auth_login_success` | `auth_login_success` and `AUTH_PRIVILEGED_LOGIN_SUCCESS` |
+
+Every account must have a TOTP secret: `accounts.totp_secret_enc` is `NOT NULL`, and `scripts/create_staff.py` always creates one.
+
+**To sign in as staff:**
+
+1. Create the account, inside `backend/` with the virtual environment active:
+   ```
+   python -m scripts.create_staff --username official.one --role polling_official
+   ```
+2. Add the setup link or key it prints, shown only once, to an authenticator app.
+3. With the backend and the frontend dev server running, open http://localhost:5173/staff.html. This page is separate from the voter app.
+4. Enter the username and password, then the 6-digit code. The page shows your role and when the session ends, and signs you out after 10 minutes. It does not call any admin route.
+5. Use the admin routes from the API docs page (http://localhost:8000/docs) or curl (see SR-05). The session cookie also works on `localhost:8000`, because cookies are shared across ports of the same host. Set `COOKIE_SECURE=false` in `backend/.env` for local `http://`.
+
+Run the SR-06 tests, inside `backend/` with PostgreSQL running:
+
+```
+pytest tests/test_sr06_privileged_mfa.py -v
+```
+
+**TOTP is not phishing-resistant.** A fake sign-in page can capture a password and a code and use them within the same 30 seconds.
+
+Design only, not implemented:
+- Phishing-resistant passkeys (WebAuthn) for privileged users.
+- Re-authentication before each sensitive function.
+- A sealed break-glass account, with alerting and a review within 24 hours of any use.
+- A two-credential policy for privileged users.
+- Alerting on privileged sign ins and failures.
+
+## SR-07: signed ballot definitions
+
+Voters get their ballot papers only from a **ballot definition**: one signed, versioned document per election. It must be approved by two distinct delegates and activated before polls open.
+
+**What is signed.** Each version stores a payload: canonical JSON (sorted keys, compact separators, UTF-8) holding:
+- the election id and the version number;
+- `valid_from` and `valid_until`;
+- every division, each with its candidates in ballot order (id, given name, surname, party, position);
+- `prev_hash`: the SHA-256 of the previous version's payload, or `null` for version 1.
+
+Delegates sign the tag `evoting-ballot-definition-v1` and a newline, followed by the payload, with Ed25519. The stored payload text itself is what gets checked, never a re-serialised copy. Stored versions are never changed or deleted; a change is always a new version.
+
+**Approval.** The keyring (`DELEGATE_KEYRING_PATH`) maps each `key_id` to a delegate and a public key; the app reads only that. A definition needs valid signatures from `REQUIRED_DELEGATE_APPROVALS` (2) **distinct delegates**:
+- a signature from an unknown key, or one that does not verify, does not count;
+- one delegate counts once, however many keys or copies they sign with.
+
+A definition is also refused outside `valid_from`..`valid_until`, both ends included.
+
+**Activation** (script only; no API endpoint) happens in one transaction. It succeeds only if:
+1. the definition verifies;
+2. it is exactly the active version + 1, and its `prev_hash` matches the active version;
+3. it is at least `MIN_ACTIVATION_LEAD_HOURS` (24) before polls open;
+4. polls are not open yet.
+
+Anything else changes nothing and exits with the reason. Polls open and close at `elections.starts_at` and `ends_at`.
+
+**Serving.**
+- **Ballot request:** `GET /api/ballot` verifies the active definition on every request and builds the ballot only from its entry for the voter's division, in the same response shape as before. A candidate added to the candidates table later never appears.
+- **Submission:** `POST /api/ballot/submit` accepts only rankings of that entry's candidates.
+- **Failure:** with no active definition, or one that fails verification, nothing is served: `503 {"detail": "ballot_unavailable"}`, audited as `BALLOT_DEFINITION_INVALID`.
+- **Start-up:** the API refuses to start if an election whose polls have not closed has an invalid active definition, or is open with none.
+
+**The delegate script**, inside `backend/` with the virtual environment active:
+
+```
+python -m scripts.ballot_definition build --valid-from 2026-11-01T00:00:00+11:00 --valid-until 2027-11-01T00:00:00+11:00 --out definition.json
+python -m scripts.ballot_definition sign --definition definition.json --delegate delegate_a
+python -m scripts.ballot_definition activate --definition definition.json --signature definition.json.delegate_a.sig.json --signature definition.json.delegate_b.sig.json
+```
+
+`build` writes the next version from the current candidates (`--election ID` to choose an election; the latest by default). `sign` writes `{key_id, signature}`. `activate` prints `Activated version N` or `Rejected: <reason>` and exits 1.
+
+**To demonstrate the rejections** with the seeded election, whose polls are already open:
+1. `build` the next version, sign it with `delegate_a` only, and `activate` it with that one signature: `Rejected: not_enough_delegates`.
+2. Sign it with `delegate_b` as well and activate it with both: `Rejected: polls_open`.
+
+Both are audited as `BALLOT_DEFINITION_REJECTED`.
+
+**Seed fixture.** The seed writes version 1 directly, signed by `delegate_a` and `delegate_b`, with `activated_at` set to polls open minus 25 hours. The 24-hour rule applies to the activation script, and the demo election must already be open.
+
+**Development keys only.** The first use of the script, or of the seed, creates `delegate_a`, `delegate_b` and `delegate_c` private keys and `keyring.json` in `backend/keys/delegates/`, which Git ignores. Never use them for a real election. Nothing under `app/` reads a private key, and a test checks this.
+
+Audit events: `BALLOT_DEFINITION_ACTIVATED` and `BALLOT_DEFINITION_REJECTED` (actor `script`), and `BALLOT_DEFINITION_INVALID` (actor `account:<id>`, or `unknown` at start-up). Each has a reason code only, never payload or signature material.
+
+Run the SR-07 tests, inside `backend/` with PostgreSQL running:
+
+```
+pytest tests/test_sr07_ballot_definition.py -v
+```
+
+Design only, not implemented:
+- A delegate key ceremony.
+- Delegate keys held on hardware.
+- A signing screen.
+- Publishing each definition's hash.
+- Database-level protection of stored definitions (the database roles SR).
+
+## SR-08: House preference rules
+
+Before a ballot is accepted, the server checks the ranking against the House of Representatives rules (`app/ballot_rules.py`). The candidate list comes from the same verified ballot definition the ballot was served from (SR-07). A ballot arrives as an ordered list of candidate ids: the first id is number 1, the next number 2, and so on. Repeated numbers, gaps and a missing first preference therefore cannot occur, and the interface cannot produce ticks, crosses or writing.
+
+The rules, in order, for a division with N candidates:
+
+1. **Invalid:** a candidate who is not in this division, a candidate listed twice, or more than N entries.
+2. **Informal, `blank`:** nothing ranked.
+3. **Formal:** all N candidates, each once. The list order is the preference order, and it is stored as submitted.
+4. **Informal, `incomplete_order`:** anything else, that is, fewer than N.
+
+| Result | Response |
+|---|---|
+| Informal | `422 {"detail": "informal_ballot", "reason": "blank"}` or `"reason": "incomplete_order"`. Shown as "Your preferences are incomplete: number every box from 1 to N" |
+| Invalid | `422 {"detail": "invalid_ballot"}`, never saying which candidate or rule. Shown as "Your ballot could not be accepted. Please check your preferences" |
+
+**When the rules run.** The check runs inside the SR-03 accept transaction, after the replay check and before the token is used. A used token still gets its stored receipt without any check. A refused ballot changes nothing: the token stays unused, the elector stays `issued` and no ballot is stored, so the voter can correct it and submit again with the same token. The server never takes the client's word that a ballot is formal.
+
+**Audit.** An invalid request is audited as `BALLOT_REJECTED_INVALID` (account only), as possible tampering. An informal ballot is deliberately not audited, because the entry would record what that elector was trying to vote.
+
+**The interface** already requires every candidate to be ranked:
+- **Ballot screen:** shows how many boxes are left, highlights the empty ones and will not move on to review until every box is numbered.
+- **Review screen:** offers no submit button for an incomplete ballot.
+
+So no ballot made through the interface is informal or invalid. The two messages above appear only if the server disagrees.
+
+**Design assumptions:**
+1. The platform does not accept informal ballots. There is no `confirm_informal` flag and informal ballots are never stored. The request to `POST /api/ballot/submit` is unchanged: the ballot token and an ordered list of candidate ids.
+2. Every box must be numbered. The one-blank-box savings provision is not implemented, so a list of N-1 candidates is informal and refused. This is stricter than the real House rules. Because the interface already requires every candidate to be ranked, no ballot produced through it is affected.
+
+Run the SR-08 tests, inside `backend/` with PostgreSQL running:
+
+```
+pytest tests/test_sr08_house_rules.py -v
+```
+
+Design only, not implemented:
+- **The one-blank-box savings provision.** Under the House rules, a ballot with every box but one numbered consecutively is formal, and the blank box counts as the last preference.
+- **Accepting an informal ballot.** This would come with a warning and one explicit confirmation, store the ballot as informal and count it in the informal total. Real informal ballots are votes: they are handed in and counted as informal.
 
 ## Folder layout
 

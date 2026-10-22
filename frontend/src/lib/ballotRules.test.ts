@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { checkRanking, movePreference, removePreference, toggleCandidate } from "./ballotRules";
+import { checkRanking, movePreference, removePreference, submitProblem, toggleCandidate } from "./ballotRules";
 
 const ids = [10, 20, 30];
 
@@ -53,5 +53,22 @@ describe("checkRanking", () => {
 
   it("rejects a candidate who is not on this ballot", () => {
     expect(checkRanking(ids, [10, 20, 30, 99]).valid).toBe(false);
+  });
+});
+
+// SR-08: the messages for the server's two 422 answers, and the fallback for anything else
+describe("submitProblem", () => {
+  it("asks for every box to be numbered when the server finds the ballot informal", () => {
+    expect(submitProblem("informal_ballot", 4)).toBe("Your preferences are incomplete: number every box from 1 to 4.");
+  });
+
+  it("gives a general message for an invalid ballot, without saying what was wrong", () => {
+    expect(submitProblem("invalid_ballot", 4)).toBe("Your ballot could not be accepted. Please check your preferences.");
+  });
+
+  it("keeps the old message for any other failure", () => {
+    expect(submitProblem(undefined, 4)).toBe(
+      "Your ballot could not be submitted. Try again, or ask a polling official for help.",
+    );
   });
 });
