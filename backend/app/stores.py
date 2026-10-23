@@ -35,6 +35,8 @@ BALLOT_TABLES = frozenset(
     {
         "ballots",  # the encrypted ballots (SR-11): random id, election id, ciphertext
         "ballot_tokens",  # one-time token hashes and the receipts they produced
+        # SR-13: the hash chain over stored ballots: it names ballots, never electors
+        "ballot_chain",
     }
 )
 

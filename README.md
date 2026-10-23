@@ -85,6 +85,8 @@ This creates `backend/keys/ballot.key`: 32 random bytes, the AES-256 key that en
 
 > **Back up the key, and never commit it.** Keep a copy somewhere safe and separate from the database and its backups. If the key is lost, every stored ballot is unreadable and nobody can recover them. `backend/keys/` is in `.gitignore`. Never email it or put it in shared documents.
 
+SR-13: also create the ballot chain's checkpoint keys, `python -m scripts.gen_checkpoint_key`. They are needed only to seal and verify; the server starts without them.
+
 ### 6. Build the frontend
 
 ```
@@ -225,7 +227,7 @@ The same checks run on every pull request through GitHub Actions (`.github/workf
 
 Before every release, also run the SR-11 storage audit, `python -m scripts.audit_ballots`, against the release database. It must exit with code 0. See [docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md).
 
-Before each election, export the ballot side (`python -m scripts.export_ballots`) and take backups as two separate dump files, one for each side ([SR-12](#sr-12-identity-and-ballots-kept-apart)). Then run `python -m scripts.audit_separation --file <each backup and export file>`. It must also exit with code 0.
+Before each election, export the ballot side (`python -m scripts.export_ballots`) and take backups as two separate dump files, one for each side ([SR-12](#sr-12-identity-and-ballots-kept-apart)). Then run `python -m scripts.audit_separation --file <each backup and export file>`. It must also exit with code 0. Finally run `python -m scripts.verify_chain --election <id>` for each election ([SR-13](#sr-13-integrity-protected-ballot-storage)): it must exit with code 0, and its head hash goes in the release record.
 
 ## Settings
 
@@ -256,6 +258,8 @@ Copy `backend/.env.example` to `backend/.env`. Docker Compose reads the same fil
 | `MAX_FAILED_ATTEMPTS`, `LOCK_MINUTES`, `MFA_PENDING_MINUTES`, `RATE_LIMIT_ATTEMPTS`, `RATE_LIMIT_WINDOW_SECONDS`, `COOKIE_SECURE` | Sign-in lockout, rate limit and cookie settings. See [SR-01](#sr-01-authentication-and-rate-limiting) | `5`, `15`, `2`, `20`, `300`, `true` |
 | `ROLL_PUBLIC_KEY_PATH`, `MIN_VOTING_AGE` | The roll's Ed25519 public key, and the minimum age on polling day. See [SR-02](#sr-02-roll-signing-and-eligibility) | `backend/keys/roll_public.pem`, `18` |
 | `DELEGATE_KEYRING_PATH`, `REQUIRED_DELEGATE_APPROVALS`, `MIN_ACTIVATION_LEAD_HOURS` | The delegates' public keyring, the distinct delegates who must sign, and how long before polls open a definition must be activated. See [SR-07](#sr-07-signed-ballot-definitions) | `backend/keys/delegates/keyring.json`, `2`, `24` |
+| `MIN_SEAL_BATCH`, `CHECKPOINT_DIR` | SR-13: the smallest batch sealed without `--final`, and the folder of signed checkpoints (relative to `backend/`). See [SR-13](#sr-13-integrity-protected-ballot-storage) | `10`, `checkpoints` |
+| `CHECKPOINT_PUBLIC_KEY`, `CHECKPOINT_PRIVATE_KEY` | SR-13: the checkpoint key pair (`python -m scripts.gen_checkpoint_key`). The private key is for the seal script only | `keys/checkpoint_public.pem`, `keys/checkpoint_private.pem` |
 | `LOG_DIR` | Folder of the server's log files, if its output is saved to files. The SR-12 separation audit scans it | `logs/` at the project root |
 | `BALLOT_KEY_FILE` | The 32-byte AES-256 key that encrypts every stored ballot (`python -m scripts.gen_ballot_key`). No default key exists: without this file the API does not start. See [SR-11](#sr-11-ballots-encrypted-at-rest) | `backend/keys/ballot.key` |
 | `HSTS_MAX_AGE` | Seconds the browser must use HTTPS only for this host. `.env.example` sets `300` for local work. See [SR-10](#sr-10-tls-13-for-ballot-transmission) | `31536000` (one year) |
@@ -846,7 +850,7 @@ From the moment a ballot is accepted, and for as long as it is kept, no persiste
 | Side | Tables |
 |---|---|
 | Identity (`IDENTITY_TABLES`) | `electoral_roll`, `accounts` (electors and staff), `sessions`, `registration_sessions`, `voter_participation` (issued or voted, never how), `audit_log`. Also the public election setup: `elections`, `divisions`, `candidates` and `ballot_definitions`. These hold no ballot content and are referenced by the roll and participation |
-| Ballot (`BALLOT_TABLES`) | `ballots` (random id, election id, SR-11 ciphertext) and `ballot_tokens` (random id, election id, token hash, receipt) |
+| Ballot (`BALLOT_TABLES`) | `ballots` (random id, election id, SR-11 ciphertext), `ballot_tokens` (random id, election id, token hash, receipt) and, since SR-13, `ballot_chain` (the hash chain over stored ballots) |
 
 Sign-in rate-limit counts are identity-side too, but they live in memory only. `alembic_version` is Alembic's own bookkeeping and belongs to neither side.
 
@@ -872,7 +876,7 @@ This writes one line per ballot, `{"ballot_id", "election_id", "encrypted_payloa
 ```powershell
 New-Item -ItemType Directory -Force ..\evoting-backups | Out-Null
 docker compose exec db pg_dump -U evoting -d evoting --no-owner -f /tmp/identity.sql -t public.accounts -t public.audit_log -t public.ballot_definitions -t public.candidates -t public.divisions -t public.elections -t public.electoral_roll -t public.registration_sessions -t public.sessions -t public.voter_participation -t public.alembic_version
-docker compose exec db pg_dump -U evoting -d evoting --no-owner -f /tmp/ballots.sql -t public.ballots -t public.ballot_tokens
+docker compose exec db pg_dump -U evoting -d evoting --no-owner -f /tmp/ballots.sql -t public.ballots -t public.ballot_tokens -t public.ballot_chain
 docker compose cp db:/tmp/identity.sql ..\evoting-backups\identity.sql
 docker compose cp db:/tmp/ballots.sql ..\evoting-backups\ballots.sql
 docker compose exec db rm /tmp/identity.sql /tmp/ballots.sql
@@ -912,6 +916,80 @@ pytest tests/test_sr12_separation.py -v
 - **Physical row order.** PostgreSQL stores rows in pages roughly in insertion order, so someone with raw disk access may still see part of the arrival order. Counting and export never rely on it: they order by the random ballot id.
 - **Encrypted separate backups.** The two dump files and how to encrypt them are documented above. No tool makes or encrypts them automatically.
 
+## SR-13: integrity-protected ballot storage
+
+Every accepted ballot ends up in an integrity-protected repository: a SHA-256 hash chain per election, with signed checkpoints. The integrity tests and the verify command detect insertion, deletion, modification and reordering of recorded ballots. **The chain detects tampering; it does not prevent it.**
+
+**The chain** (`ballot_chain`, `app/ballot_chain.py`). One entry per sealed ballot: election id, position, batch number, ballot id, previous hash and entry hash.
+- **What the entry hash covers.** SHA-256 over a version tag, the previous entry's hash, the ballot id, the election id, and the SHA-256 of the stored SR-11 ciphertext. Changing a ballot's bytes, removing or adding one, or swapping two breaks the chain.
+- **Where it starts.** Position 1 links to a start value derived from the election id.
+- **Nothing to decrypt.** Verifying reads only the ciphertext, so it never decrypts a ballot and never needs the SR-11 key.
+- **Unchanged parts.** The `ballots` table and the SR-03 accept transaction are unchanged. The chain holds no time, elector, roll, session or IP.
+
+**Sealing in shuffled batches.** Ballots are not chained when they are accepted. The returning officer seals them, inside `backend/`:
+
+```
+python -m scripts.seal_ballots --election <election id>           # needs at least MIN_SEAL_BATCH (10) unsealed ballots
+python -m scripts.seal_ballots --election <election id> --final   # after polls close: the last batch, any size
+```
+
+- **One transaction, one seal at a time.** Each seal runs in one transaction under a per-election lock, so two seals cannot interleave. It refuses an empty batch, a batch below `MIN_SEAL_BATCH` (unless `--final`), anything after a final seal, and a chain that already fails verification.
+- **Order within a batch.** Ballots are ordered by their random ballot id, never by arrival, so a position reveals nothing about when a ballot came in (SR-12).
+- **After the commit.**
+  - It appends one signed checkpoint line to `CHECKPOINT_DIR/<election id>.jsonl` (default `backend/checkpoints/`, never committed). The line holds the election, batch number, entry count, head hash and final flag, signed with Ed25519.
+  - It verifies the whole chain and prints the head hash.
+  - It audits `BALLOT_BATCH_SEALED` with the batch number and count only.
+- **After a `--final` seal,** no more ballots may be accepted for that election. One that arrives later fails verification (`unsealed_after_final`).
+
+**Keys.** Create them once, inside `backend/`:
+
+```
+python -m scripts.gen_checkpoint_key
+```
+
+- **Where they go.** This writes `keys/checkpoint_private.pem` (0600 where supported) and `keys/checkpoint_public.pem`. It never overwrites without `--force`.
+- **Who uses which key.** Only the seal script uses the private key. The server side reads only the public key, and only when verifying. The API starts without either, so CI and tests need no keys.
+
+**Verifying.** Inside `backend/`:
+
+```
+python -m scripts.verify_chain --election <election id>
+```
+
+It prints one PASS or FAIL line per check group, the entry count and the head hash, and exits with code 1 on any failure. The reason codes are:
+- `bad_entry_hash`, `broken_link`: a wrong entry hash or a broken link, including a ballot whose bytes changed;
+- `gap_or_reorder`: positions not continuous from 1, or batches out of order;
+- `missing_ballot`: a chain entry whose ballot is gone;
+- `missing_checkpoint`, `malformed_checkpoint`, `bad_checkpoint_signature`: a checkpoint file or line that is missing, unreadable or wrongly signed;
+- `checkpoint_mismatch`: a checkpoint that does not match the chain at its batch;
+- `tail_mismatch`: a last checkpoint that does not match the chain's tail, which catches a truncated tail;
+- `unsealed_after_final`: a ballot that is not in the chain after a final seal.
+
+Failures are audited as `BALLOT_CHAIN_VERIFY_FAILED` with the reason codes only. No option skips a check. There is no counting feature; any future count must call `verify_chain` first and refuse to count on failure.
+
+**Append-only tables.** Database triggers refuse every UPDATE and DELETE on `ballots` and `ballot_chain`, with no bypass flag; INSERT is allowed. The triggers do not stop `TRUNCATE`, which the development `python -m scripts.seed --reset` relies on. They do not stop a database owner either, who can disable them. That is why the chain and the checkpoints exist.
+
+**SR-12 consistency.** `ballot_chain` is a ballot-side table, and its entry hashes count as ballot identifiers in the separation audit. That audit now also refuses order-number columns (position, seq, batch...) on the ballot side, with one narrow exception: `ballot_chain.position` and `batch_no`, which follow the random ballot-id order. The ballot backup dump includes `ballot_chain`.
+
+Run the SR-13 tests, inside `backend/` with PostgreSQL running:
+
+```
+pytest tests/test_sr13_chain.py -v
+```
+
+**SR-13 assumptions:**
+- **Order is fixed, but only coarsely.** The chain fixes ballot order, so the order is random within a batch, and batches reveal only coarse timing. This protects SR-12.
+- **Key and checkpoints on one machine.** In the prototype the signing key and the checkpoint folder sit on the same machine as the database. Someone who controls all three can rebuild a consistent chain. Recording the head hash with each release limits this.
+- **Triggers can be bypassed by a database owner.**
+
+**SR-13 design only, not implemented:**
+- a background sealing worker;
+- signing keys in an HSM, or split between two delegates;
+- write-once or off-host checkpoint storage;
+- external anchoring of the head hash;
+- a Merkle tree;
+- least-privilege database roles.
+
 ## Folder layout
 
 ```
@@ -920,5 +998,6 @@ frontend/            React app
 docs/                MANUAL.md (files and how to run the app), SR-09_INSPECTION.md and sr09-evidence/ (SR-09), RELEASE_CHECKLIST.md (SR-11)
 certs/               SR-10: the development TLS certificate and key (python -m scripts.dev_certs). Never committed
 exports/, logs/      SR-12: ballot-side exports and server log files. Never committed
+backend/checkpoints/ SR-13: signed ballot chain checkpoints, one file per election. Never committed
 docker-compose.yml   PostgreSQL 16 for local development
 ```

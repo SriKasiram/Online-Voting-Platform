@@ -78,6 +78,16 @@ class Settings(BaseSettings):
     # scans this folder, and any *.log file in the project, for ballot identifiers.
     log_dir: Path = PROJECT_DIR / "logs"
 
+    # SR-13: the ballot hash chain. A batch smaller than this is sealed only with --final, so a batch
+    # never narrows down which ballots arrived together.
+    min_seal_batch: int = 10
+    # SR-13: signed checkpoints, one JSON Lines file per election. Stands in for separate storage.
+    checkpoint_dir: Path = Path("checkpoints")
+    # SR-13: the server side only ever reads the public key, and only when verifying. Missing keys
+    # never stop the API from starting; the private key is used by scripts/seal_ballots.py alone.
+    checkpoint_public_key: Path = Path("keys/checkpoint_public.pem")
+    checkpoint_private_key: Path = Path("keys/checkpoint_private.pem")
+
     # SR-10: how long browsers must use HTTPS only for this host. One year by default. HSTS ignores
     # the port, so local development sets it short (.env.example) to avoid locking localhost to HTTPS.
     hsts_max_age: int = 31536000
@@ -90,6 +100,10 @@ class Settings(BaseSettings):
     def tls_path(self, path: Path) -> Path:
         """SR-10: a certificate or key path, with relative paths taken from the project root."""
         return path if path.is_absolute() else PROJECT_DIR / path
+
+    def backend_path(self, path: Path) -> Path:
+        """SR-13: a checkpoint path or key, with relative paths taken from backend/ (beside keys/)."""
+        return path if path.is_absolute() else BACKEND_DIR / path
 
     def database_url(self, database: str | None = None) -> URL:
         """Connection URL for the app database, or for another database on the same server."""

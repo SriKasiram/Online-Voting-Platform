@@ -299,6 +299,28 @@ class Ballot(Base):
     encrypted_payload: Mapped[bytes]
 
 
+class BallotChainEntry(Base):
+    """
+    SR-13: one link of an election's SHA-256 hash chain over its accepted ballots
+    (app/ballot_chain.py). Written only by the sealing script, in shuffled
+    batches: within a batch the order is the random ballot id, so a position
+    says nothing about when a ballot arrived (SR-12). No time, elector, roll,
+    session or IP. A database trigger refuses UPDATE and DELETE here and on ballots.
+    """
+
+    __tablename__ = "ballot_chain"
+
+    # SR-12: a plain value, no foreign key to the identity side
+    election_id: Mapped[uuid.UUID] = mapped_column(primary_key=True)
+    # SR-13: assigned by the sealing code, never a database serial, so the database invents no order
+    position: Mapped[int] = mapped_column(primary_key=True, autoincrement=False)
+    batch_no: Mapped[int]
+    ballot_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("ballots.id"), unique=True)
+    # SR-13: lowercase hex SHA-256 values
+    prev_hash: Mapped[str]
+    entry_hash: Mapped[str]
+
+
 # ---------------------------------------------------------------
 # Audit log
 # ---------------------------------------------------------------

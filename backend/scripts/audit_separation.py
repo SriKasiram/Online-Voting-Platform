@@ -40,6 +40,12 @@ RECEIPT_PATTERN = re.compile(rf"(?<![A-Z0-9])[{RECEIPT_ALPHABET}]{{4}}-[{RECEIPT
 # (ip, client_ip, ip_address), so that receipt_reference is not a false match.
 FORBIDDEN_NAME_PARTS = ("elector", "roll", "user", "session", "agent")
 TIME_TYPES = {"timestamp without time zone", "timestamp with time zone", "time without time zone", "time with time zone"}
+# SR-13: an order number on the ballot side could replay the order ballots arrived in, so a column
+# named as one (position, seq, batch...) is refused like a serial id. The one narrow exception:
+# ballot_chain's own position and batch_no, which the seal script assigns in random ballot-id order
+# within shuffled batches. Every other rule above still applies to ballot_chain.
+ORDER_WORDS = {"position", "seq", "sequence", "ordinal", "counter", "batch"}
+CHAIN_ORDER_COLUMNS = {("ballot_chain", "position"), ("ballot_chain", "batch_no")}
 
 # SR-12: identity markers, for files that are not SQL dumps (exports). A file holding a ballot
 # identifier and any of these fails:
@@ -69,12 +75,14 @@ def identifiers_in(content: str) -> set[str]:
 
 
 def ballot_identifiers(db: Session) -> set[str]:
-    """SR-12: ballot ids, token ids, token hashes and receipts, normalised like identifiers_in."""
+    """SR-12: ballot ids, token ids, token hashes and receipts (SR-13: and chain entry hashes), normalised like identifiers_in."""
     identifiers = {str(ballot_id).lower() for (ballot_id,) in db.execute(text("SELECT id FROM ballots"))}
     for token_id, token_hash, receipt in db.execute(text("SELECT id, token_hash, receipt_reference FROM ballot_tokens")):
         identifiers |= {str(token_id).lower(), token_hash.lower()}
         if receipt:
             identifiers.add(receipt)
+    # SR-13: a chain entry hash points at one ballot too, so it may not appear on the identity side either
+    identifiers |= {entry_hash.lower() for (entry_hash,) in db.execute(text("SELECT entry_hash FROM ballot_chain"))}
     return identifiers
 
 
@@ -130,6 +138,9 @@ def check_ballot_columns(db: Session) -> Check:
                 problems.append(f"{table}.{column} ({data_type})")
             if identity == "YES" or (default or "").startswith("nextval("):
                 problems.append(f"{table}.{column} (serial)")
+            # SR-13: order numbers are refused too, except ballot_chain's position and batch_no
+            if set(column.lower().split("_")) & ORDER_WORDS and (table, column) not in CHAIN_ORDER_COLUMNS:
+                problems.append(f"{table}.{column} (order number)")
     if problems:
         return Check(name, "FAIL", "; ".join(problems))
     return Check(name, "PASS", f"{', '.join(sorted(BALLOT_TABLES))}: no identity-like names, no time columns, no serial ids")

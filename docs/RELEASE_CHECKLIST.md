@@ -13,5 +13,8 @@ Work through every step, in order, before a release. A release needs every requi
    - First make the two separate backup dumps (identity side and ballot side) and the ballot export, as described in the README's SR-12 section.
    - Then run `python -m scripts.audit_separation --file <each backup and export file>` against the release database. It must exit with code 0, ending in `SR-12 separation audit: PASS`. Attach the output to the release record.
    - Store and encrypt the two dumps separately, never in the repository.
-5. **Ballot key (SR-11).** `BALLOT_KEY_FILE` exists on the server, and a backup of it is kept separately from the database and its backups. It is never in the repository.
-6. **TLS (SR-10).** The server starts with `python -m app.serve`, and `docs/MANUAL.md` section 6 still passes.
+5. **Ballot chain (required, SR-13).** For each election, seal what is left (`python -m scripts.seal_ballots --election <id> --final` once polls have closed).
+   - Then run `python -m scripts.verify_chain --election <id>`. It must exit with code 0. Attach the output and record the head hash it prints in the release record.
+   - Keep the checkpoint files (`backend/checkpoints/`) with the release record, apart from the database.
+6. **Ballot key (SR-11).** `BALLOT_KEY_FILE` exists on the server, and a backup of it is kept separately from the database and its backups. It is never in the repository.
+7. **TLS (SR-10).** The server starts with `python -m app.serve`, and `docs/MANUAL.md` section 6 still passes.

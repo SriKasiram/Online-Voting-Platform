@@ -15,6 +15,8 @@ certs/
 # SR-12: ballot-side exports (python -m scripts.export_ballots) and server log files (LOG_DIR)
 exports/
 logs/
+# SR-13: signed ballot chain checkpoints (CHECKPOINT_DIR). The checkpoint keys are under keys/ above.
+checkpoints/
 
 # Databases and dumps
 *.sqlite

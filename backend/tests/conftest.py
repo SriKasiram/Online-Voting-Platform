@@ -47,6 +47,8 @@ from scripts.ballot_definition import build_payload, ensure_delegate_keys, sign,
 from scripts.create_staff import create_staff
 # SR-11: the same key generator the README tells people to run
 from scripts.gen_ballot_key import generate_ballot_key
+# SR-13: and the checkpoint key generator
+from scripts.gen_checkpoint_key import generate_checkpoint_keys
 from scripts.sign_roll import sign_record
 
 # SR-02: a fixed polling date, so no test depends on today's date
@@ -167,6 +169,29 @@ def ballot_key(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path]:
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(settings, "ballot_key_file", path)
         yield path
+
+
+@pytest.fixture(scope="session", autouse=True)
+def checkpoint_keys(tmp_path_factory: pytest.TempPathFactory) -> Iterator[tuple[Path, Path]]:
+    """
+    SR-13: a checkpoint signing key pair for this test run, made by the key script itself, with the
+    settings pointed at it. Tests and CI need no keys/ folder.
+    """
+    folder = tmp_path_factory.mktemp("checkpoint_keys")
+    private, public = generate_checkpoint_keys(folder / "checkpoint_private.pem", folder / "checkpoint_public.pem")
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(settings, "checkpoint_private_key", private)
+        patch.setattr(settings, "checkpoint_public_key", public)
+        yield private, public
+
+
+@pytest.fixture(scope="session", autouse=True)
+def checkpoint_dir(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Path]:
+    """SR-13: checkpoints go to a temporary folder, never backend/checkpoints/. Each election has its own file."""
+    folder = tmp_path_factory.mktemp("checkpoints")
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(settings, "checkpoint_dir", folder)
+        yield folder
 
 
 @pytest.fixture(scope="session", autouse=True)

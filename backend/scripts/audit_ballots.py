@@ -41,6 +41,8 @@ OTHER_TABLES = {
     # SR-12: tokens no longer hold expires_at or consumed_at
     "ballot_tokens": {"id", "election_id", "token_hash", "receipt_reference"},
     "voter_participation": {"roll_id", "election_id", "state"},
+    # SR-13: the hash chain holds ids and hashes of the ciphertext, never ballot content
+    "ballot_chain": {"election_id", "position", "batch_no", "ballot_id", "prev_hash", "entry_hash"},
     "audit_log": {"id", "created_at", "event_type", "actor", "details", "prev_hash", "hash"},
 }
 SKIP_DIRS = {".git", "node_modules", ".venv", "dist", "__pycache__", ".pytest_cache"}
