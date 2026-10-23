@@ -58,6 +58,11 @@ EVENT_CATEGORIES: dict[str, str] = {
     # SR-13
     "BALLOT_BATCH_SEALED": BALLOT_BOX,
     "BALLOT_CHAIN_VERIFY_FAILED": BALLOT_BOX,
+    # SR-17: the House count, run by the returning officer's script. Like the seal, these name no
+    # elector and no ballot: only the outcome, a reason code and how many ballots were counted.
+    "COUNT_STARTED": BALLOT_BOX,
+    "COUNT_COMPLETED": BALLOT_BOX,
+    "COUNT_REFUSED": BALLOT_BOX,
 }
 
 SUCCESS = "success"
@@ -122,5 +127,15 @@ REASON_CODES = frozenset(
         "wrong_code",
         "too_many_attempts",
         "already_registered",
+        # SR-17: why a House count stopped (app/house_count.py), in the order the checks run.
+        # The first, polls_open, is already listed above for SR-07 and means the same here.
+        "definition_invalid",
+        "no_final_checkpoint",
+        "chain_invalid",
+        "total_mismatch",
+        "decrypt_failed",
+        "wrong_division",
+        "informal_or_invalid",
+        "unresolved_tie",
     }
 )

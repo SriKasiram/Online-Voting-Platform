@@ -26,3 +26,7 @@ Work through every step, in order, before a release. A release needs every requi
 11. **Monthly audit capture (SR-16).** Check that the monthly audit-capture workflow passed this month: the **Audit capture** workflow in GitHub Actions.
     - If it has not run this month, run it by hand: Actions, Audit capture, Run workflow.
     - Scheduled workflows run only on the default branch.
+12. **House count (SR-17).** Before any count: verify_chain and verify_audit must pass. Run python -m scripts.count_house only after polls close and the final seal. A refusal must be investigated, never bypassed.
+    - Inside `backend/`: `python -m scripts.verify_chain --election <id>` and `python -m scripts.verify_audit` must both exit with code 0.
+    - Then run `python -m scripts.count_house --election <id>`. Attach its output and the result file (`exports/house_result_<id>.json`) to the release record.
+    - A `REFUSED: <code>` stops the count with no result. There is no way to skip a check.

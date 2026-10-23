@@ -3,6 +3,7 @@
 from datetime import timedelta
 
 import pyotp
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -12,12 +13,14 @@ from app.security import enrolment_code_hash, roll_lookup, utc_now
 from scripts.seed import (
     CODE_VALID_DAYS,
     REVIEWER_DATE_OF_BIRTH,
+    REVIEWER_DIVISION,
     REVIEWER_ENROLMENT_CODE,
     REVIEWER_GIVEN_NAME,
     REVIEWER_POSTCODE,
     REVIEWER_SURNAME,
     reset_reviewer,
     seed,
+    seed_demo_electors,
 )
 
 REVIEWER = {
@@ -73,6 +76,24 @@ def test_every_seed_run_refreshes_the_code_expiry(db_session: Session) -> None:
     seed(db_session)
 
     assert reviewer_entry(db_session).code_expires_at > utc_now() + timedelta(days=CODE_VALID_DAYS - 1)
+
+
+def test_demo_electors_are_added_once_in_the_reviewers_division_and_can_register(
+    client: TestClient, db_session: Session
+) -> None:
+    """SR-17: --demo-electors adds fake electors for a count demo, only once, each able to register; 1 to 9 only."""
+    seed(db_session)
+
+    electors = seed_demo_electors(db_session, 3)
+
+    assert seed_demo_electors(db_session, 3) == electors
+    assert counts(db_session)["electoral_roll"] == 4
+    divisions = db_session.scalars(select(Division.name).join(ElectoralRollEntry, ElectoralRollEntry.division_id == Division.id))
+    assert set(divisions) == {REVIEWER_DIVISION}
+    assert client.post("/api/register/verify", json=electors[1]).status_code == 204
+    for wrong in (0, 10):
+        with pytest.raises(SystemExit):
+            seed_demo_electors(db_session, wrong)
 
 
 def test_reviewer_can_register_with_the_seeded_details(client: TestClient, db_session: Session) -> None:

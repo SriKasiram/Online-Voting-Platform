@@ -812,7 +812,7 @@ Every stored ballot is encrypted with AES-256-GCM. Before each release, a storag
 - **No way around it.** There is no default key, no plaintext mode and no setting that turns encryption off.
 - **Never logged.** Nothing logs or prints the key, a plaintext ballot or a ciphertext.
 
-**Counting.** The prototype has no counting or results feature, so none was added. `decrypt_ballot` opens a ballot in memory only. A future count must use it the same way, and never write decrypted ballots to disk, logs or the database.
+**Counting.** SR-11 added no counting feature. `decrypt_ballot` opens a ballot in memory only. SR-17's House count uses it that way and never writes a decrypted ballot to disk, logs or the database (see [SR-17](#sr-17-verified-house-count)).
 
 **Error responses.** FastAPI's default 422 answer repeats the submitted input. For a malformed `POST /api/ballot/submit`, the answer now keeps only where and why validation failed, so it can never repeat the ranking. Other routes are unchanged.
 
@@ -866,7 +866,7 @@ Sign-in rate-limit counts are identity-side too, but they live in memory only. `
 - **Exact times stay on the identity side.** The audit log, sessions and participation keep theirs.
 - **Foreign keys.** `ballots` and `ballot_tokens` no longer have foreign keys to `elections`: the election id is a plain value. So the ballot side has no foreign key at all.
 - **Database errors.** They no longer show their SQL parameters (`hide_parameters=True`). If storing an accepted ballot fails, the error raised carries none of the database's text about the row, so the server log cannot repeat a ballot id, token hash or receipt.
-- **Bulk reads.** Every bulk read of ballots (`stores.ballot_rows`: the export, the SR-11 audit, any future count) is ordered by the random ballot id, never by arrival order or time.
+- **Bulk reads.** Every bulk read of ballots (`stores.ballot_rows`: the export and the SR-11 audit) is ordered by the random ballot id, never by arrival order or time. SR-17: the count reads through the chain instead, in chain position order. Positions follow the random ballot id within each sealed batch (SR-13), so arrival order stays hidden.
 - **Audit events.** `BALLOT_TOKEN_ISSUED` and `BALLOT_ACCEPTED` hold only the event type and the elector's account. The access log has request lines only, and no exception handler includes a ballot value.
 
 **Export the ballot side.** Inside `backend/`:
@@ -971,7 +971,7 @@ It prints one PASS or FAIL line per check group, the entry count and the head ha
 - `tail_mismatch`: a last checkpoint that does not match the chain's tail, which catches a truncated tail;
 - `unsealed_after_final`: a ballot that is not in the chain after a final seal.
 
-Failures are audited as `BALLOT_CHAIN_VERIFY_FAILED` with the reason codes only. No option skips a check. There is no counting feature; any future count must call `verify_chain` first and refuse to count on failure.
+Failures are audited as `BALLOT_CHAIN_VERIFY_FAILED` with the reason codes only. No option skips a check. SR-17's House count calls `verify_chain` first and refuses to count on any failure.
 
 **Append-only tables.** Database triggers refuse every UPDATE and DELETE on `ballots` and `ballot_chain`, with no bypass flag; INSERT is allowed. The triggers do not stop `TRUNCATE`, which the development `python -m scripts.seed --reset` relies on. They do not stop a database owner either, who can disable them. That is why the chain and the checkpoints exist.
 
@@ -1251,6 +1251,89 @@ pytest tests/test_sr16_audit.py -v
 - forwarding to a SIEM;
 - least-privilege database roles;
 - destruction at the end of the retention period.
+
+## SR-17: verified House count
+
+The House count uses only ballots from the verified ballot chain, up to the final signed checkpoint. Each one is decrypted with its own record binding and checked against the active signed ballot definition. If any check fails, the whole count stops.
+
+**When and how.** Only after polls close (the election's `ends_at`) and the final seal. Inside `backend/`:
+
+```
+python -m scripts.seal_ballots --election <id> --final   # SR-13, after polls close
+python -m scripts.verify_chain --election <id>           # must PASS
+python -m scripts.verify_audit                           # must PASS (SR-16)
+python -m scripts.count_house --election <id>            # writes exports/house_result_<id>.json
+python -m scripts.count_house --election <id> --out <file>
+```
+
+It needs the SR-11 ballot key and the SR-13 checkpoint public key, read as the other scripts read them, and no private key. There is no API endpoint and no results screen.
+
+**A demo with several ballots.** The seed has one elector, the reviewer. `python -m scripts.seed --demo-electors N` adds up to 9 fake demo electors in the reviewer's division (development only), so several people can register and vote before a demo count. [docs/MANUAL.md](docs/MANUAL.md) section 13 gives every step, including closing polls for the demo.
+
+**The checks, in this order** (`backend/app/house_count.py`):
+
+| Code | Stops the count when |
+|---|---|
+| `polls_open` | the clock is still before the election's close |
+| `definition_invalid` | the active ballot definition does not verify (SR-07), as it stood at the close |
+| `no_final_checkpoint` | there is no valid, signed final checkpoint for the election (SR-13) |
+| `chain_invalid` | `verify_chain` reports anything: hashes, links, positions, checkpoints, a ballot unsealed after the final seal. The SR-13 codes are printed too |
+| `total_mismatch` | the ballots read differ from the final checkpoint's count, or from the number of electors marked `voted`. Totals only: participation is never joined to a ballot |
+| `decrypt_failed` | a ballot does not decrypt with its own ballot id and election (SR-11) |
+| `wrong_division` | a ballot's division is not on the active definition |
+| `informal_or_invalid` | a ballot is not formal for that division's candidates (SR-08) |
+| `unresolved_tie` | a tie for exclusion that no earlier round separates (below) |
+
+Ballots are read only through the chain: rows of `ballot_chain` joined to `ballots`, positions 1 to the final checkpoint's count, in position order. A ballot that is not in the chain is never read.
+
+**Any failed check stops the whole count.**
+- **Nothing is ever skipped.** No ballot is dropped, no division is left out, and no flag bypasses a check.
+- **No result.** The script prints `REFUSED: <code>`, writes no result file and exits with code 1. A refusal must be investigated, never worked around.
+
+**The calculation** is a full preferential count, run per division.
+- **Each round.** Every ballot counts for its highest-ranked continuing candidate. More than half of the formal ballots elects. Otherwise the candidate with the fewest votes is excluded and the next round starts.
+- **No exhausted ballots.** Every ballot is fully ranked (SR-08), so none can exhaust. Each round's total is checked to stay the same.
+- **Ties for exclusion.** The tied candidate with fewer votes at the most recent earlier round in which their totals differed is excluded. With more than two tied, the look-back continues among those still tied. If no earlier round separates them, the count stops with `unresolved_tie`.
+- **Small divisions.** A lone candidate is elected with every formal ballot. A division with no ballots shows `no_ballots` and does not stop the others.
+
+**Read-only.** The checks and the calculation run in one database transaction. Its first statement is `SET TRANSACTION READ ONLY`, and it uses REPEATABLE READ, so it sees one consistent snapshot and the database refuses any write.
+
+Its audit entries go in short transactions of their own (SR-16, category `ballot_box`, actor `script`):
+- `COUNT_STARTED` before;
+- then `COUNT_COMPLETED` with the number of ballots counted;
+- or `COUNT_REFUSED` with the reason code and the number of ballots that had passed every check.
+
+**The result** goes to `exports/house_result_<election id>.json` by default (`exports/` is never committed). For each division it holds:
+- the formal total and each round's totals;
+- the excluded candidate, if any, and the elected candidate;
+- the status.
+
+It also holds the number of ballots counted and the final checkpoint's head hash. Decrypted ballots exist only in memory: never in the result, the logs, the audit log or the database. The result has no ballot id and no ranking.
+
+**The definition is checked as at the close.** The seed signs its definition as valid until polls close. A check made after the close would always fail as `expired`, so SR-07's verification gained an optional time, and the count passes the close. Nothing else in SR-07 changed.
+
+Run the SR-17 tests, inside `backend/` with PostgreSQL running:
+
+```
+pytest tests/test_sr17_count.py -v
+```
+
+**SR-17 assumptions:**
+- **House of Representatives only,** counted one division at a time.
+- **Ties.** An exclusion tie is broken by looking back to the most recent round in which the tied candidates' totals differed. A tie no earlier round separates stops the count for a manual decision.
+- **No two-candidate-preferred count** is built.
+- **The read-only transaction stands in for a separate counting account.**
+- **The close of polls is `ends_at`.** It is the election's existing closing time, so no column was added.
+- **Very small divisions.** Round totals are published per division, so in a division with one or two ballots they show how those few electors voted. That is true of any published count; a real election has many ballots per division.
+
+**SR-17 design only, not implemented:**
+- a restricted database role for the counting service;
+- a returning officer screen to start the count;
+- signed and published results;
+- two-candidate-preferred counts;
+- a scrutineer view of each round;
+- a recount workflow;
+- the statutory procedure for ties that cannot be broken.
 
 ## Folder layout
 

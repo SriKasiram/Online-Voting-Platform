@@ -28,7 +28,7 @@ from httpx2 import Response
 from sqlalchemy import Connection, Engine, create_engine, select, text
 from sqlalchemy.orm import Session
 
-from app import ballot_definitions, deps, security
+from app import ballot_definitions, deps, house_count, security
 from app.config import BACKEND_DIR, settings
 from app.deps import get_db
 from app.main import app
@@ -225,7 +225,8 @@ def clock(monkeypatch: pytest.MonkeyPatch) -> Clock:
     """
     fake = Clock(utc_now())
     # SR-07: the ballot definition module and the delegate script read the same clock
-    for module in (security, deps, auth, ballot, ballot_definitions, ballot_definition_script):
+    # SR-17: and the House count, so a test can move past the close of polls
+    for module in (security, deps, auth, ballot, ballot_definitions, ballot_definition_script, house_count):
         monkeypatch.setattr(module, "utc_now", lambda: fake.now)
     return fake
 

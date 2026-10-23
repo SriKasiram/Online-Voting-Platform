@@ -163,26 +163,81 @@ def seed_definition(session: Session) -> bool:
     return True
 
 
-def seed_reviewer(session: Session, now: datetime) -> ElectoralRollEntry:
-    """Creates the reviewer's roll entry if it is missing, and refreshes the code's expiry."""
-    lookup = roll_lookup(REVIEWER_GIVEN_NAME, REVIEWER_SURNAME, REVIEWER_DATE_OF_BIRTH, REVIEWER_POSTCODE)
+def ensure_roll_entry(
+    session: Session, now: datetime, given_name: str, surname: str, date_of_birth: str, postcode: str, address: str, code: str
+) -> ElectoralRollEntry:
+    """A roll entry in the reviewer's division, created if missing, with the code's expiry refreshed."""
+    lookup = roll_lookup(given_name, surname, date_of_birth, postcode)
     entry = session.scalar(select(ElectoralRollEntry).where(ElectoralRollEntry.roll_lookup == lookup))
     if entry is None:
         division = session.scalars(select(Division).where(Division.name == REVIEWER_DIVISION)).one()
         entry = ElectoralRollEntry(
             roll_lookup=lookup,
-            full_name_enc=encrypt(f"{REVIEWER_GIVEN_NAME} {REVIEWER_SURNAME}", "electoral_roll.full_name"),
-            address_enc=encrypt(REVIEWER_ADDRESS, "electoral_roll.address"),
-            date_of_birth_enc=encrypt(REVIEWER_DATE_OF_BIRTH, "electoral_roll.date_of_birth"),
-            postcode_enc=encrypt(REVIEWER_POSTCODE, "electoral_roll.postcode"),
+            full_name_enc=encrypt(f"{given_name} {surname}", "electoral_roll.full_name"),
+            address_enc=encrypt(address, "electoral_roll.address"),
+            date_of_birth_enc=encrypt(date_of_birth, "electoral_roll.date_of_birth"),
+            postcode_enc=encrypt(postcode, "electoral_roll.postcode"),
             division_id=division.id,
             enrolled=True,
-            enrolment_code_hash=enrolment_code_hash(REVIEWER_ENROLMENT_CODE),
+            enrolment_code_hash=enrolment_code_hash(code),
         )
         session.add(entry)
     entry.code_expires_at = now + timedelta(days=CODE_VALID_DAYS)
     session.flush()
     return entry
+
+
+def seed_reviewer(session: Session, now: datetime) -> ElectoralRollEntry:
+    """Creates the reviewer's roll entry if it is missing, and refreshes the code's expiry."""
+    return ensure_roll_entry(
+        session,
+        now,
+        REVIEWER_GIVEN_NAME,
+        REVIEWER_SURNAME,
+        REVIEWER_DATE_OF_BIRTH,
+        REVIEWER_POSTCODE,
+        REVIEWER_ADDRESS,
+        REVIEWER_ENROLMENT_CODE,
+    )
+
+
+DEMO_ELECTORS_MAX = 9
+
+
+def demo_elector(n: int) -> dict[str, str]:
+    """SR-17: the fake details of demo elector n, as typed into registration step 1."""
+    return {
+        "given_name": "Demo",
+        "surname": f"Elector{n}",
+        "date_of_birth": f"1980-01-{n:02d}",
+        "postcode": "3000",
+        "enrolment_code": f"DEMO-ELEC-{n:04d}",
+    }
+
+
+def seed_demo_electors(session: Session, count: int) -> list[dict[str, str]]:
+    """
+    SR-17, development only: extra fake electors in the reviewer's division, so a demonstrator can
+    register several people and cast ballots with different preferences for the House count (the
+    reviewer alone casts one ballot). Each still registers and votes through the app as usual.
+    """
+    if not 1 <= count <= DEMO_ELECTORS_MAX:
+        raise SystemExit(f"--demo-electors takes 1 to {DEMO_ELECTORS_MAX}.")
+    now = datetime.now(UTC)
+    electors = [demo_elector(n) for n in range(1, count + 1)]
+    for n, person in enumerate(electors, start=1):
+        ensure_roll_entry(
+            session,
+            now,
+            person["given_name"],
+            person["surname"],
+            person["date_of_birth"],
+            person["postcode"],
+            f"{n} Demo Street, Melbourne VIC 3000",
+            person["enrolment_code"],
+        )
+    session.commit()
+    return electors
 
 
 def reset_reviewer(session: Session) -> None:
@@ -266,6 +321,10 @@ def main() -> None:
     group.add_argument(
         "--reset-participation", action="store_true", help="clear the reviewer's issued ballot, if not yet voted"
     )
+    # SR-17: development only, for demonstrating the House count with several ballots
+    parser.add_argument(
+        "--demo-electors", type=int, metavar="N", help=f"also add N (1 to {DEMO_ELECTORS_MAX}) fake demo electors"
+    )
     args = parser.parse_args()
 
     with SessionLocal() as session:
@@ -281,6 +340,8 @@ def main() -> None:
             reset(session)
             print("Deleted all data.")
         added = seed(session)
+        demo = seed_demo_electors(session, args.demo_electors) if args.demo_electors is not None else []
+        # SR-17: after the demo electors, so their roll records are signed too (SR-02)
         sign_roll(session)
 
     print("Added the election data." if added else "Election data already present. Nothing duplicated.")
@@ -289,6 +350,11 @@ def main() -> None:
         f"born {REVIEWER_DATE_OF_BIRTH}, postcode {REVIEWER_POSTCODE}, enrolment code {REVIEWER_ENROLMENT_CODE}, "
         f"valid for {CODE_VALID_DAYS} days."
     )
+    for person in demo:
+        print(
+            f"Demo elector (fake test data, {REVIEWER_DIVISION}): {person['given_name']} {person['surname']}, "
+            f"born {person['date_of_birth']}, postcode {person['postcode']}, enrolment code {person['enrolment_code']}"
+        )
 
 
 if __name__ == "__main__":

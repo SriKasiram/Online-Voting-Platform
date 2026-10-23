@@ -57,7 +57,9 @@ def load_keyring(path: Path) -> dict[str, tuple[str, Ed25519PublicKey]]:
     return {key_id: (entry["delegate"], parse_public_key(entry["public_key"].encode())) for key_id, entry in entries.items()}
 
 
-def verify_definition(payload: str, signatures: Any, election_id: uuid.UUID, previous: BallotDefinition | None) -> str:
+def verify_definition(
+    payload: str, signatures: Any, election_id: uuid.UUID, previous: BallotDefinition | None, at: datetime | None = None
+) -> str:
     """
     SR-07: "ok", or the first reason the definition must not be used:
     bad_payload, election_mismatch, bad_signature, not_enough_delegates,
@@ -68,6 +70,10 @@ def verify_definition(payload: str, signatures: Any, election_id: uuid.UUID, pre
     count, and approvals are counted per distinct delegate in the keyring, so a
     repeated signature or two keys of one delegate count once. `previous` is the
     version this one must follow (None for version 1).
+
+    SR-17: `at` is the moment the validity window is checked against, now by default. The House
+    count checks the definition as it stood when polls closed, because that is the paper every
+    counted ballot was cast on; a definition that expires at the close is still the right one.
     """
     try:
         content = json.loads(payload)
@@ -99,7 +105,7 @@ def verify_definition(payload: str, signatures: Any, election_id: uuid.UUID, pre
     if len(delegates) < settings.required_delegate_approvals:
         return "bad_signature" if rejected else "not_enough_delegates"
 
-    now = utc_now()
+    now = at or utc_now()
     if now < valid_from:
         return "not_yet_valid"
     if now > valid_until:
@@ -117,15 +123,16 @@ def active_definition(db: Session, election_id: uuid.UUID) -> BallotDefinition |
     )
 
 
-def check_stored(db: Session, definition: BallotDefinition) -> str:
+def check_stored(db: Session, definition: BallotDefinition, at: datetime | None = None) -> str:
     # SR-07: a stored version is checked against the version before it, which also proves the
     # payload's version matches the row's
+    # SR-17: `at` as in verify_definition, for the count; everything else passes nothing
     previous = db.scalar(
         select(BallotDefinition).where(
             BallotDefinition.election_id == definition.election_id, BallotDefinition.version == definition.version - 1
         )
     )
-    return verify_definition(definition.payload, definition.signatures, definition.election_id, previous)
+    return verify_definition(definition.payload, definition.signatures, definition.election_id, previous, at)
 
 
 def verified_division(db: Session, election: Election, division_id: int) -> tuple[dict[str, Any] | None, str]:
