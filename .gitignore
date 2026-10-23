@@ -19,6 +19,8 @@ logs/
 checkpoints/
 # SR-18: signed House result releases (RELEASES_DIR). The results keys are under keys/ above.
 releases/
+# SR-19: the availability monitor's probe logs (scripts/availability_monitor.py)
+monitoring/
 
 # Databases and dumps
 *.sqlite

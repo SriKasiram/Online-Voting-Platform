@@ -184,7 +184,7 @@ After 5 wrong enrolment codes the entry is locked, and the same reset unlocks it
 
 | Request | Purpose |
 |---|---|
-| `GET /api/health` | Liveness check |
+| `GET /api/health` | Liveness check. SR-19: `200 {"status": "ok"}` only if the database answers within 2 seconds and the required keys are loaded, otherwise `503 {"status": "unavailable"}`. No session, no audit entry |
 | `GET /api/divisions` | Divisions stored in the database |
 | `POST /api/register/verify` | Registration, step 1: given name, surname, date of birth, postcode and enrolment code. Every failure answers `400 registration_failed` |
 | `POST /api/register/account` | Step 2: username and password. Returns the authenticator setup link and key, once, with `Cache-Control: no-store` |
@@ -1432,6 +1432,68 @@ The OpenSSL test is skipped unless OpenSSL 3.0 or later is installed. Git for Wi
 - a transparency log;
 - delivery to real external systems, such as media feeds.
 
+## SR-19: availability
+
+Throughout the voting period the platform targets at least 99.9% availability to authorised electors, measured by a health probe every 30 seconds.
+
+**The health route.** `GET /api/health` needs no session and sits outside `/api/admin`. It returns `200 {"status": "ok"}` only if both checks pass:
+- **The database.** `SELECT 1` answers within 2 seconds (`SET LOCAL statement_timeout`).
+- **The keys.** The keys the app needs at start-up are in place:
+  - the SR-11 ballot key, read from its file, because every stored ballot needs it;
+  - the SR-02 roll key and the SR-07 delegate keyring, which are cached once loaded.
+
+The route never re-verifies the roll or the ballot definition on a probe. If either check fails, it returns `503 {"status": "unavailable"}`, with the same body whatever failed: no details, versions or timings. HTTPS only, HSTS, no-store and `X-Request-ID` apply as on every response. Probes are not audited (one every 30 seconds would flood the SR-16 log) and not rate limited.
+
+**The monitor.** Inside `backend/`, while the app runs:
+
+```
+python -m scripts.availability_monitor --url https://localhost:8443/api/health --cacert certs/dev-cert.pem
+```
+
+- **The schedule.** One GET every `--interval` seconds (default 30), due at start + n x interval on the monotonic clock, so the schedule never drifts.
+- **What counts as up.** HTTP 200 within `--timeout` seconds (default 5). Anything else is down: a slower 200, another status, a timeout, a connection error or a TLS error.
+- **The log.** One JSON line per probe goes to `--log` (default `monitoring/probes.jsonl`, never committed): `time` (UTC), `ok`, `status`, `latency_ms` and `error` (`none`, `timeout`, `connection_error`, `tls_error` or `http_<code>`).
+- **When it stops.** It runs until Ctrl+C, or for `--count` probes.
+- **Certificates.** Always checked: against `--cacert`, or the system's trusted certificates without it. There is no option to turn that off.
+- **Paths.** Relative `--cacert` and `--log` paths are taken from the project root. It uses the standard library only.
+- **On Windows, use `127.0.0.1`.** Probe `https://127.0.0.1:8443/api/health`, which the development certificate also covers. `localhost` tries IPv6 first and adds about 2 seconds to every probe.
+
+**The report.**
+
+```
+python -m scripts.availability_report --log monitoring/probes.jsonl [--from ISO] [--to ISO] [--target 99.9] [--interval 30]
+```
+
+| Figure | How it is worked out |
+|---|---|
+| Availability | successful probes / total probes x 100, over the probes in the period (exactly: 999 of 1000 is 99.900% and meets 99.9%) |
+| Estimated downtime | failed probes x interval |
+| Downtime budget | period length x (1 - target / 100); the period runs from `--from` to `--to`, or from the first to the last probe |
+| Longest outage | the longest run of consecutive failed probes x interval |
+
+It prints the probe totals, availability (3 decimal places), target, PASS or FAIL, downtime, budget and longest outage. Exit codes:
+- **0** for PASS, **1** for FAIL;
+- **2** if the log is missing or empty, or has no probes in the period;
+- **2** if a line is malformed. The line number is given, and the line is never skipped, because skipping it would change the figures.
+
+Run the SR-19 tests, inside `backend/` with PostgreSQL running:
+
+```
+pytest tests/test_sr19_availability.py -v
+```
+
+**SR-19 assumptions:**
+- **One instance, one machine.** The prototype measures availability against the 99.9% target, but cannot demonstrate it over a real voting period. 99.9% over two weeks allows about 20 minutes of downtime.
+- **The monitor runs on the same machine.** So it cannot detect network failures between voters and the platform.
+- **Other protections.** Availability is also protected by the SR-01 sign-in rate limits and lockout, and by the SR-14 timeout that answers `try_again`.
+
+**SR-19 design only, not implemented:**
+- at least two service instances behind a health-checked load balancer, with failover within 60 seconds;
+- database replication;
+- external probes from several locations;
+- wider rate limiting and overload protection;
+- network-layer DDoS filtering that does not decrypt ballot traffic.
+
 ## Folder layout
 
 ```
@@ -1442,5 +1504,6 @@ certs/               SR-10: the development TLS certificate and key (python -m s
 exports/, logs/      SR-12: ballot-side exports and server log files. Never committed
 backend/checkpoints/ SR-13: signed ballot chain checkpoints, one file per election. Never committed
 backend/releases/    SR-18: signed House result releases, one folder per election and version. Never committed
+monitoring/          SR-19: the availability monitor's probe logs. Never committed
 docker-compose.yml   PostgreSQL 16 for local development
 ```

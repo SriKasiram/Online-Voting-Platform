@@ -12,6 +12,8 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select
 
+# SR-19: what the health probe checks
+from app import health as app_health
 # SR-11: no usable ballot key, no API
 from app.ballot_crypto import check_ballot_key_at_startup
 from app.ballot_definitions import check_definitions_at_startup
@@ -101,9 +103,17 @@ app.include_router(public.router, prefix="/api")
 
 
 @app.get("/api/health", tags=["health"])
-def health() -> dict[str, str]:
-    """Liveness check. Reports status only, so it reveals nothing about the system."""
-    return {"status": "ok"}
+def health(db: DbSession) -> Response:
+    """
+    Liveness check. Reports status only, so it reveals nothing about the system.
+    SR-19: the probe the availability monitor calls every 30 seconds. "ok" only if the database
+    answers within 2 seconds and the required keys are loaded; otherwise 503. No session, no audit
+    entry (one every 30 seconds would flood the SR-16 log) and no rate limit.
+    """
+    if app_health.database_answers(db) and app_health.required_keys_loaded():
+        return JSONResponse({"status": "ok"})
+    # SR-19: the same body whatever failed, so the probe tells an outsider nothing about the inside
+    return JSONResponse({"status": "unavailable"}, status_code=503)
 
 
 @app.get("/api/divisions", tags=["divisions"])
