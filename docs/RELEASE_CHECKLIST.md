@@ -34,3 +34,7 @@ Work through every step, in order, before a release. A release needs every requi
     - Run `python -m scripts.release_results --election <id>` inside `backend/`. Record the version and the dataset SHA-256 it prints.
     - Copy the release folder somewhere else, fetch the key from `https://<server>/api/public/results-key`, and check its fingerprint against the one published.
     - Then run `python verify_release.py --dataset result.json --signature result.json.sig --public-key results_public.pem --expected-fingerprint <fingerprint>`. It must print `VALID`. Attach its output to the release record.
+14. **Backups and recovery test (required, SR-20).** Take a backup before polls open (--label before_open) and at the close of polls (--label close). Run python -m scripts.recovery_test --reset-target quarterly and before each election; all checks must pass; attach the output.
+    - Inside `backend/`: `python -m scripts.backup_db --label before_open` before polls open, and `python -m scripts.backup_db --label close` at the close of polls. Record each backup id it prints.
+    - `python -m scripts.recovery_test --reset-target` must end in `PASS: all checks passed` and exit with code 0: `time`, `zero_loss` and `reconciliation` all PASS. A FAIL or a REFUSED blocks the election until it is explained.
+    - Keep a copy of `BACKUP_KEY_FILE` apart from the backups, and never with the SR-11 ballot key. The backups (`backend/backups/`) and the key are never in the repository.

@@ -21,6 +21,8 @@ checkpoints/
 releases/
 # SR-19: the availability monitor's probe logs (scripts/availability_monitor.py)
 monitoring/
+# SR-20: encrypted database backups (BACKUPS_DIR, scripts/backup_db.py). The backup key is under keys/ above.
+backups/
 
 # Databases and dumps
 *.sqlite

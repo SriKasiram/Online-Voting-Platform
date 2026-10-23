@@ -87,6 +87,8 @@ This creates `backend/keys/ballot.key`: 32 random bytes, the AES-256 key that en
 
 SR-13: also create the ballot chain's checkpoint keys, `python -m scripts.gen_checkpoint_key`. They are needed only to seal and verify; the server starts without them.
 
+SR-20: for backups, create the backup key, `python -m scripts.gen_backup_key`, and the restore database (see [SR-20](#sr-20-encrypted-backups-and-recovery-tests)). The server starts without them.
+
 ### 6. Build the frontend
 
 ```
@@ -138,6 +140,8 @@ pytest
 ```
 
 PostgreSQL must be running. Every run deletes and rebuilds a separate `evoting_test` database from the migrations. The tests create their own data and never rely on the seed, so your development data is never touched.
+
+SR-20: the backup tests also use `evoting_test_restore`, which they create if it is missing. If the database user may not create databases, create it once as a superuser (see [SR-20](#sr-20-encrypted-backups-and-recovery-tests)).
 
 ## Vite dev server (development only)
 
@@ -228,7 +232,7 @@ The same checks run on every pull request through GitHub Actions (`.github/workf
 
 Before every release, also run the SR-11 storage audit, `python -m scripts.audit_ballots`, against the release database. It must exit with code 0. See [docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md).
 
-Before each election, export the ballot side (`python -m scripts.export_ballots`) and take backups as two separate dump files, one for each side ([SR-12](#sr-12-identity-and-ballots-kept-apart)). Then run `python -m scripts.audit_separation --file <each backup and export file>`. It must also exit with code 0. Finally run `python -m scripts.verify_chain --election <id>` for each election ([SR-13](#sr-13-integrity-protected-ballot-storage)): it must exit with code 0, and its head hash goes in the release record. SR-16: also run `pytest -m audit_capture`, `python -m scripts.audit_checkpoint` and `python -m scripts.verify_audit` ([SR-16](#sr-16-append-only-audit-log-with-allow-listed-fields)).
+Before each election, export the ballot side (`python -m scripts.export_ballots`) and take backups as two separate dump files, one for each side ([SR-12](#sr-12-identity-and-ballots-kept-apart)). Then run `python -m scripts.audit_separation --file <each backup and export file>`. It must also exit with code 0. Finally run `python -m scripts.verify_chain --election <id>` for each election ([SR-13](#sr-13-integrity-protected-ballot-storage)): it must exit with code 0, and its head hash goes in the release record. SR-16: also run `pytest -m audit_capture`, `python -m scripts.audit_checkpoint` and `python -m scripts.verify_audit` ([SR-16](#sr-16-append-only-audit-log-with-allow-listed-fields)). SR-20: take a backup before polls open and at the close of polls, and run `python -m scripts.recovery_test --reset-target` quarterly and before each election ([SR-20](#sr-20-encrypted-backups-and-recovery-tests)).
 
 ## Settings
 
@@ -265,6 +269,8 @@ Copy `backend/.env.example` to `backend/.env`. Docker Compose reads the same fil
 | `DELEGATE_KEYRING_PATH`, `REQUIRED_DELEGATE_APPROVALS`, `MIN_ACTIVATION_LEAD_HOURS` | The delegates' public keyring, the distinct delegates who must sign, and how long before polls open a definition must be activated. See [SR-07](#sr-07-signed-ballot-definitions) | `backend/keys/delegates/keyring.json`, `2`, `24` |
 | `MIN_SEAL_BATCH`, `CHECKPOINT_DIR` | SR-13: the smallest batch sealed without `--final`, and the folder of signed checkpoints (relative to `backend/`). See [SR-13](#sr-13-integrity-protected-ballot-storage) | `10`, `checkpoints` |
 | `CHECKPOINT_PUBLIC_KEY`, `CHECKPOINT_PRIVATE_KEY` | SR-13: the checkpoint key pair (`python -m scripts.gen_checkpoint_key`). The private key is for the seal script only | `keys/checkpoint_public.pem`, `keys/checkpoint_private.pem` |
+| `BACKUP_KEY_FILE`, `BACKUPS_DIR` | SR-20: the AES-256 backup key (`python -m scripts.gen_backup_key`), never the ballot key, and where encrypted backups go (relative to `backend/`). Only the backup scripts read them. See [SR-20](#sr-20-encrypted-backups-and-recovery-tests) | `keys/backup.key`, `backups` |
+| `RESTORE_DATABASE_URL`, `RESTORE_TIME_LIMIT_SECONDS` | SR-20: the separate database a restore goes into (never the app's own; empty means no restore), and the recovery test's time limit | empty, `1800` |
 | `RESULTS_PUBLIC_KEY`, `RESULTS_PRIVATE_KEY`, `RELEASES_DIR` | SR-18: the dedicated results key pair (`python -m scripts.gen_results_key`), and where signed releases go (relative to `backend/`). The private key is for the release script only. See [SR-18](#sr-18-signed-result-releases) | `keys/results_public.pem`, `keys/results_private.pem`, `releases` |
 | `LOG_DIR` | Folder of the server's log files, if its output is saved to files. The SR-12 separation audit scans it | `logs/` at the project root |
 | `BALLOT_KEY_FILE` | The 32-byte AES-256 key that encrypts every stored ballot (`python -m scripts.gen_ballot_key`). No default key exists: without this file the API does not start. See [SR-11](#sr-11-ballots-encrypted-at-rest) | `backend/keys/ballot.key` |
@@ -1494,6 +1500,127 @@ pytest tests/test_sr19_availability.py -v
 - wider rate limiting and overload protection;
 - network-layer DDoS filtering that does not decrypt ballot traffic.
 
+## SR-20: encrypted backups and recovery tests
+
+The platform keeps AES-256-encrypted, tamper-evident backups of the whole database, accepted ballots included. Backups are taken before polls open, at the close of polls and on demand. Quarterly and before each election, a recovery test restores a backup into a separate database within 30 minutes. It shows that no accepted ballot up to the backup point was lost, and that every ballot confirmation reference reconciles.
+
+Everything runs in Python through SQLAlchemy and the project's own Alembic migrations: no `pg_dump`, `psql` or `pg_restore`.
+
+**1. Create the backup key, once.** Inside `backend/`:
+
+```
+python -m scripts.gen_backup_key
+```
+
+- **What it writes.** `keys/backup.key`: 32 random bytes, 0600 where supported. It never overwrites without `--force`, which makes every existing backup unreadable.
+- **A key of its own.** It is never the SR-11 ballot key. Anyone holding a backup still needs this key, and losing one key does not expose what the other protects.
+- **Keep a copy apart from the backups.** A backup cannot be restored without its key. Never commit it: `keys/` is in `.gitignore`.
+- **Who reads it.** Only the backup scripts. The app starts without the backup key and without a restore database.
+
+**2. Create the restore database, once.** As a PostgreSQL superuser, for example with `docker compose exec db psql -U evoting -d postgres`:
+
+```
+CREATE DATABASE evoting_restore OWNER evoting;
+```
+
+The name must end with `_restore`, and the app's database user must own it, so that `--reset-target` can empty it. Then set its URL in `backend/.env`:
+
+```
+RESTORE_DATABASE_URL=postgresql+psycopg://evoting:<password>@127.0.0.1:5432/evoting_restore
+```
+
+Percent-encode `@`, `:`, `/` and `%` in the password (`%40`, `%3A`, `%2F`, `%25`). A restore is refused if `RESTORE_DATABASE_URL` is empty, or names the same host, port and database as the app's own database. `localhost`, `127.0.0.1` and `::1` count as the same host.
+
+**3. Back up.** Inside `backend/`:
+
+```
+python -m scripts.backup_db --label before_open   # before polls open
+python -m scripts.backup_db --label close         # at the close of polls
+python -m scripts.backup_db                       # on demand (label manual)
+```
+
+| Step | What happens |
+|---|---|
+| Read | Every application table (all but `alembic_version`) is read in one read-only REPEATABLE READ transaction, so both files come from the same moment. A table on neither SR-12 side refuses `table_without_side` |
+| Encode | One JSON line per row, `{"table": ..., "row": {...}}`, in primary-key order and without loss: bytes as `{"$b64": ...}`, UUIDs as text, times as `{"$datetime": ISO}`, dates as `{"$date": ...}`, decimals as `{"$decimal": "..."}`, JSON values as they are |
+| Encrypt | Identity tables go into `identity.jsonl.enc`, ballot tables into `ballot.jsonl.enc`. Each file is AES-256-GCM: version byte `0x01`, a 12-byte random nonce, then ciphertext and tag. The associated data is `evoting-backup-v1\|<backup id>\|<file name>`, so a file decrypts only in its own backup under its own name. Ballots inside stay SR-11 encrypted as well. Encryption happens in memory: no plaintext is written to disk |
+| Manifest | `manifest.json` records the backup id, time (UTC), label, Alembic revision, each file's name, SHA-256 and row count per table, and the number of ballots |
+| Store | A new folder each time, `backend/backups/<UTC time>_<backup id>/`. If it already exists the backup refuses (`backup_exists`). Every file is made read-only. No script overwrites or deletes a backup |
+
+`BACKUPS_DIR` (default `backups`, relative to `backend/`) is never committed.
+
+**4. Restore.** Inside `backend/`:
+
+```
+python -m scripts.restore_db --backup backups/<UTC time>_<backup id>
+```
+
+Each step must pass, or it prints `REFUSED: <code>: <reason>` and exits with code 1:
+
+| Step | Refusal |
+|---|---|
+| `RESTORE_DATABASE_URL` is set and is not the app's database | `no_restore_database`, `target_is_live` |
+| the manifest is readable, and each file's SHA-256 matches it | `manifest_mismatch` |
+| each file decrypts with the backup key, in this backup and under its own name | `decrypt_failed` |
+| every row is on its file's SR-12 side, and the row counts and ballot count match the manifest | `manifest_mismatch` |
+| the target can be reached, and holds no table at all (application tables or `alembic_version`) | `target_unreachable`, `target_not_empty` |
+| one transaction: the project's Alembic migrations up to the manifest's revision, every row inserted in foreign-key order, then serial sequences moved past the restored ids | `restore_failed`. Everything is rolled back, schema included |
+
+A missing key refuses with `backup_key_missing`. A key that is not 32 bytes refuses with `backup_key_invalid`. Everything is checked before the target is touched. On success the script prints `PASS` with the row count of each table.
+
+**5. The recovery test.** Run it quarterly and before each election, inside `backend/`:
+
+```
+python -m scripts.recovery_test --reset-target
+```
+
+- **What it does.** It takes a backup (label `recovery_test`), starts a monotonic timer, restores the backup, runs the checks on the restored copy, then stops the timer.
+- **`--reset-target`.** It first empties the restore database by dropping and recreating its `public` schema. It does this only if the database is not the app's own and its name ends with `_restore`; otherwise it refuses with `reset_refused`, before any backup is taken. Without the option, a restore database that is not empty is refused.
+
+| Check | Passes when |
+|---|---|
+| `time` | the restore and the checks take no longer than `RESTORE_TIME_LIMIT_SECONDS` (default 1800, 30 minutes) |
+| `zero_loss` | every election with chain entries passes SR-13's chain verification on the restored database, against the live signed checkpoints in `CHECKPOINT_DIR`; and the restored database holds exactly the manifest's number of ballots |
+| `reconciliation` | per election: used ballot tokens = ballots = electors marked voted; and every used token still has its `receipt_hash`, the SHA-256 of the confirmation reference the voter holds (SR-14) |
+
+Every count reads one table, grouped by election: no check joins an identity table to a ballot table (SR-12). The script prints each check with PASS or FAIL, the restore-and-checks time and the total time, and exits with code 0 only if all three pass. It writes no audit event.
+
+A sample run. This was a test election with 5 sealed ballots, against the test database:
+
+```
+SR-20 recovery test
+Backup d61cccff-4205-4e78-95b4-90ef0def031f (recovery_test, revision 0014) in ...\backups\20261023T094549Z_d61cccff-4205-4e78-95b4-90ef0def031f
+  time: PASS: restore and checks took 0.52 s, limit 1800 s
+  zero_loss: PASS: 5 ballots restored of 5; 1 chain(s) verified
+  reconciliation: PASS: 5 ballots = used tokens = voted, every receipt hash present
+Restore and checks: 0.52 s. Total time, backup included: 0.58 s
+PASS: all checks passed
+```
+
+Run the SR-20 tests, inside `backend/` with PostgreSQL running:
+
+```
+pytest tests/test_sr20_backup.py -v
+```
+
+- **The test restore database.** The tests use `evoting_test_restore`. They create it if it is missing, and empty it before and after each test.
+- **Never skipped.** If the database user cannot create it, the tests fail and print the `CREATE DATABASE` command to run once as a superuser.
+
+**SR-20 assumptions:**
+- **Zero loss is up to the backup point.** A ballot accepted after the last backup is only in the live database until the next one.
+- **Tamper-evident, not immutable.** The backups sit on the same machine as the database. Someone with access could delete them, but could not change one without the restore refusing it. Someone holding the backup key could write a new backup and manifest.
+- **The app's own tables hold all election data.** Signed checkpoints (`CHECKPOINT_DIR`) and keys are files, kept and backed up apart from the database (release checklist). The recovery test reads the live checkpoints.
+- **The time is measured, although the data is small.** The 30-minute limit is checked on every run, but prototype data restores in about a second.
+- **The restore database.** It is created once by a superuser, or the database user may create databases (the tests create theirs).
+
+**SR-20 design only, not implemented:**
+- synchronous replication to a second site before a ballot is confirmed, so the loss window is zero rather than up to the last backup;
+- write-once (WORM) or off-site backup storage;
+- daily scheduled backups and an automatic quarterly recovery test;
+- the backup key in a KMS or HSM;
+- signed manifests;
+- in production, `pg_dump` or point-in-time recovery (PITR) alongside these logical backups.
+
 ## Folder layout
 
 ```
@@ -1505,5 +1632,6 @@ exports/, logs/      SR-12: ballot-side exports and server log files. Never comm
 backend/checkpoints/ SR-13: signed ballot chain checkpoints, one file per election. Never committed
 backend/releases/    SR-18: signed House result releases, one folder per election and version. Never committed
 monitoring/          SR-19: the availability monitor's probe logs. Never committed
+backend/backups/     SR-20: encrypted database backups, one read-only folder per backup. Never committed
 docker-compose.yml   PostgreSQL 16 for local development
 ```

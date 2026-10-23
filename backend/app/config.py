@@ -101,6 +101,17 @@ class Settings(BaseSettings):
     results_public_key: Path = Path("keys/results_public.pem")
     releases_dir: Path = Path("releases")
 
+    # SR-20: encrypted, tamper-evident backups (scripts/backup_db.py), with their own AES-256 key,
+    # never the SR-11 ballot key, so a stolen backup and a stolen ballot key are separate losses.
+    # Only the backup scripts read these; the API starts without them.
+    backup_key_file: Path = Path("keys/backup.key")
+    backups_dir: Path = Path("backups")
+    # SR-20: a separate database the recovery test restores into, never the live one. It holds a
+    # password, so it is a secret like POSTGRES_PASSWORD. Empty means no restore is possible.
+    restore_database_url: SecretStr = SecretStr("")
+    # SR-20: a restore and its checks must finish within 30 minutes
+    restore_time_limit_seconds: int = Field(default=1800, gt=0)
+
     # SR-10: how long browsers must use HTTPS only for this host. One year by default. HSTS ignores
     # the port, so local development sets it short (.env.example) to avoid locking localhost to HTTPS.
     hsts_max_age: int = 31536000
