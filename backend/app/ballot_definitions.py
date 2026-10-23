@@ -18,8 +18,11 @@ from typing import Any
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
+# SR-16: the start-up check records its failure with the allow-listed fields
+from app.audit_events import FAILURE, UNKNOWN
 from app.config import settings
 from app.models import BallotDefinition, Election, ElectionStatus
 from app.roll_signing import parse_public_key, verify_signature
@@ -153,6 +156,11 @@ def check_definitions_at_startup(db: Session) -> None:
         reason = "no_active_definition" if definition is None else check_stored(db, definition)
         if reason != OK:
             logger.error("Ballot definition check failed for election %s: %s", election.id, reason)
-            audit(db, "BALLOT_DEFINITION_INVALID", actor="unknown", reason=reason)
-            db.commit()
+            # SR-16: recorded if the database can still take it; the API refuses to start either way
+            try:
+                audit(db, "BALLOT_DEFINITION_INVALID", outcome=FAILURE, actor=UNKNOWN, role=UNKNOWN, reason=reason)
+                db.commit()
+            except SQLAlchemyError:
+                db.rollback()
+                logger.error("The failed ballot definition check could not be written to the audit log")
             raise RuntimeError(f"Refusing to start: election {election.id} has no valid ballot definition ({reason})")

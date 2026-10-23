@@ -8,7 +8,6 @@ SR-14: "used" is a flag, and the token keeps only the SHA-256 of the receipt it 
 """
 
 import hashlib
-import json
 import threading
 import traceback
 from collections.abc import Callable, Iterator
@@ -313,9 +312,10 @@ def test_voted_elector_with_another_unused_token_is_refused(
 
 
 def test_audit_events_hold_no_token_reference_or_ballot_content(
-    client: TestClient, db_session: Session, make_voter, sign_in, clock
+    client: TestClient, db_session: Session, make_voter, sign_in, clock, audit_text
 ) -> None:
-    """SR-03 test 13: issue, accept, replay and each rejection are audited by account and event type only."""
+    """SR-03 test 13: issue, accept, replay and each rejection are audited by account and event type only.
+    SR-16: plus the allow-listed outcome and role, never a free-text field; every column is searched."""
     before = db_session.scalar(select(func.coalesce(func.max(AuditLogEntry.id), 0)))
     voted, late_voter, unissued = make_voter(), make_voter(), make_voter()
 
@@ -345,10 +345,11 @@ def test_audit_events_hold_no_token_reference_or_ballot_content(
         "BALLOT_REPLAY_BLOCKED",
         "BALLOT_TOKEN_REJECTED",
     }
-    assert {r.details.get("reason") for r in rows if r.event_type == "BALLOT_TOKEN_REJECTED"} == {"invalid", "wrong_state"}
+    assert {r.reason for r in rows if r.event_type == "BALLOT_TOKEN_REJECTED"} == {"invalid", "wrong_state"}
     assert {r.actor for r in rows} == {f"account:{v.account_id}" for v in (voted, late_voter, unissued)}
-    assert all(set(r.details) <= {"reason"} for r in rows)
-    recorded = json.dumps([[r.event_type, r.actor, r.details] for r in rows])
+    assert all(r.details is None and r.batch_no is None and r.count is None for r in rows)
+    assert {r.category for r in rows} == {"eligibility"} and {r.role for r in rows} == {"elector"}
+    recorded = audit_text(before)
     secrets = [
         ballot["ballot_token"],
         late["ballot_token"],
@@ -365,7 +366,8 @@ def test_audit_events_hold_no_token_reference_or_ballot_content(
 
 
 def test_reset_participation_clears_issued_and_refuses_voted(db_session: Session) -> None:
-    """SR-03 test 14: the script clears an "issued" reviewer, audits it, and refuses a "voted" one."""
+    """SR-03 test 14: the script clears an "issued" reviewer, audits it, and refuses a "voted" one.
+    SR-16: the actor is now the script that did it (it was "unknown")."""
     seed(db_session)
     entry = db_session.scalars(select(ElectoralRollEntry)).one()
     election = db_session.scalars(select(Election)).one()
@@ -376,7 +378,7 @@ def test_reset_participation_clears_issued_and_refuses_voted(db_session: Session
     assert reset_participation(db_session).startswith("Cleared")
     assert count(db_session, VoterParticipation) == 0
     reset = db_session.scalars(select(AuditLogEntry).order_by(AuditLogEntry.id.desc()).limit(1)).one()
-    assert (reset.event_type, reset.actor, reset.details) == ("ELECTOR_RESET", "unknown", {})
+    assert (reset.event_type, reset.actor, reset.role, reset.outcome, reset.details) == ("ELECTOR_RESET", "script", "script", "success", None)
 
     db_session.add(VoterParticipation(roll_id=entry.id, election_id=election.id, state=ParticipationState.VOTED))
     db_session.commit()

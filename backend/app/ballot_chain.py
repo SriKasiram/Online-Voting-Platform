@@ -64,9 +64,11 @@ def compute_entry_hash(prev_hash: str, ballot_id: UUID | str, election_id: UUID 
     return _sha256_hex(ENTRY_TAG + b"|".join(part.encode("ascii") for part in parts))
 
 
-def checkpoint_message(content: dict[str, Any]) -> bytes:
-    """SR-13: exactly what the checkpoint key signs."""
-    return CHECKPOINT_TAG + canonical(content).encode("utf-8")
+def checkpoint_message(content: dict[str, Any], tag: bytes = CHECKPOINT_TAG) -> bytes:
+    """SR-13: exactly what the checkpoint key signs.
+    SR-16: the audit log's checkpoints pass their own tag, so a ballot checkpoint can never pass as an
+    audit one or the other way round."""
+    return tag + canonical(content).encode("utf-8")
 
 
 def checkpoint_file(election_id: UUID | str) -> Path:
@@ -78,8 +80,14 @@ def load_checkpoint_public_key(path: Path) -> Ed25519PublicKey:
     return parse_public_key(Path(path).read_bytes())
 
 
-def read_checkpoints(path: Path, public_key: Ed25519PublicKey) -> tuple[list[dict[str, Any]], set[str]]:
-    """SR-13: the checkpoint lines whose signature holds, in file order, and the problems with the rest."""
+def read_checkpoints(
+    path: Path,
+    public_key: Ed25519PublicKey,
+    fields: dict[str, type] = CHECKPOINT_FIELDS,
+    tag: bytes = CHECKPOINT_TAG,
+) -> tuple[list[dict[str, Any]], set[str]]:
+    """SR-13: the checkpoint lines whose signature holds, in file order, and the problems with the rest.
+    SR-16: also reads the audit log's checkpoints, which have their own fields and tag."""
     valid: list[dict[str, Any]] = []
     problems: set[str] = set()
     for line in path.read_text(encoding="utf-8").splitlines():
@@ -88,14 +96,12 @@ def read_checkpoints(path: Path, public_key: Ed25519PublicKey) -> tuple[list[dic
         try:
             record = json.loads(line)
             signature = base64.b64decode(record.pop("signature"), validate=True)
-            well_formed = set(record) == set(CHECKPOINT_FIELDS) and all(
-                type(record[name]) is kind for name, kind in CHECKPOINT_FIELDS.items()
-            )
+            well_formed = set(record) == set(fields) and all(type(record[name]) is kind for name, kind in fields.items())
         except (ValueError, KeyError, AttributeError, TypeError, binascii.Error):
             well_formed = False
         if not well_formed:
             problems.add("malformed_checkpoint")
-        elif not verify_signature(public_key, signature, checkpoint_message(record)):
+        elif not verify_signature(public_key, signature, checkpoint_message(record, tag)):
             problems.add("bad_checkpoint_signature")
         else:
             valid.append(record)

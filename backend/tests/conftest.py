@@ -10,6 +10,7 @@ transaction that is rolled back at the end, so nothing leaks between tests.
 
 import itertools
 import re
+import secrets
 import uuid
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
@@ -227,6 +228,51 @@ def clock(monkeypatch: pytest.MonkeyPatch) -> Clock:
     for module in (security, deps, auth, ballot, ballot_definitions, ballot_definition_script):
         monkeypatch.setattr(module, "utc_now", lambda: fake.now)
     return fake
+
+
+# ---------------------------------------------------------------
+# Audit log (SR-16)
+# ---------------------------------------------------------------
+
+
+@pytest.fixture
+def audit_text(db_session: Session) -> Callable[..., str]:
+    """
+    SR-16: the audit rows after `after_id`, every column as JSON text. The "no secret in the
+    log" checks read this instead of the old details column, so the new fields are covered too.
+    """
+
+    def read(after_id: int = 0) -> str:
+        db_session.expire_all()
+        rows = db_session.scalars(
+            text("SELECT row_to_json(entry)::text FROM audit_log AS entry WHERE id > :after ORDER BY id"),
+            {"after": after_id},
+        )
+        return "\n".join(rows)
+
+    return read
+
+
+@pytest.fixture
+def plant_audit_text(db_session: Session) -> Callable[[str], None]:
+    """
+    SR-16: puts a value into the audit log as only a bug or a tamperer could. The writer now
+    refuses anything shaped like a token, hash or receipt, so the SR-11 to SR-14 leak tests insert
+    their planted value directly, and still prove the audits would find one.
+    """
+
+    def plant(value: str) -> None:
+        db_session.execute(
+            text(
+                "INSERT INTO audit_log (created_at, event_type, actor, category, outcome, role, request_id, "
+                "reason, format_version, prev_hash, hash) VALUES (now(), 'auth_login_success', 'unknown', "
+                "'authentication', 'success', 'unknown', gen_random_uuid(), :value, 2, :prev, :hash)"
+            ),
+            {"value": value, "prev": secrets.token_bytes(32), "hash": secrets.token_bytes(32)},
+        )
+        # Not committed: the same session sees it, and a test may roll it back with a savepoint
+
+    return plant
 
 
 # ---------------------------------------------------------------

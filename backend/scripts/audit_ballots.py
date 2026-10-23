@@ -44,7 +44,24 @@ OTHER_TABLES = {
     "voter_participation": {"roll_id", "election_id", "state"},
     # SR-13: the hash chain holds ids and hashes of the ciphertext, never ballot content
     "ballot_chain": {"election_id", "position", "batch_no", "ballot_id", "prev_hash", "entry_hash"},
-    "audit_log": {"id", "created_at", "event_type", "actor", "details", "prev_hash", "hash"},
+    # SR-16: the allow-listed fields: fixed codes, account ids, counts and a request id, never ballot content
+    "audit_log": {
+        "id",
+        "created_at",
+        "event_type",
+        "actor",
+        "details",
+        "category",
+        "outcome",
+        "role",
+        "request_id",
+        "batch_no",
+        "count",
+        "reason",
+        "format_version",
+        "prev_hash",
+        "hash",
+    },
 }
 SKIP_DIRS = {".git", "node_modules", ".venv", "dist", "__pycache__", ".pytest_cache"}
 
@@ -167,7 +184,8 @@ def check_logs(db: Session, project_dir: Path) -> Check:
     name = "e. audit log and log files"
     hits = [
         f"audit_log id {entry_id}"
-        for entry_id, line in db.execute(text("SELECT id, event_type || ' ' || actor || ' ' || details::text FROM audit_log"))
+        # SR-16: the whole row as text, so the structured fields are scanned too (details is now NULL)
+        for entry_id, line in db.execute(text("SELECT id, row_to_json(entry)::text FROM audit_log AS entry"))
         if any(field in line for field in PAYLOAD_FIELDS)
     ]
     entries = db.scalar(text("SELECT count(*) FROM audit_log"))

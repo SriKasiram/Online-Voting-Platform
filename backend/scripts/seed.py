@@ -29,6 +29,8 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import delete, select, text
 from sqlalchemy.orm import Session
 
+# SR-16: the development reset is audited as the script that ran it
+from app.audit_events import SCRIPT
 from app.ballot_definitions import active_definition
 from app.db import Base, SessionLocal
 from app.models import (
@@ -225,10 +227,10 @@ def reset_participation(session: Session) -> str:
     entry = session.scalar(select(ElectoralRollEntry).where(ElectoralRollEntry.roll_lookup == lookup))
     if entry is None:
         return "There is no reviewer roll entry yet. Run python -m scripts.seed first."
-    account_id = session.scalar(select(Account.id).where(Account.roll_id == entry.id))
     # SR-05: the reset itself now lives in app/participation.py, shared with the admin route.
-    # Same outcomes, messages and audit entry as before.
-    result = reset_issued(session, entry.id, actor=f"account:{account_id}" if account_id else "unknown")
+    # Same outcomes and messages as before.
+    # SR-16: the actor is the script that did it, not the reviewer's own account
+    result = reset_issued(session, entry.id, actor=SCRIPT, role=SCRIPT)
     if result == "voted":
         raise SystemExit(
             "The reviewer has already voted, and a cast ballot cannot be undone, by design. "

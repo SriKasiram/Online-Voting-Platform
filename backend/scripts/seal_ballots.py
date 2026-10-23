@@ -19,6 +19,7 @@ import sys
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
@@ -26,6 +27,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.ballot_chain import (
+    CHECKPOINT_TAG,
     checkpoint_file,
     checkpoint_message,
     compute_entry_hash,
@@ -37,6 +39,7 @@ from app.ballot_chain import (
 from app.ballot_definitions import canonical
 from app.config import settings
 from app.db import SessionLocal
+from app.audit_events import FAILURE, SCRIPT, SUCCESS
 from app.models import BallotChainEntry
 from app.security import audit
 
@@ -63,7 +66,9 @@ def lock_key(election_id: uuid.UUID) -> int:
 
 def record_failure(db: Session, reasons: list[str]) -> None:
     # SR-13: the reason codes only, never a hash or a ballot id
-    audit(db, "BALLOT_CHAIN_VERIFY_FAILED", actor="script", reason=",".join(reasons))
+    # SR-16: one entry per reason, because a reason is a single catalogued code, not a list
+    for reason in reasons:
+        audit(db, "BALLOT_CHAIN_VERIFY_FAILED", outcome=FAILURE, actor=SCRIPT, role=SCRIPT, reason=reason)
     db.commit()
 
 
@@ -139,20 +144,29 @@ def seal_batch(
         )
         prev_hash = entry_hash
     # SR-13: the batch number and how many, nothing that names a ballot
-    audit(db, "BALLOT_BATCH_SEALED", actor="script", batch=batch_no, count=len(unsealed))
+    # SR-16: in the seal's transaction: if the entry cannot be written, nothing is sealed
+    audit(db, "BALLOT_BATCH_SEALED", outcome=SUCCESS, actor=SCRIPT, role=SCRIPT, batch_no=batch_no, count=len(unsealed))
     db.commit()
 
     # SR-13: after the commit. If this step is lost the next verification reports tail_mismatch.
     content = {"election_id": str(election_id), "batch_no": batch_no, "entry_count": position, "head_hash": prev_hash, "final": final}
-    signature = base64.b64encode(private_key.sign(checkpoint_message(content))).decode()
-    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-    with checkpoint_path.open("a", encoding="utf-8", newline="\n") as file:
-        file.write(canonical(content | {"signature": signature}) + "\n")
+    append_checkpoint(checkpoint_path, content, private_key)
 
     reasons = verify_chain(db, election_id, public_key, checkpoint_path)
     if reasons:
         record_failure(db, reasons)
     return SealResult(batch_no, len(unsealed), first_position, position, prev_hash, final, reasons)
+
+
+def append_checkpoint(path: Path, content: dict[str, Any], private_key: Ed25519PrivateKey, tag: bytes = CHECKPOINT_TAG) -> None:
+    """
+    SR-13: signs one checkpoint and appends it to the file as a JSON line, with a base64 signature.
+    SR-16: shared with scripts/audit_checkpoint.py, which passes the audit log's own tag.
+    """
+    signature = base64.b64encode(private_key.sign(checkpoint_message(content, tag))).decode()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8", newline="\n") as file:
+        file.write(canonical(content | {"signature": signature}) + "\n")
 
 
 def load_private_key(path: Path) -> Ed25519PrivateKey:

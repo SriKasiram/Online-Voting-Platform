@@ -10,14 +10,15 @@ from typing import Literal
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.audit_events import SUCCESS
 from app.models import ParticipationState, VoterParticipation
 from app.security import audit
 
 
-def reset_issued(db: Session, roll_id: uuid.UUID, actor: str) -> Literal["reset", "voted", "not_found"]:
+def reset_issued(db: Session, roll_id: uuid.UUID, actor: str, role: str) -> Literal["reset", "voted", "not_found"]:
     """
     Clears the elector's "issued" participation, so a new ballot can be issued,
-    and audits ELECTOR_RESET as `actor`. A "voted" elector is never reset: a cast
+    and audits ELECTOR_RESET as `actor` with its `role` (SR-16: the staff account, or "script"). A "voted" elector is never reset: a cast
     ballot cannot be undone, by design. Changes and commits only on "reset".
     """
     # Locked, so a ballot being accepted at the same moment either finishes first (voted) or finds no row
@@ -29,6 +30,7 @@ def reset_issued(db: Session, roll_id: uuid.UUID, actor: str) -> Literal["reset"
         return "voted"
     for row in rows:
         db.delete(row)
-    audit(db, "ELECTOR_RESET", actor=actor)
+    # SR-16: in the same transaction as the reset: if the entry cannot be written, nothing is reset
+    audit(db, "ELECTOR_RESET", outcome=SUCCESS, actor=actor, role=role)
     db.commit()
     return "reset"

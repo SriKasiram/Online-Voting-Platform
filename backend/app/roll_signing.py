@@ -14,8 +14,10 @@ from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from cryptography.hazmat.primitives.serialization import load_pem_public_key
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from app.audit_events import FAILURE, SUCCESS, UNKNOWN
 from app.config import settings
 from app.models import ElectoralRollEntry
 from app.security import audit, decrypt_or_none
@@ -99,10 +101,24 @@ def check_roll_at_startup(db: Session) -> None:
             len(entries),
             " (public key missing or unreadable)" if key is None else "",
         )
-        audit(db, "ROLL_VERIFICATION_FAILED", actor="unknown", records=len(entries), failed=failed)
-        db.commit()
+        # SR-16: recorded if the database can still take it; the API refuses to start either way
+        try:
+            audit(
+                db,
+                "ROLL_VERIFICATION_FAILED",
+                outcome=FAILURE,
+                actor=UNKNOWN,
+                role=UNKNOWN,
+                count=failed,
+                reason="public_key_missing" if key is None else "bad_signature",
+            )
+            db.commit()
+        except SQLAlchemyError:
+            db.rollback()
+            logger.error("The failed roll check could not be written to the audit log")
         raise RuntimeError(
             f"Refusing to start: the electoral roll failed its signature check ({failed} of {len(entries)} records)"
         )
-    audit(db, "ROLL_VERIFIED", actor="unknown", records=len(entries))
+    # SR-16: the count of records checked; the old "records" detail is now the count field
+    audit(db, "ROLL_VERIFIED", outcome=SUCCESS, actor=UNKNOWN, role=UNKNOWN, count=len(entries))
     db.commit()

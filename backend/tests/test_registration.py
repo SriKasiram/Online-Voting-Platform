@@ -1,6 +1,5 @@
 """Registration: verify the roll entry, choose an account, confirm the authenticator app."""
 
-import json
 import logging
 import re
 import threading
@@ -10,7 +9,7 @@ from datetime import timedelta
 import pyotp
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.orm import Session
 
 from app import config
@@ -313,7 +312,7 @@ def test_username_held_by_a_registration_in_progress_is_taken(client: TestClient
 
 
 def test_totp_secret_is_kept_out_of_accounts_logs_and_later_responses(
-    client: TestClient, db_session: Session, make_person, caplog: pytest.LogCaptureFixture
+    client: TestClient, db_session: Session, make_person, caplog: pytest.LogCaptureFixture, audit_text
 ) -> None:
     caplog.set_level(logging.DEBUG)
     person = make_person()
@@ -331,11 +330,12 @@ def test_totp_secret_is_kept_out_of_accounts_logs_and_later_responses(
 
     assert all(secret not in response.text for response in later)
     assert secret not in caplog.text
-    audit_text = json.dumps([[e.actor, e.details] for e in db_session.scalars(select(AuditLogEntry))])
-    assert secret not in audit_text
+    # SR-16: every column of every audit row, not just the actor and the old details
+    assert secret not in audit_text()
 
 
-def test_audit_log_holds_no_personal_data(client: TestClient, db_session: Session, make_person) -> None:
+def test_audit_log_holds_no_personal_data(client: TestClient, db_session: Session, make_person, audit_text) -> None:
+    """SR-16: the actor no longer holds the client IP or the roll entry id: "unknown" until the account exists."""
     before = db_session.scalar(select(func.coalesce(func.max(AuditLogEntry.id), 0)))
     person = make_person()
     client.post(VERIFY, json=person.verify_body(enrolment_code="WRONG-CODE"))
@@ -344,10 +344,15 @@ def test_audit_log_holds_no_personal_data(client: TestClient, db_session: Sessio
     entries = db_session.scalars(select(AuditLogEntry).where(AuditLogEntry.id > before).order_by(AuditLogEntry.id)).all()
 
     assert [e.event_type for e in entries] == ["REGISTRATION_FAILED", "REGISTRATION_STARTED", "REGISTRATION_COMPLETED"]
-    # The only identifiers: the client IP before a match, the roll entry id after it
-    assert entries[0].actor == "testclient"
-    assert all(e.actor == f"roll:{person.roll_id}" for e in entries[1:])
-    text = json.dumps([e.details for e in entries]).casefold()
+    account_id = db_session.scalar(select(Account.id).where(Account.username == "private.name"))
+    assert [(e.actor, e.role, e.outcome, e.reason) for e in entries] == [
+        ("unknown", "unknown", "failure", "details_not_verified"),
+        ("unknown", "unknown", "success", None),
+        (f"account:{account_id}", "elector", "success", None),
+    ]
+    recorded = audit_text(before)
+    assert "testclient" not in recorded and str(person.roll_id) not in recorded
+    recorded = recorded.casefold()
     for private in (
         person.given_name,
         person.surname,
@@ -359,7 +364,7 @@ def test_audit_log_holds_no_personal_data(client: TestClient, db_session: Sessio
         PASSWORD,
         secret,
     ):
-        assert private.casefold() not in text
+        assert private.casefold() not in recorded
 
 
 # ---------------------------------------------------------------
@@ -398,7 +403,6 @@ def test_two_simultaneous_registrations_create_one_account(engine, roll_key) -> 
     details = {"given_name": "Race", "surname": "Tester", "date_of_birth": "1970-01-01", "postcode": "3999"}
     body = details | {"enrolment_code": code}
     with Session(engine) as setup:
-        before = setup.scalar(select(func.coalesce(func.max(AuditLogEntry.id), 0)))
         division = Division(name="Racetown", state="Victoria")
         setup.add(division)
         setup.flush()
@@ -455,7 +459,9 @@ def test_two_simultaneous_registrations_create_one_account(engine, roll_key) -> 
                 delete(RegistrationSession).where(RegistrationSession.roll_id == roll_id),
                 delete(ElectoralRollEntry).where(ElectoralRollEntry.id == roll_id),
                 delete(Division).where(Division.name == "Racetown"),
-                delete(AuditLogEntry).where(AuditLogEntry.id > before),
+                # SR-16: audit rows cannot be deleted (append-only trigger); TRUNCATE fires no row trigger.
+                # Only this test's committed rows are there: every other test rolls back.
+                text("TRUNCATE audit_log"),
             ):
                 cleanup.execute(statement)
             # SR-02: without this the rows stayed behind, and later start-up checks would see them

@@ -150,7 +150,8 @@ def test_altered_stored_definition_serves_nothing(
 
     assert outcome(client.get("/api/ballot")) == UNAVAILABLE
     entry = db_session.scalars(select(AuditLogEntry).where(AuditLogEntry.event_type == "BALLOT_DEFINITION_INVALID")).one()
-    assert (entry.actor, entry.details) == (f"account:{voter.account_id}", {"reason": "bad_signature"})
+    # SR-16: the reason is a structured field
+    assert (entry.actor, entry.outcome, entry.reason) == (f"account:{voter.account_id}", "failure", "bad_signature")
     assert db_session.scalar(select(func.count()).select_from(VoterParticipation)) == 0
     assert db_session.scalar(select(func.count()).select_from(BallotToken)) == 0
 
@@ -171,7 +172,8 @@ def test_startup_refuses_an_open_election_without_a_valid_definition(
 
     last = db_session.scalars(select(AuditLogEntry).order_by(AuditLogEntry.id.desc()).limit(1)).one()
     reason = "bad_signature" if problem == "altered" else "no_active_definition"
-    assert (last.event_type, last.actor, last.details) == ("BALLOT_DEFINITION_INVALID", "unknown", {"reason": reason})
+    # SR-16: the reason is a structured field, in the configuration category
+    assert (last.event_type, last.actor, last.category, last.reason) == ("BALLOT_DEFINITION_INVALID", "unknown", "configuration", reason)
 
 
 def test_definition_is_valid_only_between_its_dates(db_session: Session, future, delegate_keys, clock) -> None:
@@ -370,9 +372,10 @@ def test_app_code_never_reads_a_delegate_private_key() -> None:
 
 
 def test_audit_events_hold_no_payload_or_signature_material(
-    client: TestClient, db_session: Session, election, future, delegate_keys, make_voter, sign_in, clock
+    client: TestClient, db_session: Session, election, future, delegate_keys, make_voter, sign_in, clock, audit_text
 ) -> None:
-    """SR-07 test 13: activated, rejected and invalid events carry an actor and a reason code only."""
+    """SR-07 test 13: activated, rejected and invalid events carry an actor and a reason code only.
+    SR-16: plus the allow-listed outcome and role; every column is searched for definition material."""
     before = db_session.scalar(select(func.coalesce(func.max(AuditLogEntry.id), 0)))
     payload = payload_for(db_session, future, clock)
     signatures = signed(delegate_keys, payload, "delegate_a", "delegate_b")
@@ -386,11 +389,11 @@ def test_audit_events_hold_no_payload_or_signature_material(
     rows = db_session.scalars(
         select(AuditLogEntry).where(AuditLogEntry.id > before, AuditLogEntry.event_type.like("BALLOT_DEFINITION_%"))
     ).all()
-    assert [(r.event_type, r.actor, r.details) for r in rows] == [
-        ("BALLOT_DEFINITION_REJECTED", "script", {"reason": "not_enough_delegates"}),
-        ("BALLOT_DEFINITION_ACTIVATED", "script", {}),
-        ("BALLOT_DEFINITION_INVALID", f"account:{voter.account_id}", {"reason": "bad_signature"}),
+    assert [(r.event_type, r.actor, r.outcome, r.reason) for r in rows] == [
+        ("BALLOT_DEFINITION_REJECTED", "script", "rejected", "not_enough_delegates"),
+        ("BALLOT_DEFINITION_ACTIVATED", "script", "success", None),
+        ("BALLOT_DEFINITION_INVALID", f"account:{voter.account_id}", "failure", "bad_signature"),
     ]
-    recorded = json.dumps([[r.event_type, r.actor, r.details] for r in rows])
+    recorded = audit_text(before)
     material = [payload_hash(payload), "Ortega", "Whitfield"] + [s["signature"] for s in signatures] + [s["key_id"] for s in signatures]
     assert [m for m in material if m in recorded] == []

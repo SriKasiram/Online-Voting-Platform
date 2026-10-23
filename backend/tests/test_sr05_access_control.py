@@ -5,7 +5,6 @@ permission map. Unmapped admin routes cannot exist, and voting routes accept
 electors only.
 """
 
-import json
 import uuid
 from contextlib import nullcontext
 
@@ -299,14 +298,17 @@ def test_turnout_holds_counts_and_nothing_about_electors(
 def test_audit_verify_finds_an_altered_entry(
     client: TestClient, db_session: Session, make_staff, sign_in
 ) -> None:
-    """SR-05 test 10: ok on a clean chain; after one entry is changed in the database, that entry is reported."""
+    """SR-05 test 10: ok on a clean chain; after one entry is changed in the database, that entry is reported.
+    SR-16: the log is append-only now, so the change is made as a database owner would, trigger off."""
     sign_in(make_staff("auditor"))
     clean = call(client, "verify").json()
     assert clean["ok"] is True and clean["entries"] >= 2
 
     entries = db_session.scalars(select(AuditLogEntry).order_by(AuditLogEntry.id)).all()
     altered = entries[-2]
+    db_session.execute(text("ALTER TABLE audit_log DISABLE TRIGGER audit_log_append_only"))
     db_session.execute(update(AuditLogEntry).where(AuditLogEntry.id == altered.id).values(actor="unknown"))
+    db_session.execute(text("ALTER TABLE audit_log ENABLE TRIGGER audit_log_append_only"))
     db_session.commit()
 
     assert call(client, "verify").json() == {"ok": False, "first_bad_id": altered.id}
@@ -360,7 +362,14 @@ def test_create_staff_script(db_session: Session, monkeypatch: pytest.MonkeyPatc
     assert secret.encode() not in account.totp_secret_enc
     assert "otpauth://totp/" in printed and secret in printed and "auditor password one" not in printed
     created = db_session.scalars(select(AuditLogEntry).where(AuditLogEntry.event_type == "STAFF_CREATED")).one()
-    assert (created.actor, created.details) == ("system", {"account": str(account.id), "role": "auditor"})
+    # SR-16: the new account and its role as the actor (no free-text details, no username)
+    assert (created.actor, created.role, created.category, created.outcome, created.details) == (
+        f"account:{account.id}",
+        "auditor",
+        "privileged_access",
+        "success",
+        None,
+    )
 
     for argv in (
         ["--username", "NEW.AUDITOR", "--role", "auditor"],  # taken, whatever the letter case
@@ -380,9 +389,10 @@ def test_create_staff_script(db_session: Session, monkeypatch: pytest.MonkeyPatc
 
 
 def test_denials_and_resets_are_audited_without_secrets(
-    client: TestClient, db_session: Session, make_staff, sign_in, issued_elector
+    client: TestClient, db_session: Session, make_staff, sign_in, issued_elector, audit_text
 ) -> None:
-    """SR-05 test 13: AUTHZ_DENIED and ELECTOR_RESET by account only; unauthenticated 401s write nothing."""
+    """SR-05 test 13: AUTHZ_DENIED and ELECTOR_RESET by account only; unauthenticated 401s write nothing.
+    SR-16: the missing permission is the reason code, and the reset's actor is account:<id> (was staff:<id>)."""
     before = last_id(db_session)
     for route in ROUTES:
         assert call(client, route, issued_elector.roll_id).status_code == 401
@@ -399,11 +409,11 @@ def test_denials_and_resets_are_audited_without_secrets(
     call(client, "reset", issued_elector.roll_id)
 
     rows = audit_since(db_session, before, "AUTHZ_DENIED", "ELECTOR_RESET")
-    assert [(r.event_type, r.actor, r.details) for r in rows] == [
-        ("AUTHZ_DENIED", f"account:{auditor.account_id}", {"permission": "elector:reset"}),
-        ("AUTHZ_DENIED", f"account:{official.account_id}", {"permission": "audit:read"}),
-        ("ELECTOR_RESET", f"staff:{official.account_id}", {}),
+    assert [(r.event_type, r.actor, r.role, r.outcome, r.reason) for r in rows] == [
+        ("AUTHZ_DENIED", f"account:{auditor.account_id}", "auditor", "denied", "elector:reset"),
+        ("AUTHZ_DENIED", f"account:{official.account_id}", "polling_official", "denied", "audit:read"),
+        ("ELECTOR_RESET", f"account:{official.account_id}", "polling_official", "success", None),
     ]
     secrets += [auditor.password, auditor.totp_secret, official.password, official.totp_secret]
-    recorded = json.dumps([[r.event_type, r.actor, r.details] for r in audit_since(db_session, before)])
+    recorded = audit_text(before)
     assert [s for s in secrets if s in recorded] == []

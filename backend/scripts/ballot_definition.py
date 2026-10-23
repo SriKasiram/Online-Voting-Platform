@@ -32,6 +32,7 @@ from app.ballot_definitions import OK, active_definition, canonical, message, pa
 from app.config import settings
 from app.db import SessionLocal
 from app.models import BallotDefinition, Candidate, Division, Election
+from app.audit_events import REJECTED, SCRIPT, SUCCESS
 from app.security import audit, utc_now
 from scripts.sign_roll import load_or_create_private_key
 
@@ -162,11 +163,13 @@ def activate(db: Session, payload: str, signatures: list) -> str:
             reason = "insufficient_lead"
     if reason != OK:
         db.rollback()
-        audit(db, "BALLOT_DEFINITION_REJECTED", actor="script", reason=reason)
+        # SR-16: a rejection, in its own transaction; the reason is one of the SR-07 codes
+        audit(db, "BALLOT_DEFINITION_REJECTED", outcome=REJECTED, actor=SCRIPT, role=SCRIPT, reason=reason)
         db.commit()
         return reason
     store_active(db, election.id, payload, signatures, now)
-    audit(db, "BALLOT_DEFINITION_ACTIVATED", actor="script")
+    # SR-16: in the same transaction as the activation: if the entry cannot be written, nothing is activated
+    audit(db, "BALLOT_DEFINITION_ACTIVATED", outcome=SUCCESS, actor=SCRIPT, role=SCRIPT)
     db.commit()
     return OK
 

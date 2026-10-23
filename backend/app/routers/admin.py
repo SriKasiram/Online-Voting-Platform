@@ -14,7 +14,7 @@ from app.models import AuditLogEntry, Division, Election, ElectoralRollEntry, Vo
 from app.participation import reset_issued
 from app.rbac import AUDIT_READ, AUDIT_VERIFY, ELECTOR_RESET, TURNOUT_READ, AdminRouter
 from app.schemas import AuditEntryOut, DivisionTurnout, ResetOut, StateCounts, TurnoutOut
-from app.security import verify_audit_chain
+from app.security import actor_for, verify_audit_chain
 
 router = AdminRouter(prefix="/admin", tags=["admin"])
 
@@ -54,7 +54,9 @@ def turnout(db: DbSession) -> TurnoutOut:
 @router.post("/electors/{roll_id}/reset", permission=ELECTOR_RESET)
 def reset_elector(roll_id: uuid.UUID, session: CurrentSession, db: DbSession) -> ResetOut:
     """SR-05: clears an elector's issued ballot (SR-03 reset). Never undoes a vote."""
-    result = reset_issued(db, roll_id, actor=f"staff:{session.account_id}")
+    # SR-16: the official's account and role; "staff:<id>" is not an allowed actor
+    actor, role = actor_for(db, session.account_id)
+    result = reset_issued(db, roll_id, actor=actor, role=role)
     if result == "not_found":
         raise HTTPException(status.HTTP_404_NOT_FOUND, "not_found")
     if result == "voted":

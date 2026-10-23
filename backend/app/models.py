@@ -32,7 +32,7 @@ import uuid
 from datetime import date, datetime
 from typing import Any
 
-from sqlalchemy import BigInteger, CheckConstraint, Enum, ForeignKey, Index, UniqueConstraint, false, func, text
+from sqlalchemy import BigInteger, CheckConstraint, Enum, ForeignKey, Index, SmallInteger, UniqueConstraint, false, func, text
 from sqlalchemy.dialects.postgresql import CITEXT, JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -332,13 +332,38 @@ class BallotChainEntry(Base):
 
 
 class AuditLogEntry(Base):
+    """
+    SR-16: append-only (database triggers refuse UPDATE and DELETE, migration 0013) and written
+    only through app/security.py audit(), which allows only the fields of app/audit_events.py.
+    """
+
     __tablename__ = "audit_log"
+    __table_args__ = (
+        # SR-16: a version 2 row carries its fields and no free text
+        CheckConstraint(
+            "format_version = 1 OR (category IS NOT NULL AND outcome IS NOT NULL AND role IS NOT NULL "
+            "AND request_id IS NOT NULL AND details IS NULL)",
+            name="v2_fields",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     event_type: Mapped[str]
     actor: Mapped[str]
-    details: Mapped[dict[str, Any]] = mapped_column(default=dict, server_default=text("'{}'::jsonb"))
+    # SR-16: free text, kept only for rows written before SR-16; new rows leave it empty (SQL NULL,
+    # not JSON null, so the v2_fields check can tell)
+    details: Mapped[dict[str, Any] | None] = mapped_column(JSONB(none_as_null=True))
+    # SR-16: the allow-listed fields, empty on rows written before SR-16 (those are never rewritten)
+    category: Mapped[str | None]
+    outcome: Mapped[str | None]
+    role: Mapped[str | None]
+    request_id: Mapped[uuid.UUID | None]
+    batch_no: Mapped[int | None]
+    count: Mapped[int | None]
+    reason: Mapped[str | None]
+    # SR-16: which hash formula the row was written with: 1 before SR-16, 2 from SR-16 on
+    format_version: Mapped[int] = mapped_column(SmallInteger, server_default=text("1"))
     # UNIQUE prev_hash stops two entries from claiming the same predecessor
     prev_hash: Mapped[bytes] = mapped_column(unique=True)
     hash: Mapped[bytes]

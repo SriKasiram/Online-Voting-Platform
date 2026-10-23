@@ -21,7 +21,8 @@ from sqlalchemy.orm import Session
 from app import config
 from app.db import SessionLocal
 from app.models import Account, AccountRole, RegistrationSession
-from app.security import audit, encrypt, hash_password, new_totp_secret, totp_uri
+from app.audit_events import SUCCESS
+from app.security import account_actor, audit, encrypt, hash_password, new_totp_secret, totp_uri
 
 STAFF_ROLES = [AccountRole.POLLING_OFFICIAL.value, AccountRole.AUDITOR.value]
 
@@ -58,7 +59,10 @@ def create_staff(session: Session, username: str, role: str, password: str) -> t
     )
     session.add(account)
     session.flush()
-    audit(session, "STAFF_CREATED", actor="system", account=str(account.id), role=role)
+    # SR-16: the actor is the account created, with the role it was given. Only this script makes
+    # staff accounts, on the server, and it has no account of its own; the username is never recorded.
+    actor, actor_role = account_actor(account)
+    audit(session, "STAFF_CREATED", outcome=SUCCESS, actor=actor, role=actor_role)
     session.commit()
     return totp_uri(secret, username), secret
 

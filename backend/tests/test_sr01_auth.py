@@ -4,7 +4,6 @@ a code from an authenticator app (TOTP) before any voting route opens. Failed
 attempts lock the account, and each client IP has a limit on sign-in requests.
 """
 
-import json
 import threading
 from collections.abc import Iterator
 from datetime import timedelta
@@ -12,7 +11,7 @@ from datetime import timedelta
 import pyotp
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import Engine, delete, func, select
+from sqlalchemy import Engine, delete, func, select, text
 from sqlalchemy.orm import Session
 
 from app import security
@@ -203,7 +202,6 @@ def test_parallel_wrong_passwords_are_all_counted(engine: Engine) -> None:
             yield session
 
     with Session(engine) as setup:
-        before = setup.scalar(select(func.coalesce(func.max(AuditLogEntry.id), 0)))
         account = Account(
             username="parallel.voter",
             password_hash=hash_password("the right password"),
@@ -239,7 +237,9 @@ def test_parallel_wrong_passwords_are_all_counted(engine: Engine) -> None:
     finally:
         app.dependency_overrides.clear()
         with Session(engine) as cleanup:
-            cleanup.execute(delete(AuditLogEntry).where(AuditLogEntry.id > before))
+            # SR-16: audit rows cannot be deleted (append-only trigger); TRUNCATE fires no row trigger.
+            # Only this test's committed rows are there: every other test rolls back.
+            cleanup.execute(text("TRUNCATE audit_log"))
             cleanup.execute(delete(AuthSession).where(AuthSession.account_id == account_id))
             cleanup.execute(delete(Account).where(Account.id == account_id))
             cleanup.commit()
@@ -309,9 +309,10 @@ def test_locked_and_unknown_users_still_run_the_dummy_hash(
 
 
 def test_audit_records_each_event_without_secrets(
-    client: TestClient, db_session: Session, make_voter, clock, monkeypatch: pytest.MonkeyPatch
+    client: TestClient, db_session: Session, make_voter, clock, monkeypatch: pytest.MonkeyPatch, audit_text
 ) -> None:
-    """SR-01 test 14: every sign-in event is audited with only the account (or "unknown") and the event type."""
+    """SR-01 test 14: every sign-in event is audited with only the account (or "unknown") and the event type.
+    SR-16: and the allow-listed outcome and role, with no free text; every column is searched for secrets."""
     before = db_session.scalar(select(func.coalesce(func.max(AuditLogEntry.id), 0)))
     voter = make_voter()
     secrets = [voter.password, WRONG_PASSWORD, voter.username, voter.totp_secret]
@@ -331,8 +332,9 @@ def test_audit_records_each_event_without_secrets(
     rows = db_session.scalars(select(AuditLogEntry).where(AuditLogEntry.id > before)).all()
     assert {r.event_type for r in rows} == EVENTS
     assert {r.actor for r in rows} == {f"account:{voter.account_id}", "unknown"}
-    assert all(r.details == {} for r in rows)
-    recorded = json.dumps([[r.event_type, r.details] for r in rows])
+    assert all(r.details is None and r.reason is None for r in rows)
+    assert {r.role for r in rows} == {"elector", "unknown"}
+    recorded = audit_text(before)
     assert [s for s in secrets if s in recorded] == []
 
 

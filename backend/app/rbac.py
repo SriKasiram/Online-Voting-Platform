@@ -15,8 +15,9 @@ from fastapi import APIRouter, Depends, FastAPI, HTTPException, status
 from fastapi.routing import APIRoute, iter_route_contexts
 
 from app.deps import CurrentSession, DbSession
+from app.audit_events import DENIED
 from app.models import Account, AccountRole
-from app.security import audit
+from app.security import account_actor, audit
 
 TURNOUT_READ = "turnout:read"
 ELECTOR_RESET = "elector:reset"
@@ -47,7 +48,9 @@ def require_permission(permission: str) -> Callable[..., Account]:
         # Read from the database on every request, so a role change applies to the very next one
         account = db.get_one(Account, session.account_id)
         if permission not in ROLE_PERMISSIONS.get(account.role, frozenset()):
-            audit(db, "AUTHZ_DENIED", actor=f"account:{account.id}", permission=permission)
+            # SR-16: the missing permission is recorded as a fixed reason code (app/audit_events.py)
+            actor, role = account_actor(account)
+            audit(db, "AUTHZ_DENIED", outcome=DENIED, actor=actor, role=role, reason=permission)
             db.commit()
             raise HTTPException(status.HTTP_403_FORBIDDEN, "forbidden")
         return account

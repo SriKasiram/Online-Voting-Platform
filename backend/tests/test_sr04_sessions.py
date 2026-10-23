@@ -7,7 +7,6 @@ accepted only where it belongs.
 
 import base64
 import hashlib
-import json
 import threading
 from collections.abc import Iterator
 from datetime import timedelta
@@ -264,9 +263,10 @@ def test_new_sign_in_clears_expired_sessions(client: TestClient, db_session: Ses
 
 
 def test_extension_audit_events_hold_no_identifiers(
-    client: TestClient, db_session: Session, make_voter, sign_in, clock
+    client: TestClient, db_session: Session, make_voter, sign_in, clock, audit_text
 ) -> None:
-    """SR-04 test 12: SESSION_EXTENDED and SESSION_EXTENSION_REFUSED (limit, expired), by account, without identifiers."""
+    """SR-04 test 12: SESSION_EXTENDED and SESSION_EXTENSION_REFUSED (limit, expired), by account, without identifiers.
+    SR-16: the reason and outcome are structured fields, and every column is searched."""
     before = db_session.scalar(select(func.coalesce(func.max(AuditLogEntry.id), 0)))
     voter = make_voter()
     sign_in(voter)
@@ -281,14 +281,14 @@ def test_extension_audit_events_hold_no_identifiers(
     rows = db_session.scalars(
         select(AuditLogEntry).where(AuditLogEntry.id > before, AuditLogEntry.event_type.like("SESSION_%"))
     ).all()
-    assert [(r.event_type, r.details) for r in rows] == [
-        ("SESSION_EXTENDED", {}),
-        ("SESSION_EXTENDED", {}),
-        ("SESSION_EXTENSION_REFUSED", {"reason": "limit"}),
-        ("SESSION_EXTENSION_REFUSED", {"reason": "expired"}),
+    assert [(r.event_type, r.outcome, r.reason, r.details) for r in rows] == [
+        ("SESSION_EXTENDED", "success", None, None),
+        ("SESSION_EXTENDED", "success", None, None),
+        ("SESSION_EXTENSION_REFUSED", "denied", "limit", None),
+        ("SESSION_EXTENSION_REFUSED", "denied", "expired", None),
     ]
     assert {r.actor for r in rows} == {f"account:{voter.account_id}"}
-    recorded = json.dumps([[r.event_type, r.actor, r.details] for r in rows])
+    recorded = audit_text(before)
     assert [t for t in tokens if t in recorded or hash_token(t).hex() in recorded] == []
 
 
@@ -320,7 +320,6 @@ def test_ten_simultaneous_extensions_with_one_identifier_allow_one(engine: Engin
 
     token = new_token()
     with Session(engine) as setup:
-        before = setup.scalar(select(func.coalesce(func.max(AuditLogEntry.id), 0)))
         account = Account(
             username="sr04.parallel",
             password_hash=hash_password("a long enough password"),
@@ -364,7 +363,9 @@ def test_ten_simultaneous_extensions_with_one_identifier_allow_one(engine: Engin
     finally:
         app.dependency_overrides.clear()
         with Session(engine) as cleanup:
-            cleanup.execute(delete(AuditLogEntry).where(AuditLogEntry.id > before))
+            # SR-16: audit rows cannot be deleted (append-only trigger); TRUNCATE fires no row trigger.
+            # Only this test's committed rows are there: every other test rolls back.
+            cleanup.execute(text("TRUNCATE audit_log"))
             cleanup.execute(delete(AuthSession).where(AuthSession.account_id == account_id))
             cleanup.execute(delete(Account).where(Account.id == account_id))
             cleanup.commit()

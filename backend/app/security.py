@@ -10,8 +10,10 @@ all and a key made for one purpose is never used for another.
 import hashlib
 import hmac
 import json
+import re
 import secrets
 import unicodedata
+import uuid
 from collections import deque
 from datetime import UTC, date, datetime
 from threading import Lock
@@ -29,8 +31,11 @@ from fastapi import Response
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
+# SR-16: the catalogue and fixed sets the audit writer enforces, and the request being handled
+from app import audit_events
 from app.config import TOTP_ISSUER, TOTP_VALID_WINDOW, settings
-from app.models import AuditLogEntry
+from app.models import Account, AccountRole, AuditLogEntry
+from app.request_id import current_request_id
 
 # ---------------------------------------------------------------
 # Tokens and cookies
@@ -255,54 +260,194 @@ _GENESIS_HASH = bytes(32)
 # Any fixed number. Holding this lock while appending stops two writers forking the chain.
 _AUDIT_LOCK_ID = 51_204
 
+# SR-16: 1 = rows written before SR-16 (free-form details); 2 = the allow-listed fields only.
+# Old rows are never rewritten, so each row is verified with the formula of its own version.
+AUDIT_FORMAT_V1 = 1
+AUDIT_FORMAT_V2 = 2
 
-def audit(db: Session, event_type: str, actor: str, **details: Any) -> None:
+_UUID_TEXT = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+_ACCOUNT_ACTOR = re.compile(rf"account:{_UUID_TEXT}")
+_ANY_UUID = re.compile(_UUID_TEXT, re.IGNORECASE)
+# SR-16: the shape of a token (base64url, 32+ characters), a token hash (64 hex) or a receipt
+# reference (32 hex). Account and request ids are UUIDs, which are taken out before this is applied.
+_SECRET_SHAPE = re.compile(r"[0-9a-fA-F]{32}|[A-Za-z0-9_-]{32,}")
+_ACCOUNT_ROLES = frozenset(role.value for role in AccountRole)
+
+
+class AuditFieldError(ValueError):
+    """SR-16: the entry would break the audit allow-list, so nothing was written."""
+
+
+def looks_secret(value: str) -> bool:
+    """SR-16: True if the text holds something shaped like a token, a token hash or a receipt."""
+    return _SECRET_SHAPE.search(_ANY_UUID.sub("", value)) is not None
+
+
+def account_actor(account: Account) -> tuple[str, str]:
+    """SR-16: the actor and role audit() needs for an account: its id and role, never its username."""
+    return f"account:{account.id}", account.role.value
+
+
+def actor_for(db: Session, account_id: uuid.UUID | None) -> tuple[str, str]:
+    """SR-16: the same for an account id, or "unknown" when no account is known."""
+    account = db.get(Account, account_id) if account_id else None
+    return account_actor(account) if account else (audit_events.UNKNOWN, audit_events.UNKNOWN)
+
+
+def _checked_fields(
+    event_type: str,
+    outcome: str,
+    actor: str,
+    role: str,
+    request_id: str,
+    batch_no: int | None,
+    count: int | None,
+    reason: str | None,
+) -> str:
+    """SR-16: raises AuditFieldError unless every value is allowed. Returns the event's category."""
+    for value in (event_type, outcome, actor, role, request_id, reason):
+        if value is not None and (not isinstance(value, str) or looks_secret(value)):
+            raise AuditFieldError("an audit value is not plain text or is shaped like a secret")
+    category = audit_events.EVENT_CATEGORIES.get(event_type)
+    if category is None:
+        raise AuditFieldError(f"not a catalogued audit event: {event_type}")
+    if outcome not in audit_events.OUTCOMES:
+        raise AuditFieldError(f"not an audit outcome: {outcome}")
+    if role not in audit_events.ROLES:
+        raise AuditFieldError(f"not an audit role: {role}")
+    if reason is not None and reason not in audit_events.REASON_CODES:
+        raise AuditFieldError("the reason is not a catalogued reason code")
+    # SR-16: the actor is an account id, "script" or "unknown", and its role must fit it
+    if actor in (audit_events.SCRIPT, audit_events.UNKNOWN):
+        if role != actor:
+            raise AuditFieldError(f"the {actor} actor must have the {actor} role")
+    elif not _ACCOUNT_ACTOR.fullmatch(actor) or role not in _ACCOUNT_ROLES:
+        raise AuditFieldError("the actor must be account:<id>, script or unknown, with a matching role")
+    if not re.fullmatch(_UUID_TEXT, request_id):
+        raise AuditFieldError("the request id must be a lowercase UUID")
+    for number in (batch_no, count):
+        if number is not None and (type(number) is not int or number < 0):
+            raise AuditFieldError("batch_no and count must be whole numbers")
+    return category
+
+
+def _v2_body(entry: AuditLogEntry) -> str:
+    # SR-16: every structured field and the format version, in one canonical text form
+    return json.dumps(
+        {
+            "format_version": AUDIT_FORMAT_V2,
+            # The database may hand the time back in another zone, so use the writer's UTC form
+            "created_at": entry.created_at.astimezone(UTC).isoformat(),
+            "event_type": entry.event_type,
+            "category": entry.category,
+            "outcome": entry.outcome,
+            "actor": entry.actor,
+            "role": entry.role,
+            "request_id": str(entry.request_id),
+            "batch_no": entry.batch_no,
+            "count": entry.count,
+            "reason": entry.reason,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _v1_body(entry: AuditLogEntry) -> str:
+    # SR-01 to SR-15: the formula rows written before SR-16 were hashed with, unchanged
+    return json.dumps(
+        {
+            "created_at": entry.created_at.astimezone(UTC).isoformat(),
+            "event_type": entry.event_type,
+            "actor": entry.actor,
+            "details": entry.details,
+        },
+        sort_keys=True,
+    )
+
+
+def entry_hash(prev_hash: bytes, entry: AuditLogEntry) -> bytes:
+    """The hash an entry must carry, by the formula of its own format version."""
+    body = _v1_body(entry) if entry.format_version == AUDIT_FORMAT_V1 else _v2_body(entry)
+    return hashlib.sha256(prev_hash + body.encode()).digest()
+
+
+def audit(
+    db: Session,
+    event_type: str,
+    *,
+    outcome: str,
+    actor: str,
+    role: str,
+    request_id: str | None = None,
+    batch_no: int | None = None,
+    count: int | None = None,
+    reason: str | None = None,
+    **unexpected: Any,
+) -> None:
     """
     Appends an audit entry, chained to the one before it by hash. Committed or
-    rolled back with the caller's transaction. Never pass personal data, codes
-    or secrets: `actor` is a roll entry id ("roll:<id>"), a client IP or "unknown".
+    rolled back with the caller's transaction.
+
+    SR-16: only the allow-listed fields of app/audit_events.py. Anything else (an unknown event
+    type or field, a value outside the fixed sets, a non-integer number, anything shaped like a
+    token, hash or receipt) raises AuditFieldError before anything is written. The category and
+    time are set here, and the request id comes from the request being handled (app/request_id.py).
+    Callers write it in the same transaction as the change it describes, so if this fails the
+    change is rolled back too.
     """
+    if unexpected:
+        raise AuditFieldError(f"not an allowed audit field: {', '.join(sorted(unexpected))}")
+    # SR-16: outside a request (scripts, start-up) each entry gets its own random id
+    request_id = request_id or current_request_id() or str(uuid.uuid4())
+    category = _checked_fields(event_type, outcome, actor, role, request_id, batch_no, count, reason)
+
     db.execute(text("SELECT pg_advisory_xact_lock(:id)"), {"id": _AUDIT_LOCK_ID})
     prev_hash = db.scalar(select(AuditLogEntry.hash).order_by(AuditLogEntry.id.desc()).limit(1))
     prev_hash = prev_hash or _GENESIS_HASH
-    created_at = utc_now()
-    body = json.dumps(
-        {"created_at": created_at.isoformat(), "event_type": event_type, "actor": actor, "details": details},
-        sort_keys=True,
+    entry = AuditLogEntry(
+        created_at=utc_now(),
+        event_type=event_type,
+        actor=actor,
+        category=category,
+        outcome=outcome,
+        role=role,
+        request_id=uuid.UUID(request_id),
+        batch_no=batch_no,
+        count=count,
+        reason=reason,
+        # SR-16: the old free-text column is never written again
+        details=None,
+        format_version=AUDIT_FORMAT_V2,
+        prev_hash=prev_hash,
     )
-    db.add(
-        AuditLogEntry(
-            created_at=created_at,
-            event_type=event_type,
-            actor=actor,
-            details=details,
-            prev_hash=prev_hash,
-            hash=hashlib.sha256(prev_hash + body.encode()).digest(),
-        )
-    )
+    entry.hash = entry_hash(prev_hash, entry)
+    db.add(entry)
     # Written now, so a second entry in the same transaction chains to this one
     db.flush()
 
 
 def verify_audit_chain(db: Session) -> tuple[int, int | None]:
     """
-    SR-05: recomputes the hash chain exactly as audit() builds it (audit() is
-    unchanged). Returns how many entries checked out and the id of the first one
-    that does not, or None when the whole chain is intact.
+    SR-05: recomputes the hash chain exactly as audit() builds it. Returns how many
+    entries checked out and the id of the first one that does not, or None when the
+    whole chain is intact. SR-16: each row by the formula of its format version, and a
+    version 2 row must have no free-text details at all.
     """
     prev_hash, checked = _GENESIS_HASH, 0
-    for entry in db.scalars(select(AuditLogEntry).order_by(AuditLogEntry.id)):
-        body = json.dumps(
-            {
-                # The database may hand the time back in another zone, so restore audit()'s UTC form
-                "created_at": entry.created_at.astimezone(UTC).isoformat(),
-                "event_type": entry.event_type,
-                "actor": entry.actor,
-                "details": entry.details,
-            },
-            sort_keys=True,
-        )
-        if entry.prev_hash != prev_hash or entry.hash != hashlib.sha256(prev_hash + body.encode()).digest():
+    # SR-16: populate_existing, so rows this session already holds are re-read from the database:
+    # verification must check what is stored now, not what the session saw earlier
+    rows = select(AuditLogEntry).order_by(AuditLogEntry.id).execution_options(populate_existing=True)
+    for entry in db.scalars(rows):
+        stray_details = entry.format_version != AUDIT_FORMAT_V1 and entry.details is not None
+        if stray_details or entry.prev_hash != prev_hash or entry.hash != entry_hash(prev_hash, entry):
             return checked, entry.id
         prev_hash, checked = entry.hash, checked + 1
     return checked, None
+
+
+def audit_hash_at(db: Session, position: int) -> bytes | None:
+    """SR-16: the hash of the position-th entry (1 = the first) in chain order, or None if there is none."""
+    if position < 1:
+        return None
+    return db.scalar(select(AuditLogEntry.hash).order_by(AuditLogEntry.id).offset(position - 1).limit(1))

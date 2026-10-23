@@ -20,3 +20,9 @@ Work through every step, in order, before a release. A release needs every requi
 7. **TLS (SR-10).** The server starts with `python -m app.serve`, and `docs/MANUAL.md` section 6 still passes.
 8. **Acceptance confirmation (SR-14).** `ACCEPT_TIMEOUT_SECONDS` on the server is between 1 and 9 (the server refuses to start otherwise), and `docs/MANUAL.md` section 10 still passes: the confirmation holds only the reference, and a held lock gets `try_again` with nothing stored.
 9. **Session reset (SR-15).** The frontend is built without demo values for `VITE_IDLE_SECONDS`, `VITE_IDLE_WARNING_SECONDS`, `VITE_RECEIPT_SECONDS` and `VITE_RESET_LOGOUT_TIMEOUT_MS` (defaults 90, 30, 60 and 3000), and `docs/MANUAL.md` section 11 still passes.
+10. **Audit log (required, SR-16).** Run `pytest -m audit_capture`; run `python -m scripts.audit_checkpoint` and `python -m scripts.verify_audit`; both must pass; attach the output.
+    - Run all three inside `backend/`, the two scripts against the release database.
+    - The scripts must exit with code 0, the second ending in `SR-16 audit verification: PASS`. Record the audit head hash it prints in the release record.
+11. **Monthly audit capture (SR-16).** Check that the monthly audit-capture workflow passed this month: the **Audit capture** workflow in GitHub Actions.
+    - If it has not run this month, run it by hand: Actions, Audit capture, Run workflow.
+    - Scheduled workflows run only on the default branch.

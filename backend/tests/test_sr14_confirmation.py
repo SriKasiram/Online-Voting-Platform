@@ -22,7 +22,7 @@ from app.deps import get_db
 from app.main import app
 from app.models import Account, Ballot, BallotToken, ParticipationState, VoterParticipation
 from app.routers import ballot as ballot_router
-from app.security import SESSION_COOKIE, audit
+from app.security import SESSION_COOKIE
 from scripts import audit_separation
 
 SUBMIT = "/api/ballot/submit"
@@ -201,8 +201,11 @@ def test_failure_while_storing_returns_no_confirmation(
     assert count(db_session, Ballot) == 0 and state_of(db_session, voter) == ParticipationState.ISSUED
 
 
-def test_separation_audit_passes_and_covers_receipts(client: TestClient, db_session: Session, make_voter, sign_in, tmp_path) -> None:
-    """SR-14 test 9: SR-12's audit passes with receipt hashes, and catches the reference or its hash on the identity side."""
+def test_separation_audit_passes_and_covers_receipts(
+    client: TestClient, db_session: Session, make_voter, sign_in, tmp_path, plant_audit_text
+) -> None:
+    """SR-14 test 9: SR-12's audit passes with receipt hashes, and catches the reference or its hash on the identity side.
+    SR-16: the writer refuses both, so each is planted in the table directly."""
     paper, _ = open_paper(client, make_voter, sign_in)
     reference = submit(client, paper).json()["receipt_id"]
 
@@ -211,7 +214,7 @@ def test_separation_audit_passes_and_covers_receipts(client: TestClient, db_sess
     assert sha256_hex(reference) in identifiers
     for leaked in (reference, sha256_hex(reference)):
         savepoint = db_session.begin_nested()
-        audit(db_session, "TEST_EVENT", actor="unknown", note=leaked)
+        plant_audit_text(leaked)
         assert audit_separation.check_identity_tables(db_session, identifiers).status == "FAIL"
         savepoint.rollback()
 

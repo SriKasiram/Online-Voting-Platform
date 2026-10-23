@@ -1,0 +1,65 @@
+name: Audit capture
+
+# SR-16: the audit capture tests run every month, so a change that stops an event category being
+# recorded is noticed even when nobody has opened a pull request. GitHub runs scheduled workflows
+# only on the default branch. Run it by hand from the Actions tab (Run workflow) before each release.
+on:
+  schedule:
+    # 00:00 UTC on the 1st of each month
+    - cron: "0 0 1 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit-capture:
+    name: SR-16 audit capture tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    # SR-16: the same database service, Python and settings as the backend job in ci.yml
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: evoting
+          # Throwaway container that exists only for this job, so this is not a secret
+          POSTGRES_PASSWORD: ci-only-password
+          POSTGRES_DB: evoting
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U evoting -d evoting"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      POSTGRES_HOST: 127.0.0.1
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: evoting
+      POSTGRES_PASSWORD: ci-only-password
+      POSTGRES_DB: evoting
+      POSTGRES_TEST_DB: evoting_test
+      # Throwaway key that only ever protects this job's test database
+      SECRET_KEY: ci-only-secret-key-for-throwaway-test-data
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # SR-16: the migrations first, so the append-only trigger and the audit fields exist
+      - name: Migrations
+        run: alembic upgrade head
+
+      # SR-16: only the tests marked audit_capture; pytest also rebuilds its own test database
+      - name: Audit capture tests
+        run: pytest -m audit_capture -v

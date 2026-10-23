@@ -11,7 +11,8 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.models import Account, Election, ElectoralRollEntry
 from app.roll_signing import public_key, verify_record
-from app.security import audit, decrypt_or_none
+from app.audit_events import DENIED
+from app.security import account_actor, audit, decrypt_or_none
 
 
 def age_on(born: date, day: date) -> int:
@@ -55,6 +56,8 @@ def eligible_division(db: Session, account: Account, election: Election) -> int:
         reason = "under_age"
     else:
         return roll.division_id
-    audit(db, "ELIGIBILITY_DENIED", actor=f"account:{account.id}", reason=reason)
+    # SR-16: a rejection, in its own transaction; the reason is one of the SR-02 codes
+    actor, role = account_actor(account)
+    audit(db, "ELIGIBILITY_DENIED", outcome=DENIED, actor=actor, role=role, reason=reason)
     db.commit()
     raise HTTPException(status.HTTP_403_FORBIDDEN, "not_enrolled")

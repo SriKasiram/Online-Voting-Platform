@@ -227,7 +227,7 @@ The same checks run on every pull request through GitHub Actions (`.github/workf
 
 Before every release, also run the SR-11 storage audit, `python -m scripts.audit_ballots`, against the release database. It must exit with code 0. See [docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md).
 
-Before each election, export the ballot side (`python -m scripts.export_ballots`) and take backups as two separate dump files, one for each side ([SR-12](#sr-12-identity-and-ballots-kept-apart)). Then run `python -m scripts.audit_separation --file <each backup and export file>`. It must also exit with code 0. Finally run `python -m scripts.verify_chain --election <id>` for each election ([SR-13](#sr-13-integrity-protected-ballot-storage)): it must exit with code 0, and its head hash goes in the release record.
+Before each election, export the ballot side (`python -m scripts.export_ballots`) and take backups as two separate dump files, one for each side ([SR-12](#sr-12-identity-and-ballots-kept-apart)). Then run `python -m scripts.audit_separation --file <each backup and export file>`. It must also exit with code 0. Finally run `python -m scripts.verify_chain --election <id>` for each election ([SR-13](#sr-13-integrity-protected-ballot-storage)): it must exit with code 0, and its head hash goes in the release record. SR-16: also run `pytest -m audit_capture`, `python -m scripts.audit_checkpoint` and `python -m scripts.verify_audit` ([SR-16](#sr-16-append-only-audit-log-with-allow-listed-fields)).
 
 ## Settings
 
@@ -293,7 +293,7 @@ Never commit a real `.env` file. Only `.env.example` belongs in Git.
 - All keys are derived from `SECRET_KEY` with HKDF, one per purpose.
 - Registration step 1 answers every failure identically and does the same hashing work either way. It is rate limited per client IP and per roll entry, and 5 wrong enrolment codes lock the entry's code. Step 3 allows 5 wrong authenticator codes before the registration ends.
 - Two registrations for the same person cannot both succeed: step 1 locks the roll entry row while it spends the code, step 3 sets `registered_at` only if it is still empty, and `accounts.roll_id` is unique.
-- The audit log records `REGISTRATION_STARTED`, `REGISTRATION_COMPLETED` and `REGISTRATION_FAILED`, and the sign-in events listed under SR-01 below. Each entry is chained to the previous one by a SHA-256 hash. Entries hold only the roll entry id, or the client IP when nothing matched: never names, dates of birth, postcodes, codes or secrets.
+- The audit log records `REGISTRATION_STARTED`, `REGISTRATION_COMPLETED` and `REGISTRATION_FAILED`, and the sign-in events listed under SR-01 below. Each entry is chained to the previous one by a SHA-256 hash. Entries never hold names, dates of birth, postcodes, codes or secrets. SR-16: registration entries no longer hold the roll entry id or the client IP either: the actor is `unknown` until the account exists, then `account:<id>`. See [SR-16](#sr-16-append-only-audit-log-with-allow-listed-fields).
 
 ### Limitations, for later stages
 
@@ -331,7 +331,7 @@ Other details:
 
 - Failures are counted in a single `UPDATE`, so attempts sent at the same time are all counted. When the account locks, any session waiting for its code is deleted.
 - The cookie is `session`: `HttpOnly`, `SameSite=Strict`, `Path=/`, with no `Max-Age`. The expiry stored on the server decides when a session ends. Only the SHA-256 of the cookie value is stored. Logging out deletes the session row and clears the cookie.
-- The audit log records `auth_password_failed`, `auth_totp_failed`, `auth_account_locked`, `auth_rate_limited` and `auth_login_success`, with only the account (`account:<id>`, or `unknown`) and the event type. No passwords, codes, secrets or tokens.
+- The audit log records `auth_password_failed`, `auth_totp_failed`, `auth_account_locked`, `auth_rate_limited` and `auth_login_success`, with only the account (`account:<id>`, or `unknown`) and the event type. No passwords, codes, secrets or tokens. SR-16: plus the allow-listed outcome, role and request id.
 
 Run the SR-01 tests, inside `backend/` with PostgreSQL running:
 
@@ -413,7 +413,7 @@ Any failure rolls everything back: a token is never used without a ballot, and a
 python -m scripts.seed --reset-participation
 ```
 
-It refuses once the reviewer has voted, because a cast ballot cannot be undone by design. Only `python -m scripts.seed --reset` (all data) starts that over. Each reset is audited as `ELECTOR_RESET`. There is no API endpoint or staff screen for it.
+It refuses once the reviewer has voted, because a cast ballot cannot be undone by design. Only `python -m scripts.seed --reset` (all data) starts that over. Each reset is audited as `ELECTOR_RESET` (SR-16: with the actor `script`). There is no API endpoint or staff screen for it.
 
 **Unlinked tables.** `voter_participation` (roll entry, election, state) has no timestamp. `ballot_tokens` (id, election, hash, used flag, receipt hash) has no elector and no time at all (SR-12, SR-14). `ballots` (id, election, division, content) has no token, no reference and no time. So the database cannot match a ballot to a token, or a token to an elector. The receipt hash on the used token row is the only handle, and it points at no ballot.
 
@@ -492,7 +492,7 @@ The database refuses any other role, an elector without a roll entry, and staff 
 **How the checks work:**
 - **Every route checked.** Each `/api/admin` route is declared through `AdminRouter`, which demands a permission and attaches the check.
 - **Deny by default.** The API refuses to start if any `/api/admin` route lacks a mapped permission, including one inside an included router. There is no setting to skip this.
-- **Denied requests** get `403 {"detail": "forbidden"}` and an `AUTHZ_DENIED` audit entry naming the account and the permission. A caller with no valid session gets the usual `401`, which is not audited.
+- **Denied requests** get `403 {"detail": "forbidden"}` and an `AUTHZ_DENIED` audit entry naming the account and the permission (SR-16: the permission is the entry's reason code). A caller with no valid session gets the usual `401`, which is not audited.
 - **The voting routes** (`/api/ballot`, `/api/ballot/submit`) accept electors only, so staff get `403 forbidden`. Every role can use `/api/auth/logout`. `/api/auth/extend` works for electors; staff sessions cannot be extended (SR-06).
 
 **Create a staff account**, inside `backend/` with the virtual environment active:
@@ -506,7 +506,7 @@ The script:
 - stores only its Argon2id hash;
 - prints the authenticator setup link and key once;
 - refuses a username already in use, or any role other than `polling_official` and `auditor`;
-- records `STAFF_CREATED` in the audit log.
+- records `STAFF_CREATED` in the audit log (SR-16: naming the new account and its role, never the username).
 
 No API endpoint creates staff, and the seed creates none.
 
@@ -1144,6 +1144,113 @@ pytest tests/test_sr15_logout.py -v
 - a watchdog that restarts the voting browser;
 - a server-side idle timeout with a heartbeat;
 - a `Clear-Site-Data` header on logout.
+
+## SR-16: append-only audit log with allow-listed fields
+
+Authentication, eligibility, privileged-access, configuration and ballot-box events are recorded in the audit log as they happen. The log is append-only and hash-chained, and it accepts only allow-listed fields: no ballot selection, no raw token, and nothing that links an elector to their ballot.
+
+**The catalogue** (`backend/app/audit_events.py`) maps every event type to one category. Every event already existed in an earlier SR, so SR-16 added no new ones; it classified them.
+
+| Category | Events |
+|---|---|
+| `authentication` | `auth_login_success`, `auth_password_failed`, `auth_totp_failed`, `auth_account_locked`, `auth_rate_limited`, `SESSION_EXTENDED`, `SESSION_EXTENSION_REFUSED`, `REGISTRATION_STARTED`, `REGISTRATION_COMPLETED`, `REGISTRATION_FAILED` |
+| `eligibility` | `ELIGIBILITY_DENIED`, `BALLOT_TOKEN_ISSUED`, `BALLOT_TOKEN_REJECTED`, `BALLOT_REJECTED_INVALID`, `BALLOT_ACCEPTED`, `BALLOT_REPLAY_BLOCKED`, `ELECTOR_RESET` |
+| `privileged_access` | `AUTH_PRIVILEGED_LOGIN_SUCCESS`, `AUTHZ_DENIED`, `STAFF_CREATED` |
+| `configuration` | `ROLL_VERIFIED`, `ROLL_VERIFICATION_FAILED`, `BALLOT_DEFINITION_ACTIVATED`, `BALLOT_DEFINITION_REJECTED`, `BALLOT_DEFINITION_INVALID` |
+| `ballot_box` | `BALLOT_BATCH_SEALED`, `BALLOT_CHAIN_VERIFY_FAILED` |
+
+An event type that is not in the catalogue cannot be written. A test scans `app/` and `scripts/` for every event type the code writes and fails if one is missing from the catalogue, or if a catalogued one is unused.
+
+**Allow-listed fields.** The writer (`audit()` in `backend/app/security.py`) accepts only these fields.
+
+| Field | What it may hold |
+|---|---|
+| `event_type` | a catalogued event; the writer sets `category` from it |
+| `outcome` | `success`, `failure`, `denied` or `rejected` |
+| `actor` | `account:<id>`, `script` or `unknown`. Never a username, name, e-mail, IP address or user agent |
+| `role` | `elector`, `polling_official`, `auditor`, `script` or `unknown`, and it must fit the actor |
+| `request_id` | the request's random id (below); outside a request, a fresh random id per entry |
+| `batch_no`, `count` | whole numbers |
+| `reason` | a code from `REASON_CODES`: the SR-02, SR-03, SR-04, SR-05 (permission), SR-07, SR-13 and registration codes |
+
+The writer sets the time from the server clock. It raises `AuditFieldError`, and writes nothing, for:
+- an unknown event type or field;
+- a value outside the fixed sets;
+- a number that is not a whole number;
+- any text shaped like a secret: 64 hex (a token hash), 32 hex (a receipt reference) or 32+ base64url characters (a raw token).
+
+**The table.** Migration `0013` adds `category`, `outcome`, `role`, `request_id`, `batch_no`, `count`, `reason` and `format_version`.
+- **Old rows.** Existing rows are not rewritten. They keep `format_version = 1` and their free-text `details`, and still verify with the SR-01 formula.
+- **New rows.** They are version 2, hashed over every structured field, with `details` empty. A check constraint enforces that.
+- **What changed at the call sites.**
+  - `REGISTRATION_*` entries no longer hold the client IP or the roll entry id.
+  - Reset and staff entries use `account:<id>` instead of `staff:<id>` or `system`.
+  - The roll check records counts in `count`.
+  - `BALLOT_CHAIN_VERIFY_FAILED` is one entry per reason code.
+  - Ballot-box entries hold only `batch_no`, `count` and `reason`, never a ballot id, token, token hash or receipt.
+
+**Request id.** A middleware gives every request a random UUID. It is kept in `request.state` and a context variable for the writer, and returned in the `X-Request-ID` response header.
+- **Never from the client.** A request id sent by the client is ignored.
+- **Identity side only.** It is stored only in the audit log, never in a ballot-side table (SR-12).
+- **Order unchanged.** It is the innermost middleware, so `tls_required` still runs first and `no-store` and HSTS still apply.
+
+**Recorded at once, fail closed.** There is no queue, buffer or background worker.
+- **State changes.** These entries are written in the same transaction as the change: token issue, ballot acceptance, reset, staff creation, definition activation, batch seal, session extension and sign in. If the entry cannot be written, the whole transaction rolls back and the request gets the usual server error, so nothing is half done.
+- **Rejections.** Failed sign in, lockout, denied access, eligibility denied and refused definitions commit on their own, with any counter update, as SR-01 does.
+- **Start-up.** The roll and definition checks write their failure if the database can still take it, then refuse to start as before.
+
+**Append-only.** A `BEFORE UPDATE OR DELETE` row trigger on `audit_log` raises "the audit log is append-only (SR-16)". INSERT stays allowed, and there is no bypass flag.
+- **What it cannot stop.** `TRUNCATE` fires no row trigger; the development reset `python -m scripts.seed --reset` relies on that. A database owner can also disable the trigger.
+- **What catches that.** The hash chain and the signed checkpoints detect what the trigger cannot prevent.
+
+**Signed checkpoints.** Inside `backend/`:
+
+```
+python -m scripts.audit_checkpoint   # signs the current entry count and head hash
+python -m scripts.verify_audit       # verifies the chain and every checkpoint
+```
+
+- **`audit_checkpoint`.** It signs `{entry_count, head_hash}` with the SR-13 checkpoint private key, over `b"evoting-audit-checkpoint-v1\n"` plus canonical JSON. It appends one line to `CHECKPOINT_DIR/audit.jsonl` (default `backend/checkpoints/`, never committed). It refuses to sign an empty log, a chain that fails, or a log that no longer matches an earlier checkpoint.
+- **`verify_audit`.** It prints PASS or FAIL for three checks, then the entry count and head hash, and exits with code 1 on any failure:
+  - **a. hash chain:** every entry, each by its version's formula;
+  - **b. checkpoint signatures;**
+  - **c. checkpoints against the log:** the entry at each checkpoint's count still has the signed hash.
+- **What it detects.** A modified, deleted, swapped or inserted entry, and a log cut short below a checkpoint.
+- **Read only.** It changes nothing.
+- **Shared code.** Both scripts reuse the SR-13 checkpoint key, message, reader and signing code.
+- **Unchanged.** The SR-05 auditor route `GET /api/admin/audit-log/verify` still checks the chain alone. The API starts without the checkpoint keys, as in CI.
+
+**Monthly capture tests.** The tests marked `audit_capture` in `backend/tests/test_sr16_audit.py` each perform one real action per category, through the API or a script.
+- **What each test checks:** the entry's category, outcome, actor and role, its request id (equal to the response's `X-Request-ID`), a time within 30 seconds of the action, and no field outside the allow-list.
+- **Run by hand:** `pytest -m audit_capture` inside `backend/`.
+- **The workflow.** `.github/workflows/audit-capture.yml` runs them at 00:00 UTC on the 1st of every month. To run it by hand, open the repository's **Actions** tab, choose **Audit capture**, then **Run workflow** (`workflow_dispatch`).
+- **Default branch only.** GitHub runs scheduled workflows only on the repository's default branch, so the monthly run starts once this file is on `main`.
+- **Before each release** they run too ([docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md)).
+
+Run all the SR-16 tests, inside `backend/` with PostgreSQL running:
+
+```
+pytest tests/test_sr16_audit.py -v
+```
+
+**SR-16 assumptions:**
+- **One database.** The audit log is in the same database as the application. Its integrity comes from the hash chain, the append-only trigger, and signed checkpoints kept in separate storage (`CHECKPOINT_DIR`).
+- **Who acted, never what was voted.** The actor's account id is recorded for accountability, but never together with a ballot, token or receipt. Ballot-box entries name no elector.
+- **One clock.** Event times come from the server's clock, which is assumed to be synchronised.
+- **Retention.** The retention period comes from the electoral rules. The prototype never deletes audit records; only the development reset (`seed --reset`) empties the table.
+- **Owners can bypass triggers.** A database owner can disable them; the checkpoints catch that.
+- **Less detail in some entries.** Only the allow-listed fields survive:
+  - registration entries keep no roll entry id;
+  - the roll check keeps the failed count but not the total;
+  - `STAFF_CREATED` names the new account as its actor, because only the create_staff script makes staff accounts and it has no account of its own.
+
+**SR-16 design only, not implemented:**
+- a separate audit service on its own infrastructure;
+- local buffering with delivery retries, and an alert after 30 seconds of undelivered events;
+- write-once or off-host log storage;
+- forwarding to a SIEM;
+- least-privilege database roles;
+- destruction at the end of the retention period.
 
 ## Folder layout
 

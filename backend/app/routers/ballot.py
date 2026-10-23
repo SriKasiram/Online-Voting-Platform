@@ -52,7 +52,9 @@ from app.models import (
     VoterParticipation,
 )
 from app.schemas import BallotOut, CandidateOut, SubmitIn, SubmitOut
-from app.security import audit, hash_token, new_token, utc_now
+# SR-16: the outcome of each event, and the account's id and role as the actor
+from app.audit_events import DENIED, FAILURE, REJECTED, SUCCESS
+from app.security import account_actor, audit, hash_token, new_token, utc_now
 
 router = APIRouter(prefix="/ballot", tags=["ballot"])
 
@@ -89,7 +91,7 @@ def definition_entry(db: Session, voter: Account, election: Election, division_i
     entry, reason = verified_division(db, election, division_id)
     if entry is None:
         db.rollback()
-        log(db, "BALLOT_DEFINITION_INVALID", voter, reason=reason)
+        log(db, "BALLOT_DEFINITION_INVALID", voter, FAILURE, reason=reason)
         db.commit()
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "ballot_unavailable")
     return entry
@@ -120,15 +122,17 @@ def token_hash(token: str) -> str:
     return hash_token(token).hex()
 
 
-def log(db: Session, event_type: str, voter: Account, **details: str) -> None:
+def log(db: Session, event_type: str, voter: Account, outcome: str, reason: str | None = None) -> None:
     # SR-03: names the account and the event only, never a token, reference or ballot content
-    audit(db, event_type, actor=f"account:{voter.id}", **details)
+    # SR-16: the allow-listed fields only, so a token or ballot value cannot be passed even by mistake
+    actor, role = account_actor(voter)
+    audit(db, event_type, outcome=outcome, actor=actor, role=role, reason=reason)
 
 
 def reject(db: Session, voter: Account, reason: str, status_code: int, detail: str) -> NoReturn:
     # SR-03: undoes everything and releases the row locks, then records why. The answer stays generic.
     db.rollback()
-    log(db, "BALLOT_TOKEN_REJECTED", voter, reason=reason)
+    log(db, "BALLOT_TOKEN_REJECTED", voter, REJECTED, reason=reason)
     db.commit()
     raise HTTPException(status_code, detail)
 
@@ -159,7 +163,7 @@ def replay(db: Session, voter: Account, presented_token: str, stored_hash: str |
     db.rollback()
     # SR-04: except that a safe retry also ends the session soon, as acceptance did
     end_session_soon(db, session_hash)
-    log(db, "BALLOT_REPLAY_BLOCKED", voter)
+    log(db, "BALLOT_REPLAY_BLOCKED", voter, DENIED)
     db.commit()
     return SubmitOut(receipt_id=reference)
 
@@ -199,7 +203,8 @@ def get_ballot(voter: CurrentElector, db: DbSession) -> BallotOut:
         ],
     )
     db.add(BallotToken(election_id=election.id, token_hash=token_hash(token)))
-    log(db, "BALLOT_TOKEN_ISSUED", voter)
+    # SR-16: in the same transaction as the token, so a token never exists without its entry
+    log(db, "BALLOT_TOKEN_ISSUED", voter, SUCCESS)
     db.commit()
     return ballot
 
@@ -270,7 +275,7 @@ def accept_ballot(body: SubmitIn, voter: Account, session: AuthSession, db: Sess
     if verdict.outcome == "invalid":
         # Possible tampering: audited, without saying which candidate or rule
         db.rollback()
-        log(db, "BALLOT_REJECTED_INVALID", voter)
+        log(db, "BALLOT_REJECTED_INVALID", voter, REJECTED)
         db.commit()
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, "invalid_ballot")
     if verdict.outcome == "informal":
@@ -315,7 +320,8 @@ def accept_ballot(body: SubmitIn, voter: Account, session: AuthSession, db: Sess
         )
         # SR-04: in the same transaction, the session now ends within POST_BALLOT_SESSION_SECONDS
         end_session_soon(db, session_hash)
-        log(db, "BALLOT_ACCEPTED", voter)
+        # SR-16: in the accept transaction: if the entry cannot be written, nothing is accepted
+        log(db, "BALLOT_ACCEPTED", voter, SUCCESS)
         db.commit()
     except SQLAlchemyError as problem:
         if timed_out(problem):

@@ -20,6 +20,7 @@ from app.config import PROJECT_DIR, settings
 from app.deps import DbSession, get_db
 from app.models import Division
 from app.rbac import check_admin_routes
+from app.request_id import assign_request_id
 from app.roll_signing import check_roll_at_startup
 from app.routers import admin, auth, ballot, register
 from app.schemas import DivisionOut
@@ -56,6 +57,12 @@ async def validation_failed(request: Request, exc: RequestValidationError) -> Re
         errors = [{key: error[key] for key in ("type", "loc", "msg") if key in error} for error in exc.errors()]
         return JSONResponse({"detail": jsonable_encoder(errors)}, status_code=422)
     return await request_validation_exception_handler(request, exc)
+
+
+# SR-16: declared first, so it is the innermost middleware: tls_required still refuses plaintext
+# before anything runs, and no_store and HSTS still apply to every response it passes back.
+# Every request handled here gets a fresh request id for its audit entries and X-Request-ID.
+app.middleware("http")(assign_request_id)
 
 
 @app.middleware("http")

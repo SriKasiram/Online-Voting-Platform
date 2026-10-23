@@ -17,7 +17,8 @@ from sqlalchemy import text
 from app.ballot_chain import CHECK_GROUPS, checkpoint_file, load_checkpoint_public_key, verify_chain
 from app.config import settings
 from app.db import SessionLocal
-from app.security import audit
+# SR-16: the same failure entries as the seal script, one per reason code
+from scripts.seal_ballots import record_failure
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -41,8 +42,7 @@ def main(argv: list[str] | None = None) -> int:
         ).one()
         if reasons:
             # SR-13: tampering is a security event: the reason codes are audited, nothing else
-            audit(db, "BALLOT_CHAIN_VERIFY_FAILED", actor="script", reason=",".join(reasons))
-            db.commit()
+            record_failure(db, reasons)
     failed = 0
     for group, codes in CHECK_GROUPS.items():
         found = [code for code in reasons if code in codes]

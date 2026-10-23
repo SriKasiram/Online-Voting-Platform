@@ -14,6 +14,7 @@ from fastapi import APIRouter, HTTPException, Request, Response, status
 from sqlalchemy import case, delete, or_, select, update
 from sqlalchemy.orm import Session
 
+from app.audit_events import DENIED, FAILURE, SUCCESS
 from app.config import settings
 from app.deps import DbSession
 from app.models import Account, AccountRole, AuthSession, ElectoralRollEntry, SessionStage
@@ -21,6 +22,7 @@ from app.schemas import LoginIn, StaffVerifyOut, VerifyIn, VerifyOut
 from app.security import (
     SESSION_COOKIE,
     SESSION_PATH,
+    actor_for,
     audit,
     clear_cookie,
     decrypt_or_none,
@@ -50,10 +52,12 @@ def rejected() -> HTTPException:
     return HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid_credentials")
 
 
-def log(db: Session, event_type: str, account_id: UUID | None, **details: str) -> None:
+def log(db: Session, event_type: str, account_id: UUID | None, outcome: str, reason: str | None = None) -> None:
     # SR-01: an audit entry names the account (or "unknown") and the event, never anything typed
-    # SR-04: `details` added for a short reason code
-    audit(db, event_type, actor=f"account:{account_id}" if account_id else "unknown", **details)
+    # SR-04: and a short reason code
+    # SR-16: plus the outcome and the account's role, read from the database, never from the request
+    actor, role = actor_for(db, account_id)
+    audit(db, event_type, outcome=outcome, actor=actor, role=role, reason=reason)
 
 
 def check_ip_limit(request: Request, db: Session) -> None:
@@ -61,7 +65,7 @@ def check_ip_limit(request: Request, db: Session) -> None:
     # never X-Forwarded-For, which any client can set.
     ip = request.client.host if request.client else "unknown"
     if not rate_limiter.allow(f"auth-ip:{ip}", settings.rate_limit_attempts, settings.rate_limit_window_seconds):
-        log(db, "auth_rate_limited", None)
+        log(db, "auth_rate_limited", None, DENIED)
         db.commit()
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "too_many_requests")
 
@@ -89,7 +93,7 @@ def record_failure(db: Session, account_id: UUID, event_type: str) -> None:
         .returning(Account.locked_until)
         .execution_options(synchronize_session=False)
     ).scalar()
-    log(db, event_type, account_id)
+    log(db, event_type, account_id, FAILURE)
     if locked_until is not None:
         # A sign in waiting for its code cannot finish once the account is locked
         db.execute(
@@ -97,7 +101,7 @@ def record_failure(db: Session, account_id: UUID, event_type: str) -> None:
                 AuthSession.account_id == account_id, AuthSession.stage == SessionStage.MFA_PENDING
             )
         )
-        log(db, "auth_account_locked", account_id)
+        log(db, "auth_account_locked", account_id, DENIED)
     db.commit()
 
 
@@ -132,7 +136,7 @@ def login(body: LoginIn, request: Request, response: Response, db: DbSession) ->
     if account is None or (account.locked_until is not None and account.locked_until > utc_now()):
         # SR-01: the same Argon2id work as a real check, so the response time reveals neither case
         verify_password(None, body.password)
-        log(db, "auth_password_failed", account.id if account else None)
+        log(db, "auth_password_failed", account.id if account else None, FAILURE)
         db.commit()
         raise rejected()
     if not verify_password(account.password_hash, body.password):
@@ -154,7 +158,7 @@ def verify(body: VerifyIn, request: Request, response: Response, db: DbSession) 
     token = request.cookies.get(SESSION_COOKIE)
     pending = db.get(AuthSession, hash_token(token)) if token else None
     if pending is None or pending.stage != SessionStage.MFA_PENDING or pending.expires_at <= now:
-        log(db, "auth_totp_failed", None)
+        log(db, "auth_totp_failed", None, FAILURE)
         db.commit()
         raise rejected()
     account = db.get_one(Account, pending.account_id)
@@ -193,10 +197,11 @@ def verify(body: VerifyIn, request: Request, response: Response, db: DbSession) 
         record_failure(db, account_id, "auth_totp_failed")
         raise rejected()
 
-    log(db, "auth_login_success", account_id)
+    # SR-16: in the same transaction as the new session (start_session commits both)
+    log(db, "auth_login_success", account_id, SUCCESS)
     if privileged:
         # SR-06: an extra event, so privileged sign ins are easy to review
-        log(db, "AUTH_PRIVILEGED_LOGIN_SUCCESS", account_id)
+        log(db, "AUTH_PRIVILEGED_LOGIN_SUCCESS", account_id, SUCCESS)
     # SR-06: a privileged session starts with its extensions used up: 10 minutes, fixed, then sign in again
     start_session(
         db,
@@ -250,13 +255,13 @@ def extend(request: Request, response: Response, db: DbSession) -> None:
         current = db.get(AuthSession, hash_token(old)) if old else None
         if current is not None and current.stage == SessionStage.AUTHENTICATED:
             limit = current.expires_at > now
-            log(db, "SESSION_EXTENSION_REFUSED", current.account_id, reason="limit" if limit else "expired")
+            log(db, "SESSION_EXTENSION_REFUSED", current.account_id, DENIED, reason="limit" if limit else "expired")
             db.commit()
             if limit:
                 raise HTTPException(status.HTTP_409_CONFLICT, "extension_limit")
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "not_signed_in")
 
-    log(db, "SESSION_EXTENDED", rotated.account_id)
+    log(db, "SESSION_EXTENDED", rotated.account_id, SUCCESS)
     db.commit()
     set_cookie(response, SESSION_COOKIE, token, SESSION_PATH, secure=settings.cookie_secure)
 

@@ -14,6 +14,7 @@ skipped or repeated: each one needs the session at the stage it expects.
 """
 
 import re
+import uuid
 from datetime import timedelta
 
 from fastapi import APIRouter, HTTPException, Request, Response, status
@@ -22,12 +23,15 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app import config
+# SR-16: registration events have no account yet ("unknown"), until the account is created
+from app.audit_events import FAILURE, SUCCESS, UNKNOWN
 from app.deps import DbSession
 from app.models import Account, AccountRole, ElectoralRollEntry, RegistrationSession, RegistrationStage
 from app.schemas import RegisterAccountIn, RegisterAccountOut, RegisterConfirmIn, RegisterVerifyIn
 from app.security import (
     REGISTRATION_COOKIE,
     REGISTRATION_PATH,
+    account_actor,
     audit,
     clear_cookie,
     decrypt,
@@ -72,7 +76,8 @@ def current_registration(request: Request, db: Session, stage: RegistrationStage
 
 def end_registration(db: Session, registration: RegistrationSession, reason: str) -> None:
     db.delete(registration)
-    audit(db, "REGISTRATION_FAILED", actor=f"roll:{registration.roll_id}", step="confirm", reason=reason)
+    # SR-16: "unknown": no account exists yet, and a roll entry id is not an allowed actor
+    audit(db, "REGISTRATION_FAILED", outcome=FAILURE, actor=UNKNOWN, role=UNKNOWN, reason=reason)
     db.commit()
 
 
@@ -114,7 +119,8 @@ def verify(body: RegisterVerifyIn, request: Request, response: Response, db: DbS
         if allowed and entry is not None and stored_hash is not None and not code_matches:
             # Counts toward locking this entry's code
             entry.code_attempts += 1
-        audit(db, "REGISTRATION_FAILED", actor=ip, step="verify")
+        # SR-16: never the client IP: an IP address is not an allowed audit value
+        audit(db, "REGISTRATION_FAILED", outcome=FAILURE, actor=UNKNOWN, role=UNKNOWN, reason="details_not_verified")
         db.commit()
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "registration_failed")
 
@@ -130,7 +136,7 @@ def verify(body: RegisterVerifyIn, request: Request, response: Response, db: DbS
             expires_at=now + timedelta(minutes=config.REGISTRATION_SESSION_MINUTES),
         )
     )
-    audit(db, "REGISTRATION_STARTED", actor=f"roll:{entry.id}")
+    audit(db, "REGISTRATION_STARTED", outcome=SUCCESS, actor=UNKNOWN, role=UNKNOWN)
     db.commit()
     set_cookie(
         response, REGISTRATION_COOKIE, token, REGISTRATION_PATH, max_age=config.REGISTRATION_SESSION_MINUTES * 60
@@ -184,7 +190,7 @@ def confirm(body: RegisterConfirmIn, request: Request, response: Response, db: D
         if registration.attempts >= config.REGISTRATION_CODE_MAX_ATTEMPTS:
             end_registration(db, registration, "too_many_attempts")
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "too_many_attempts")
-        audit(db, "REGISTRATION_FAILED", actor=f"roll:{roll_id}", step="confirm", reason="wrong_code")
+        audit(db, "REGISTRATION_FAILED", outcome=FAILURE, actor=UNKNOWN, role=UNKNOWN, reason="wrong_code")
         db.commit()
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "wrong_code")
 
@@ -202,18 +208,22 @@ def confirm(body: RegisterConfirmIn, request: Request, response: Response, db: D
         end_registration(db, db.get_one(RegistrationSession, id_hash), "already_registered")
         raise HTTPException(status.HTTP_409_CONFLICT, "already_registered")
 
-    db.add(
-        Account(
-            username=registration.username,
-            password_hash=registration.password_hash,
-            role=AccountRole.ELECTOR,  # SR-05: the role member was renamed; registration only ever makes electors
-            roll_id=roll_id,
-            totp_secret_enc=encrypt(secret, "accounts.totp_secret"),
-        )
+    # SR-16: the id is chosen here, so the completion entry can name the new account
+    account = Account(
+        id=uuid.uuid4(),
+        username=registration.username,
+        password_hash=registration.password_hash,
+        role=AccountRole.ELECTOR,  # SR-05: the role member was renamed; registration only ever makes electors
+        roll_id=roll_id,
+        totp_secret_enc=encrypt(secret, "accounts.totp_secret"),
     )
+    db.add(account)
     db.delete(registration)
-    audit(db, "REGISTRATION_COMPLETED", actor=f"roll:{roll_id}")
+    actor, role = account_actor(account)
     try:
+        # SR-16: inside the try, because writing the entry flushes the account insert, and a
+        # username taken meanwhile must get the same answer as at the commit
+        audit(db, "REGISTRATION_COMPLETED", outcome=SUCCESS, actor=actor, role=role)
         db.commit()
     except IntegrityError as error:
         db.rollback()

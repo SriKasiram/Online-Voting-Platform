@@ -4,7 +4,6 @@ a code from the authenticator app (TOTP), and gives a 10-minute session that
 cannot be extended. Elector sign in is unchanged.
 """
 
-import json
 import uuid
 from datetime import timedelta
 
@@ -183,9 +182,10 @@ def test_staff_account_cannot_exist_without_a_code_secret(db_session: Session, m
 
 
 def test_staff_sign_in_audit_holds_no_codes_or_secrets(
-    client: TestClient, db_session: Session, make_staff, clock
+    client: TestClient, db_session: Session, make_staff, clock, audit_text
 ) -> None:
-    """SR-06 test 7: failures and the privileged success are audited by account and event only."""
+    """SR-06 test 7: failures and the privileged success are audited by account and event only.
+    SR-16: STAFF_CREATED now names the new account (it was "system"), and every column is searched."""
     before = last_id(db_session)
     staff = make_staff("polling_official")
     bad, good = wrong_code(staff, clock), code_at(staff, clock)
@@ -199,7 +199,9 @@ def test_staff_sign_in_audit_holds_no_codes_or_secrets(
     assert {"auth_password_failed", "auth_totp_failed", "auth_login_success", "AUTH_PRIVILEGED_LOGIN_SUCCESS"} <= {
         r.event_type for r in rows
     }
-    assert {r.actor for r in rows} == {"system", f"account:{staff.account_id}"}  # system: STAFF_CREATED
-    recorded = json.dumps([[r.event_type, r.details] for r in rows])
+    assert {r.actor for r in rows} == {f"account:{staff.account_id}"}
+    assert {r.role for r in rows} == {"polling_official"}
+    assert {r.category for r in rows if r.event_type == "AUTH_PRIVILEGED_LOGIN_SUCCESS"} == {"privileged_access"}
+    recorded = audit_text(before)
     secrets = [staff.password, WRONG_PASSWORD, staff.totp_secret, bad, good, client.cookies[SESSION_COOKIE]]
     assert [s for s in secrets if s in recorded] == []

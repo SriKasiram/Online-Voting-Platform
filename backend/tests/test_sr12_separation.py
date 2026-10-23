@@ -22,7 +22,7 @@ from app.ballot_crypto import ballot_payload, encrypt_ballot
 from app.config import settings
 from app.db import Base
 from app.models import Account, AuditLogEntry
-from app.security import SESSION_COOKIE, audit, hash_token
+from app.security import SESSION_COOKIE, hash_token
 from app.stores import BALLOT_TABLES, IDENTITY_TABLES, ballot_rows
 from scripts import audit_separation
 from scripts.audit_separation import (
@@ -157,7 +157,8 @@ def test_logs_during_issue_and_submit_name_no_ballot(
 def test_ballot_audit_events_hold_only_the_event_and_the_elector(
     client: TestClient, db_session: Session, make_voter, sign_in
 ) -> None:
-    """SR-12 test 6: BALLOT_TOKEN_ISSUED and BALLOT_ACCEPTED record the event type and the elector, and nothing else."""
+    """SR-12 test 6: BALLOT_TOKEN_ISSUED and BALLOT_ACCEPTED record the event type and the elector, and nothing else.
+    SR-16: nothing else beyond the allow-listed outcome, role and request id."""
     vote = cast(client, make_voter, sign_in)
 
     events = db_session.scalars(
@@ -165,7 +166,8 @@ def test_ballot_audit_events_hold_only_the_event_and_the_elector(
     ).all()
 
     assert sorted(e.event_type for e in events) == ["BALLOT_ACCEPTED", "BALLOT_TOKEN_ISSUED"]
-    assert all((e.actor, e.details) == (f"account:{vote['voter'].account_id}", {}) for e in events)
+    expected = (f"account:{vote['voter'].account_id}", "elector", "success", None, None, None, None)
+    assert all((e.actor, e.role, e.outcome, e.reason, e.batch_no, e.count, e.details) == expected for e in events)
 
 
 # ---------------------------------------------------------------
@@ -265,9 +267,10 @@ def test_audit_fails_on_a_foreign_key_or_a_table_with_no_side(db_session: Sessio
 
 @pytest.mark.parametrize("planted", ["token hash", "ballot id", "receipt"])
 def test_audit_fails_on_a_ballot_identifier_planted_in_the_audit_log(
-    client: TestClient, db_session: Session, make_voter, sign_in, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys, planted: str
+    client: TestClient, db_session: Session, make_voter, sign_in, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys, planted: str, plant_audit_text
 ) -> None:
-    """SR-12 test 12: a token hash, ballot id or receipt written into the audit log fails checks c and d, and the script exits 1."""
+    """SR-12 test 12: a token hash, ballot id or receipt written into the audit log fails checks c and d, and the script exits 1.
+    SR-16: the writer refuses such values, so the planted row goes in directly."""
     vote = cast(client, make_voter, sign_in)
     token_hash = hash_token(vote["token"]).hex()
     value = {
@@ -275,7 +278,7 @@ def test_audit_fails_on_a_ballot_identifier_planted_in_the_audit_log(
         "ballot id": str(db_session.scalar(text("SELECT id FROM ballots"))),
         "receipt": vote["receipt"],
     }[planted]
-    audit(db_session, "TEST_EVENT", actor="unknown", note=value)
+    plant_audit_text(value)
     identifiers = ballot_identifiers(db_session)
 
     assert check_identity_tables(db_session, identifiers).reason == "ballot identifiers found in: audit_log (1)"

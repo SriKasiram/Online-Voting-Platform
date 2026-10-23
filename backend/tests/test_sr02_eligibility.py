@@ -93,7 +93,8 @@ def denials(db_session: Session) -> list[str]:
     rows = db_session.scalars(
         select(AuditLogEntry).where(AuditLogEntry.event_type == "ELIGIBILITY_DENIED").order_by(AuditLogEntry.id)
     )
-    return [row.details["reason"] for row in rows]
+    # SR-16: the reason is a structured field now
+    return [row.reason for row in rows]
 
 
 def last_audit(db_session: Session) -> AuditLogEntry:
@@ -249,7 +250,13 @@ def test_division_changed_after_signing_fails_the_signature(
 
     assert outcome(ballot_for(client, voter, clock)) == NOT_ENROLLED
     entry = db_session.scalars(select(AuditLogEntry).where(AuditLogEntry.event_type == "ELIGIBILITY_DENIED")).one()
-    assert (entry.actor, entry.details) == (f"account:{voter.account_id}", {"reason": "bad_signature"})
+    # SR-16: the reason, outcome and role as structured fields
+    assert (entry.actor, entry.role, entry.outcome, entry.reason) == (
+        f"account:{voter.account_id}",
+        "elector",
+        "denied",
+        "bad_signature",
+    )
 
 
 @pytest.mark.parametrize("field", ["date_of_birth", "enrolled"])
@@ -321,7 +328,8 @@ def test_signed_message_holds_only_the_eligibility_fields(db_session: Session, m
 
 
 def test_startup_refuses_a_tampered_record(client: TestClient, db_session: Session, election, make_voter) -> None:
-    """SR-02 test 13: one record changed without the key: the API refuses to start and audits it."""
+    """SR-02 test 13: one record changed without the key: the API refuses to start and audits it.
+    SR-16: the failed count is the count field and the cause a reason code (the total is not recorded)."""
     make_voter()
     voter = make_voter()
     tamper(db_session, roll_of(db_session, voter), division_id=election.divisions["Southvale"].id)
@@ -330,7 +338,14 @@ def test_startup_refuses_a_tampered_record(client: TestClient, db_session: Sessi
         start_api()
 
     entry = last_audit(db_session)
-    assert (entry.event_type, entry.actor, entry.details) == ("ROLL_VERIFICATION_FAILED", "unknown", {"records": 2, "failed": 1})
+    assert (entry.event_type, entry.actor, entry.category, entry.outcome, entry.count, entry.reason) == (
+        "ROLL_VERIFICATION_FAILED",
+        "unknown",
+        "configuration",
+        "failure",
+        1,
+        "bad_signature",
+    )
 
 
 @pytest.mark.parametrize("signature", ["none", "another key"])
@@ -349,27 +364,29 @@ def test_startup_refuses_a_record_added_without_the_key(
 
 
 def test_startup_with_a_valid_roll_starts_and_audits(client: TestClient, db_session: Session, make_voter) -> None:
-    """SR-02 test 15: every record checks out: the API starts and records ROLL_VERIFIED with counts only."""
+    """SR-02 test 15: every record checks out: the API starts and records ROLL_VERIFIED with counts only.
+    SR-16: the record count is the count field."""
     make_voter()
     make_voter()
 
     start_api()
 
     entry = last_audit(db_session)
-    assert (entry.event_type, entry.actor, entry.details) == ("ROLL_VERIFIED", "unknown", {"records": 2})
+    assert (entry.event_type, entry.actor, entry.outcome, entry.count, entry.reason) == ("ROLL_VERIFIED", "unknown", "success", 2, None)
 
 
 def test_startup_refuses_without_the_public_key(
     client: TestClient, db_session: Session, make_voter, monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
-    """SR-02: no public key means nothing can be verified, so the API does not start."""
+    """SR-02: no public key means nothing can be verified, so the API does not start. SR-16: the reason says why."""
     make_voter()
     monkeypatch.setattr(settings, "roll_public_key_path", tmp_path / "missing.pem")
 
     with pytest.raises(RuntimeError):
         start_api()
 
-    assert last_audit(db_session).details == {"records": 1, "failed": 1}
+    entry = last_audit(db_session)
+    assert (entry.count, entry.reason) == (1, "public_key_missing")
 
 
 # ---------------------------------------------------------------

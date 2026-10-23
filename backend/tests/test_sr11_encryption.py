@@ -29,7 +29,6 @@ from app.ballot_crypto import (
 )
 from app.config import settings
 from app.main import app
-from app.security import audit
 from scripts import audit_ballots
 from scripts.gen_ballot_key import generate_ballot_key
 
@@ -213,12 +212,13 @@ def test_submitted_ballot_is_stored_encrypted(
 def test_no_ballot_content_in_audit_log_or_logs(
     client: TestClient, db_session: Session, election, make_voter, sign_in, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """SR-11 test 11: after a submission neither the audit log nor any log line holds the ballot."""
+    """SR-11 test 11: after a submission neither the audit log nor any log line holds the ballot.
+    SR-16: every column of the audit rows is read, not the old details column."""
     caplog.set_level(logging.DEBUG)
     ranking = cast_ballot(client, make_voter, sign_in)
 
     audit_text = " ".join(
-        db_session.scalars(text("SELECT event_type || ' ' || actor || ' ' || details::text FROM audit_log")).all()
+        db_session.scalars(text("SELECT row_to_json(entry)::text FROM audit_log AS entry")).all()
     )
     assert "BALLOT_ACCEPTED" in audit_text
     for readable in readable_forms(ranking, election.divisions["Northgate"].id):
@@ -319,15 +319,16 @@ def test_audit_fails_on_a_legacy_plaintext_column(db_session: Session) -> None:
     assert audit_ballots.check_ballot_columns(db_session).status == "PASS"
 
 
-def test_audit_fails_when_a_log_names_a_ballot_field(db_session: Session, tmp_path: Path) -> None:
-    """SR-11 test 17: a ballot field name in the audit log, or in a log file, fails check e."""
+def test_audit_fails_when_a_log_names_a_ballot_field(db_session: Session, tmp_path: Path, plant_audit_text) -> None:
+    """SR-11 test 17: a ballot field name in the audit log, or in a log file, fails check e.
+    SR-16: the writer refuses free text, so the field name is planted directly in the table."""
     assert audit_ballots.check_logs(db_session, tmp_path).status == "PASS"
 
     (tmp_path / "api.log").write_text(f"request body: {{'{RANKING_FIELD}': [3, 1, 2]}}", encoding="utf-8")
     assert audit_ballots.check_logs(db_session, tmp_path).status == "FAIL"
 
     (tmp_path / "api.log").unlink()
-    audit(db_session, "TEST_EVENT", actor="unknown", note=DIVISION_FIELD)
+    plant_audit_text(DIVISION_FIELD)
     assert audit_ballots.check_logs(db_session, tmp_path).status == "FAIL"
 
 

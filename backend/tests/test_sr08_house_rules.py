@@ -187,7 +187,8 @@ def test_a_used_token_is_answered_before_any_rule_is_checked(
 def test_invalid_requests_are_audited_and_informal_ones_are_not(
     client: TestClient, db_session: Session, northgate, make_voter, sign_in
 ) -> None:
-    """SR-08 test 8: BALLOT_REJECTED_INVALID for an invalid request; nothing at all for an informal one."""
+    """SR-08 test 8: BALLOT_REJECTED_INVALID for an invalid request; nothing at all for an informal one.
+    SR-16: the outcome is a structured field, and there is no reason saying which candidate or rule."""
     ballot, voter = open_ballot(client, make_voter, sign_in)
     before = db_session.scalar(select(func.coalesce(func.max(AuditLogEntry.id), 0)))
 
@@ -197,6 +198,6 @@ def test_invalid_requests_are_audited_and_informal_ones_are_not(
 
     submit(client, ballot, [northgate[0], northgate[0]])
     rows = db_session.scalars(select(AuditLogEntry).where(AuditLogEntry.id > before)).all()
-    assert [(r.event_type, r.actor, r.details) for r in rows] == [
-        ("BALLOT_REJECTED_INVALID", f"account:{voter.account_id}", {})
+    assert [(r.event_type, r.actor, r.outcome, r.reason, r.details) for r in rows] == [
+        ("BALLOT_REJECTED_INVALID", f"account:{voter.account_id}", "rejected", None, None)
     ]

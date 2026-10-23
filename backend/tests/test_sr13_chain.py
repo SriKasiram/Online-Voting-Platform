@@ -33,7 +33,6 @@ from app.ballot_definitions import canonical
 from app.config import settings
 from app.main import app
 from app.models import AuditLogEntry, BallotChainEntry
-from app.security import audit
 from scripts import audit_ballots, audit_separation, seal_ballots
 from scripts import verify_chain as verify_script
 from scripts.gen_checkpoint_key import generate_checkpoint_keys
@@ -104,7 +103,8 @@ def triggers_off(db: Session, *tables: str) -> Iterator[None]:
 
 
 def test_clean_chain_over_three_batches_verifies(db_session: Session, election_id: uuid.UUID, keys: Keys) -> None:
-    """SR-13 test 1: three sealed batches verify, link by link, with one signed checkpoint each."""
+    """SR-13 test 1: three sealed batches verify, link by link, with one signed checkpoint each.
+    SR-16: each seal's entry holds the batch number and count as structured fields, nothing else."""
     three_batches(db_session, election_id, keys)
 
     entries = chain(db_session, election_id)
@@ -116,7 +116,9 @@ def test_clean_chain_over_three_batches_verifies(db_session: Session, election_i
     assert [(c["batch_no"], c["entry_count"], c["final"]) for c in lines] == [(1, 10, False), (2, 20, False), (3, 30, True)]
     assert lines[-1]["head_hash"] == entries[-1].entry_hash
     sealed = db_session.scalars(select(AuditLogEntry).where(AuditLogEntry.event_type == "BALLOT_BATCH_SEALED")).all()
-    assert [(e.actor, e.details) for e in sealed] == [("script", {"batch": n, "count": 10}) for n in (1, 2, 3)]
+    assert [(e.actor, e.category, e.batch_no, e.count, e.reason, e.details) for e in sealed] == [
+        ("script", "ballot_box", n, 10, None, None) for n in (1, 2, 3)
+    ]
 
 
 def test_chain_order_follows_ballot_id_not_arrival(db_session: Session, election_id: uuid.UUID, keys: Keys) -> None:
@@ -372,7 +374,8 @@ def test_seal_refuses_when_the_checkpoint_cannot_be_written(
 
 
 def test_seal_refuses_to_extend_a_chain_that_fails(db_session: Session, election_id: uuid.UUID, keys: Keys) -> None:
-    """SR-13 test 13: no new checkpoint is ever signed over a tampered chain, and the failure is audited by reason only."""
+    """SR-13 test 13: no new checkpoint is ever signed over a tampered chain, and the failure is audited by reason only.
+    SR-16: one entry per reason code, since a reason is a single catalogued code."""
     add_ballots(db_session, election_id, 10)
     seal(db_session, election_id, keys)
     with triggers_off(db_session, "ballot_chain"):
@@ -382,8 +385,13 @@ def test_seal_refuses_to_extend_a_chain_that_fails(db_session: Session, election
     with pytest.raises(SealRefused, match="does not verify"):
         seal(db_session, election_id, keys)
 
-    failure = db_session.scalars(select(AuditLogEntry).where(AuditLogEntry.event_type == "BALLOT_CHAIN_VERIFY_FAILED")).one()
-    assert (failure.actor, failure.details) == ("script", {"reason": "bad_entry_hash,broken_link"})
+    failures = db_session.scalars(
+        select(AuditLogEntry).where(AuditLogEntry.event_type == "BALLOT_CHAIN_VERIFY_FAILED").order_by(AuditLogEntry.id)
+    ).all()
+    assert [(f.actor, f.outcome, f.reason, f.batch_no, f.count) for f in failures] == [
+        ("script", "failure", "bad_entry_hash", None, None),
+        ("script", "failure", "broken_link", None, None),
+    ]
     assert len(chain(db_session, election_id)) == 10
 
 
@@ -435,9 +443,10 @@ def test_api_starts_without_checkpoint_keys(client: TestClient, tmp_path: Path, 
 
 
 def test_sr11_and_sr12_audits_still_pass_with_the_chain(
-    client: TestClient, db_session: Session, election_id: uuid.UUID, keys: Keys, make_voter, sign_in, tmp_path: Path
+    client: TestClient, db_session: Session, election_id: uuid.UUID, keys: Keys, make_voter, sign_in, tmp_path: Path, plant_audit_text
 ) -> None:
-    """SR-13 test 17: a real vote, sealed: both earlier audits pass, and a chain hash on the identity side fails SR-12."""
+    """SR-13 test 17: a real vote, sealed: both earlier audits pass, and a chain hash on the identity side fails SR-12.
+    SR-16: the writer refuses a hash, so it is planted in the table directly."""
     sign_in(make_voter())
     paper = client.get("/api/ballot").json()
     ranking = [c["id"] for c in paper["candidates"]]
@@ -448,7 +457,7 @@ def test_sr11_and_sr12_audits_still_pass_with_the_chain(
     storage = audit_ballots.run_audit(db_session, tmp_path)
     assert {c.status for c in separation} <= {"PASS", "SKIPPED"} and {c.status for c in storage} <= {"PASS", "SKIPPED"}
 
-    audit(db_session, "TEST_EVENT", actor="unknown", note=chain(db_session, election_id)[0].entry_hash)
+    plant_audit_text(chain(db_session, election_id)[0].entry_hash)
     identifiers = audit_separation.ballot_identifiers(db_session)
     assert audit_separation.check_identity_tables(db_session, identifiers).status == "FAIL"
 
