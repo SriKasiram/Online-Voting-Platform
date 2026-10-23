@@ -78,6 +78,11 @@ class Settings(BaseSettings):
     # scans this folder, and any *.log file in the project, for ballot identifiers.
     log_dir: Path = PROJECT_DIR / "logs"
 
+    # SR-14: every lock wait and statement in the accept transaction stops after this many seconds,
+    # with a try_again answer, so a confirmation or a refusal always comes within 10 seconds.
+    # Capped at 9 so a setting can never break that promise.
+    accept_timeout_seconds: int = Field(default=8, ge=1, le=9)
+
     # SR-13: the ballot hash chain. A batch smaller than this is sealed only with --final, so a batch
     # never narrows down which ballots arrived together.
     min_seal_batch: int = 10

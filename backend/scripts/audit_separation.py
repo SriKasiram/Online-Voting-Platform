@@ -11,6 +11,7 @@ ballot, a full token hash, a receipt or anything about an elector.
 """
 
 import argparse
+import hashlib
 import os
 import re
 import sys
@@ -23,7 +24,6 @@ from sqlalchemy.orm import Session
 
 from app.config import PROJECT_DIR, settings
 from app.db import SessionLocal
-from app.routers.ballot import RECEIPT_ALPHABET
 from app.stores import BALLOT_TABLES, IDENTITY_TABLES, NOT_APPLICATION_DATA
 
 Status = Literal["PASS", "FAIL", "SKIPPED"]
@@ -34,10 +34,12 @@ HEX64 = re.compile(r"(?<![0-9A-Fa-f])[0-9A-Fa-f]{64}(?![0-9A-Fa-f])")  # token h
 UUID_PATTERN = re.compile(
     r"(?<![0-9A-Fa-f])[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}(?![0-9A-Fa-f])"
 )  # ballot and token ids
-RECEIPT_PATTERN = re.compile(rf"(?<![A-Z0-9])[{RECEIPT_ALPHABET}]{{4}}-[{RECEIPT_ALPHABET}]{{4}}(?![A-Z0-9])")  # receipts
+# SR-14: receipt references (128 bits, 32 hex). The server keeps only their SHA-256, so a reference
+# found in text is looked up by its hash: a leaked reference is caught, not just a leaked hash.
+HEX32 = re.compile(r"(?<![0-9A-Fa-f])[0-9A-Fa-f]{32}(?![0-9A-Fa-f])")
 
 # SR-12: column names a ballot-side table may not have. "ip" counts only as a whole word of the name
-# (ip, client_ip, ip_address), so that receipt_reference is not a false match.
+# (ip, client_ip, ip_address), so that receipt_hash (SR-14) is not a false match.
 FORBIDDEN_NAME_PARTS = ("elector", "roll", "user", "session", "agent")
 TIME_TYPES = {"timestamp without time zone", "timestamp with time zone", "time without time zone", "time with time zone"}
 # SR-13: an order number on the ballot side could replay the order ballots arrived in, so a column
@@ -70,17 +72,21 @@ def identifiers_in(content: str) -> set[str]:
     """SR-12: every string in `content` shaped like a ballot-side identifier."""
     found = {match.lower() for match in HEX64.findall(content)}
     found |= {match.lower() for match in UUID_PATTERN.findall(content)}
-    found |= set(RECEIPT_PATTERN.findall(content))
+    # SR-14: a reference shows up as the hash the server holds for it
+    found |= {hashlib.sha256(match.lower().encode("ascii")).hexdigest() for match in HEX32.findall(content)}
     return found
 
 
 def ballot_identifiers(db: Session) -> set[str]:
-    """SR-12: ballot ids, token ids, token hashes and receipts (SR-13: and chain entry hashes), normalised like identifiers_in."""
+    """
+    SR-12: ballot ids, token ids and token hashes, normalised like identifiers_in. SR-13: chain entry
+    hashes. SR-14: receipt hashes, which also stand for the references themselves (see HEX32).
+    """
     identifiers = {str(ballot_id).lower() for (ballot_id,) in db.execute(text("SELECT id FROM ballots"))}
-    for token_id, token_hash, receipt in db.execute(text("SELECT id, token_hash, receipt_reference FROM ballot_tokens")):
+    for token_id, token_hash, receipt_hash in db.execute(text("SELECT id, token_hash, receipt_hash FROM ballot_tokens")):
         identifiers |= {str(token_id).lower(), token_hash.lower()}
-        if receipt:
-            identifiers.add(receipt)
+        if receipt_hash:
+            identifiers.add(receipt_hash.lower())
     # SR-13: a chain entry hash points at one ballot too, so it may not appear on the identity side either
     identifiers |= {entry_hash.lower() for (entry_hash,) in db.execute(text("SELECT entry_hash FROM ballot_chain"))}
     return identifiers

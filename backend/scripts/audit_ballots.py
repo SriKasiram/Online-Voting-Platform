@@ -39,7 +39,8 @@ LEGACY_BALLOT_COLUMNS = {"division_id", "ciphertext", "nonce", "key_id"}
 # columns they may have. A new column there has to be reviewed before a release.
 OTHER_TABLES = {
     # SR-12: tokens no longer hold expires_at or consumed_at
-    "ballot_tokens": {"id", "election_id", "token_hash", "receipt_reference"},
+    # SR-14: the receipt reference itself is gone; only its hash and the used flag remain
+    "ballot_tokens": {"id", "election_id", "token_hash", "consumed", "receipt_hash"},
     "voter_participation": {"roll_id", "election_id", "state"},
     # SR-13: the hash chain holds ids and hashes of the ciphertext, never ballot content
     "ballot_chain": {"election_id", "position", "batch_no", "ballot_id", "prev_hash", "entry_hash"},

@@ -10,9 +10,9 @@ reference. tests/test_ballot_secrecy.py fails if a column is added there, so
 every new column gets a deliberate review.
 
 SR-03: voter_participation, ballot_tokens and ballots share no column that
-links them. Participation has no timestamp, a token has no elector and its
-receipt reference is the only handle on it, and a ballot has no token,
-reference or time.
+links them. Participation has no timestamp, a token has no elector and the
+hash of its receipt reference is the only handle on it (SR-14), and a ballot
+has no token, reference or time.
 
 Protected columns (helpers in app/security.py): *_enc columns are AES-GCM
 encrypted, password_hash is Argon2id, roll_lookup and enrolment_code_hash are
@@ -268,12 +268,14 @@ class VoterParticipation(Base):
 class BallotToken(Base):
     """
     SR-03: a single-use authorisation to cast one ballot. No elector reference
-    and no issue time. receipt_reference is set when the token is used, and is
-    the only way to find the row again.
+    and no issue time. When the token is used its receipt is recorded, and is
+    the only way to find the row again (SR-14: as a hash only).
     SR-12: no expiry and no "used at" time any more: those matched the audit
-    log's issue and acceptance times to the second. A token is unused while
-    receipt_reference is empty, and usable only while its election is open and
-    the elector is signed in.
+    log's issue and acceptance times to the second. A token is usable only
+    while its election is open and the elector is signed in.
+    SR-14: the receipt reference itself is never stored. It is derived from the
+    token the client presents, and only its SHA-256 is kept, so the row can
+    confirm a retry but cannot give anyone the reference.
     """
 
     __tablename__ = "ballot_tokens"
@@ -283,7 +285,10 @@ class BallotToken(Base):
     election_id: Mapped[uuid.UUID]
     # SHA-256 of the token as hex. The token itself is never stored.
     token_hash: Mapped[str] = mapped_column(unique=True)
-    receipt_reference: Mapped[str | None]
+    # SR-14: "used" on its own, so a token used before SR-14 (no receipt hash) still counts as used
+    consumed: Mapped[bool] = mapped_column(default=False, server_default=false())
+    # SR-14: SHA-256 (hex) of the reference returned to the client; empty until the token is used
+    receipt_hash: Mapped[str | None]
 
 
 class Ballot(Base):

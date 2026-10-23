@@ -18,3 +18,4 @@ Work through every step, in order, before a release. A release needs every requi
    - Keep the checkpoint files (`backend/checkpoints/`) with the release record, apart from the database.
 6. **Ballot key (SR-11).** `BALLOT_KEY_FILE` exists on the server, and a backup of it is kept separately from the database and its backups. It is never in the repository.
 7. **TLS (SR-10).** The server starts with `python -m app.serve`, and `docs/MANUAL.md` section 6 still passes.
+8. **Acceptance confirmation (SR-14).** `ACCEPT_TIMEOUT_SECONDS` on the server is between 1 and 9 (the server refuses to start otherwise), and `docs/MANUAL.md` section 10 still passes: the confirmation holds only the reference, and a held lock gets `try_again` with nothing stored.

@@ -12,7 +12,8 @@ from sqlalchemy import Engine, inspect
 EXPECTED_COLUMNS = {
     # SR-03: the rebuilt token table. No elector, no division and no issue time.
     # SR-12: and no expiry or "used at" time either
-    "ballot_tokens": {"id", "election_id", "token_hash", "receipt_reference"},
+    # SR-14: the receipt reference is never stored, only its hash and a used flag
+    "ballot_tokens": {"id", "election_id", "token_hash", "consumed", "receipt_hash"},
     # SR-11: the division and the ranking exist only inside the AES-256-GCM encrypted payload
     "ballots": {"id", "election_id", "encrypted_payload"},
 }

@@ -10,6 +10,7 @@ import logging
 import re
 import uuid
 from contextlib import nullcontext
+from hashlib import sha256  # SR-14: receipts are kept only as their SHA-256
 from pathlib import Path
 
 import pytest
@@ -113,7 +114,8 @@ def test_ballot_side_rows_hold_nothing_about_the_elector_or_the_time(
 
     rows = ballot_side_text(db_session)
 
-    assert vote["receipt"] in rows  # the rows were really read
+    # The rows were really read. SR-14: the token row holds the receipt's hash, never the receipt.
+    assert sha256(vote["receipt"].encode()).hexdigest() in rows and vote["receipt"] not in rows
     for value in (
         str(vote["voter"].account_id),
         str(roll_id),
@@ -132,8 +134,9 @@ def test_no_ballot_identifier_on_the_identity_side(client: TestClient, db_sessio
 
     identifiers = ballot_identifiers(db_session)
 
-    assert vote["receipt"] in identifiers and hash_token(vote["token"]).hex() in identifiers
-    assert len(identifiers) == 4  # ballot id, token id, token hash, receipt
+    # SR-14: the receipt counts through its hash, the only form the server keeps
+    assert sha256(vote["receipt"].encode()).hexdigest() in identifiers and hash_token(vote["token"]).hex() in identifiers
+    assert len(identifiers) == 4  # ballot id, token id, token hash, receipt hash
     assert check_identity_tables(db_session, identifiers).status == "PASS"
 
 
@@ -309,7 +312,8 @@ def test_audit_fails_on_a_ballot_id_in_a_log_file(
 def synthetic_dump(db_session: Session, extra_identity_line: str = "") -> str:
     """SR-12: a plain pg_dump-style file holding the real ballot-side rows inside their own COPY blocks."""
     ballot_id, election_id, _ = db_session.execute(text("SELECT id, election_id, encrypted_payload FROM ballots")).one()
-    token_id, token_hash, receipt = db_session.execute(text("SELECT id, token_hash, receipt_reference FROM ballot_tokens")).one()
+    # SR-14: the token table now holds a used flag and the receipt's hash
+    token_id, token_hash, receipt_hash = db_session.execute(text("SELECT id, token_hash, receipt_hash FROM ballot_tokens")).one()
     roll_id = db_session.scalar(text("SELECT roll_id FROM voter_participation"))
     return "\n".join(
         [
@@ -318,8 +322,8 @@ def synthetic_dump(db_session: Session, extra_identity_line: str = "") -> str:
             "COPY public.ballots (id, election_id, encrypted_payload) FROM stdin;",
             f"{ballot_id}\t{election_id}\t\\\\x01aabbcc",
             "\\.",
-            "COPY public.ballot_tokens (id, election_id, token_hash, receipt_reference) FROM stdin;",
-            f"{token_id}\t{election_id}\t{token_hash}\t{receipt}",
+            "COPY public.ballot_tokens (id, election_id, token_hash, consumed, receipt_hash) FROM stdin;",
+            f"{token_id}\t{election_id}\t{token_hash}\tt\t{receipt_hash}",
             "\\.",
             "COPY public.voter_participation (roll_id, election_id, state) FROM stdin;",
             f"{roll_id}\t{election_id}\tvoted",

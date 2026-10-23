@@ -48,7 +48,8 @@ def test_voter_can_vote_once(client: TestClient, make_voter, sign_in) -> None:
     response = submit(client, ballot, [c["id"] for c in reversed(ballot["candidates"])])
 
     assert response.status_code == 200
-    assert re.fullmatch(r"[A-Z2-9]{4}-[A-Z2-9]{4}", response.json()["receipt_id"])
+    # SR-14: a 128-bit reference, 32 lowercase hex characters (was an 8-character code)
+    assert re.fullmatch(r"[0-9a-f]{32}", response.json()["receipt_id"])
     again = client.get("/api/ballot")
     assert again.status_code == 409
     assert again.json() == {"detail": "already_voted"}
@@ -69,7 +70,8 @@ def test_stored_ballot_holds_the_preferences_and_nothing_about_the_voter(
     assert decrypt_ballot(stored.encrypted_payload, stored.id, stored.election_id)[RANKING_FIELD] == ranking  # SR-11
     token_hash = hash_token(ballot["ballot_token"]).hex()
     token = db_session.scalars(select(BallotToken).where(BallotToken.token_hash == token_hash)).one()
-    assert token.receipt_reference is not None  # SR-12: the receipt marks the token used; no time is kept
+    # SR-12: no time is kept. SR-14: the token is marked used and holds only the receipt's hash.
+    assert token.consumed and token.receipt_hash is not None
     roll_id = db_session.get_one(Account, voter.account_id).roll_id
     participation = db_session.get_one(VoterParticipation, (roll_id, election.election.id))
     assert participation.state == ParticipationState.VOTED

@@ -13,18 +13,22 @@ SR-11: the ballot itself (division and ranking) is stored only AES-256-GCM encry
 SR-12: the token row has no time either. A token is usable while its election is
 open and the elector is signed in (SR-04), and is used once its receipt is set.
 Nothing here logs a ballot id, token hash, receipt or selection.
+SR-14: the confirmation is a 128-bit reference derived from the presented token,
+returned only after the commit. The server keeps only its SHA-256, and the accept
+transaction is bounded by ACCEPT_TIMEOUT_SECONDS, well inside 10 seconds.
 """
 
-import secrets
+import hashlib
+import hmac
 import uuid
 from datetime import timedelta
 from typing import Any, NoReturn
 
 from fastapi import APIRouter, HTTPException, status
 from fastapi.responses import JSONResponse
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 # SR-11: ballots are encrypted before they are stored
@@ -52,8 +56,9 @@ from app.security import audit, hash_token, new_token, utc_now
 
 router = APIRouter(prefix="/ballot", tags=["ballot"])
 
-# No 0, O, 1, I or L, so a receipt code is easy to read aloud
-RECEIPT_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+RECEIPT_TAG = b"evoting-receipt-v1|"
+# SR-14: PostgreSQL's lock_not_available (lock_timeout) and query_canceled (statement_timeout)
+TIMEOUT_SQLSTATES = {"55P03", "57014"}
 
 
 class BallotStoreError(RuntimeError):
@@ -90,13 +95,24 @@ def definition_entry(db: Session, voter: Account, election: Election, division_i
     return entry
 
 
-def receipt_code() -> str:
+def receipt_reference(ballot_token: str) -> str:
     """
-    Random, so it confirms acceptance without revealing the vote.
-    SR-03: stored only on the used token row, and never derived from the ballot.
+    SR-14: the confirmation reference: the first 128 bits of SHA-256 over a tag and the token exactly
+    as the client presented it, as 32 lowercase hex characters. It says nothing about the ballot, and
+    the same token always gives the same reference, so a retry gets the same confirmation without
+    the server ever storing the reference.
     """
-    chars = "".join(secrets.choice(RECEIPT_ALPHABET) for _ in range(8))
-    return f"{chars[:4]}-{chars[4:]}"
+    return hashlib.sha256(RECEIPT_TAG + ballot_token.encode("utf-8")).digest()[:16].hex()
+
+
+def receipt_hash(reference: str) -> str:
+    # SR-14: all the server keeps of a reference
+    return hashlib.sha256(reference.encode("ascii")).hexdigest()
+
+
+def timed_out(problem: SQLAlchemyError) -> bool:
+    # SR-14: the accept transaction hit ACCEPT_TIMEOUT_SECONDS waiting for a lock or on a statement
+    return getattr(getattr(problem, "orig", None), "sqlstate", None) in TIMEOUT_SQLSTATES
 
 
 def token_hash(token: str) -> str:
@@ -133,14 +149,19 @@ def end_session_soon(db: Session, session_hash: bytes) -> None:
     )
 
 
-def replay(db: Session, voter: Account, receipt_reference: str, session_hash: bytes) -> SubmitOut:
+def replay(db: Session, voter: Account, presented_token: str, stored_hash: str | None, session_hash: bytes) -> SubmitOut:
     # SR-03: a used token gets the first answer again, and nothing else changes
+    # SR-14: the answer is recomputed from the token and must hash to what was stored when it was used.
+    # A token used before SR-14 has no hash, and a different one means an altered row: the generic error.
+    reference = receipt_reference(presented_token)
+    if stored_hash is None or not hmac.compare_digest(receipt_hash(reference), stored_hash):
+        reject(db, voter, "invalid", status.HTTP_400_BAD_REQUEST, "invalid_ballot")
     db.rollback()
     # SR-04: except that a safe retry also ends the session soon, as acceptance did
     end_session_soon(db, session_hash)
     log(db, "BALLOT_REPLAY_BLOCKED", voter)
     db.commit()
-    return SubmitOut(receipt_id=receipt_reference)
+    return SubmitOut(receipt_id=reference)
 
 
 @router.get("")
@@ -186,6 +207,25 @@ def get_ballot(voter: CurrentElector, db: DbSession) -> BallotOut:
 @router.post("/submit")
 def submit_ballot(body: SubmitIn, voter: CurrentElector, session: CurrentSession, db: DbSession) -> SubmitOut:
     """Accepts a full preferential ballot once per voter."""
+    try:
+        return accept_ballot(body, voter, session, db)
+    except OperationalError as problem:
+        if not timed_out(problem):
+            raise
+    # SR-14: a lock or statement ran out of time. Nothing was committed (token unused, elector still
+    # issued, no ballot), so the same token can simply be sent again. Raised outside the except block
+    # so no database text is chained onto it (SR-12).
+    db.rollback()
+    raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "try_again")
+
+
+def accept_ballot(body: SubmitIn, voter: Account, session: AuthSession, db: Session) -> SubmitOut:
+    """The SR-03 accept transaction. SR-14: every lock wait and statement in it is bounded."""
+    # SR-14: first, so that no lock wait or statement in this transaction can outlast
+    # ACCEPT_TIMEOUT_SECONDS, and the voter hears back well within 10 seconds
+    limit = f"{int(settings.accept_timeout_seconds) * 1000}ms"
+    db.execute(text(f"SET LOCAL lock_timeout = '{limit}'"))
+    db.execute(text(f"SET LOCAL statement_timeout = '{limit}'"))
     # SR-04: the same session CurrentElector checked, kept here so acceptance can end it
     session_hash = session.session_id_hash
     election = open_election(db)
@@ -210,9 +250,9 @@ def submit_ballot(body: SubmitIn, voter: CurrentElector, session: CurrentSession
     if token is None:
         reject(db, voter, "invalid", status.HTTP_400_BAD_REQUEST, "invalid_ballot")
     # SR-03 (c): already used: the same answer as the first time, and no second ballot
-    # SR-12: "used" is a stored receipt, not a time
-    if token.receipt_reference is not None:
-        return replay(db, voter, token.receipt_reference, session_hash)
+    # SR-12: "used" is a flag, not a time. SR-14: no reference is stored to send back; replay checks it.
+    if token.consumed:
+        return replay(db, voter, body.ballot_token, token.receipt_hash, session_hash)
     # SR-03 (d), SR-12: no per-token expiry. The token is usable because its election is open
     # (open_election above) and the elector is signed in (CurrentElector, SR-04).
     # SR-03 (e): only an elector whose ballot is issued, not yet voted, can use a token
@@ -242,20 +282,21 @@ def submit_ballot(body: SubmitIn, voter: CurrentElector, session: CurrentSession
         )
 
     # SR-03 (g): consume the token with one conditional UPDATE. Exactly one row must change.
-    receipt = receipt_code()
-    # SR-12: the receipt is the only mark of use; no time is written to the ballot side
+    # SR-14: the reference comes from the presented token; only its hash goes on the token row
+    reference = receipt_reference(body.ballot_token)
+    # SR-12: no time is written to the ballot side
     consumed = db.execute(
         update(BallotToken)
-        .where(BallotToken.token_hash == digest, BallotToken.receipt_reference.is_(None))
-        .values(receipt_reference=receipt)
+        .where(BallotToken.token_hash == digest, BallotToken.consumed.is_(False))
+        .values(consumed=True, receipt_hash=receipt_hash(reference))
         .execution_options(synchronize_session=False)
     ).rowcount
     if consumed != 1:
         db.rollback()
         again = db.scalars(select(BallotToken).where(BallotToken.token_hash == digest)).first()
-        if again is None or again.receipt_reference is None:
+        if again is None or not again.consumed:
             reject(db, voter, "invalid", status.HTTP_400_BAD_REQUEST, "invalid_ballot")
-        return replay(db, voter, again.receipt_reference, session_hash)
+        return replay(db, voter, body.ballot_token, again.receipt_hash, session_hash)
 
     # SR-03 (h): store the ballot with no voter, token, reference or time, and mark the elector
     # voted, in the same transaction.
@@ -276,7 +317,9 @@ def submit_ballot(body: SubmitIn, voter: CurrentElector, session: CurrentSession
         end_session_soon(db, session_hash)
         log(db, "BALLOT_ACCEPTED", voter)
         db.commit()
-    except SQLAlchemyError:
+    except SQLAlchemyError as problem:
+        if timed_out(problem):
+            raise  # SR-14: answered with try_again by submit_ballot, not as a storage failure
         stored = False
     if not stored:
         db.rollback()
@@ -284,4 +327,5 @@ def submit_ballot(body: SubmitIn, voter: CurrentElector, session: CurrentSession
         # server logs unhandled errors in full. Raised outside the except block so the database error
         # is not even its context: Starlette's middleware would turn a context into a logged cause.
         raise BallotStoreError("the accepted ballot could not be stored")
-    return SubmitOut(receipt_id=receipt)
+    # SR-14: the confirmation exists only once the ballot is durably committed
+    return SubmitOut(receipt_id=reference)

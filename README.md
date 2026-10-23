@@ -194,7 +194,7 @@ After 5 wrong enrolment codes the entry is locked, and the same reset unlocks it
 | `POST /api/auth/extend` | Starts a new full session under a new identifier, at most twice per sign in (SR-04). Called only when the voter chooses Keep voting |
 | `POST /api/auth/logout` | Ends the session |
 | `GET /api/ballot` | The voter's ballot paper, taken only from the verified signed definition (SR-07), and a single-use ballot token, once per election (SR-03) |
-| `POST /api/ballot/submit` | Accepts the ranked ballot once and returns a receipt code. The same token again returns the same receipt (SR-03). An informal or invalid ranking gets 422 and can be corrected (SR-08) |
+| `POST /api/ballot/submit` | Accepts the ranked ballot once and, after the commit, returns a 128-bit receipt reference (SR-14). The same token again returns the same reference (SR-03). An informal or invalid ranking gets 422 and can be corrected (SR-08). A database wait over `ACCEPT_TIMEOUT_SECONDS` gets `503 try_again` and stores nothing (SR-14) |
 | `GET /api/admin/turnout` | Staff (SR-05): electors issued a ballot and electors who voted, per division and in total. Permission `turnout:read` |
 | `POST /api/admin/electors/{roll_id}/reset` | Staff (SR-05): clears an elector's issued ballot, never a vote. Permission `elector:reset` |
 | `GET /api/admin/audit-log` | Staff (SR-05): audit entries in order, `limit` (at most 200) and `offset`. Permission `audit:read` |
@@ -202,7 +202,7 @@ After 5 wrong enrolment codes the entry is locked, and the same reset unlocks it
 
 Errors come back as `{"detail": "<reason>"}`:
 
-- Sign in and voting: `invalid_credentials` and `not_signed_in` (401), `too_many_requests` (429), `forbidden` (staff, SR-05) and `not_enrolled` (403), `no_open_election` (404), `already_voted` and `extension_limit` (409), `invalid_ballot` (400 for a ballot token problem; SR-12 removed `ballot_expired`), `informal_ballot` and `invalid_ballot` (422 for the ranking, SR-08), `ballot_unavailable` (503, SR-07).
+- Sign in and voting: `invalid_credentials` and `not_signed_in` (401), `too_many_requests` (429), `forbidden` (staff, SR-05) and `not_enrolled` (403), `no_open_election` (404), `already_voted` and `extension_limit` (409), `invalid_ballot` (400 for a ballot token problem; SR-12 removed `ballot_expired`), `informal_ballot` and `invalid_ballot` (422 for the ranking, SR-08), `ballot_unavailable` (503, SR-07), `try_again` (503, SR-14: nothing was stored, so the same token works again).
 - Admin (SR-05): `not_signed_in` (401), `forbidden` (403), `not_found` (404), `already_voted` (409).
 - Registration: `registration_failed`, `username_invalid`, `password_too_short`, `password_is_username`, `wrong_code` and `too_many_attempts` (400), `registration_session_invalid` (401), `username_taken` and `already_registered` (409).
 
@@ -254,6 +254,7 @@ Copy `backend/.env.example` to `backend/.env`. Docker Compose reads the same fil
 | `POSTGRES_TEST_DB` | Database that pytest rebuilds on every run. Must end in `_test` | `evoting_test` |
 | `SESSION_MINUTES` | How long a signed-in session lasts, fixed from issue. Keep it equal to `VITE_SESSION_MINUTES` | `10` |
 | `MAX_SESSION_EXTENSIONS`, `POST_BALLOT_SESSION_SECONDS` | Extensions allowed per sign in, and how long a session survives once its ballot is accepted. See [SR-04](#sr-04-session-lifetime-and-binding) | `2`, `60` |
+| `ACCEPT_TIMEOUT_SECONDS` | SR-14: seconds any lock wait or statement in the ballot accept transaction may take before the voter gets `503 try_again`. 1 to 9. See [SR-14](#sr-14-ballot-acceptance-confirmation) | `8` |
 | `SECRET_KEY` | Root secret for field encryption and keyed hashes, at least 32 characters. Required | none |
 | `MAX_FAILED_ATTEMPTS`, `LOCK_MINUTES`, `MFA_PENDING_MINUTES`, `RATE_LIMIT_ATTEMPTS`, `RATE_LIMIT_WINDOW_SECONDS`, `COOKIE_SECURE` | Sign-in lockout, rate limit and cookie settings. See [SR-01](#sr-01-authentication-and-rate-limiting) | `5`, `15`, `2`, `20`, `300`, `true` |
 | `ROLL_PUBLIC_KEY_PATH`, `MIN_VOTING_AGE` | The roll's Ed25519 public key, and the minimum age on polling day. See [SR-02](#sr-02-roll-signing-and-eligibility) | `backend/keys/roll_public.pem`, `18` |
@@ -298,7 +299,7 @@ Never commit a real `.env` file. Only `.env.example` belongs in Git.
 - The rate limiter keeps its counts in memory, so they reset when the API restarts and are not shared between several API processes. Behind the dev server's proxy every request comes from `127.0.0.1`, so the per-IP limit counts all users together.
 - There is no CSRF token yet. `SameSite=Strict` cookies are the only protection. The session cookie is marked `Secure` (SR-10: `.env.example` now sets `COOKIE_SECURE=true`). The registration cookie is not marked `Secure` yet, although it now travels only over TLS (SR-10).
 - Docker Compose passes all of `backend/.env` into the database container, including `SECRET_KEY`, which the database does not need.
-- The receipt code is random and stored only on the used token row (SR-03). There is no way for a voter to check it yet.
+- The receipt reference is derived from the ballot token, and only its hash is stored, on the used token row (SR-14). There is no way for a voter to check it yet.
 
 ## SR-01: authentication and rate limiting
 
@@ -398,7 +399,7 @@ No elector can have more than one ballot accepted in an election, however many r
 4. (SR-12: there is no separate token expiry any more; a closed election gives `404 no_open_election`, and an ended session `401 not_signed_in`);
 5. reject an elector who is not `issued`: `409 already_voted` if they have voted, `400 invalid_ballot` if they were never issued a ballot;
 6. check the ballot content as before;
-7. consume the token with one conditional `UPDATE` that must change exactly one row, recording a random receipt reference (SR-12: no time);
+7. consume the token with one conditional `UPDATE` that must change exactly one row, recording the SHA-256 of the receipt reference (SR-14; it was a random reference before) and no time (SR-12);
 8. store the ballot and mark the elector `voted`, then commit.
 
 Any failure rolls everything back: a token is never used without a ballot, and a ballot never exists without the elector marked voted. A token stays unused after a rejected ballot, so the voter can correct it and submit again.
@@ -411,9 +412,9 @@ python -m scripts.seed --reset-participation
 
 It refuses once the reviewer has voted, because a cast ballot cannot be undone by design. Only `python -m scripts.seed --reset` (all data) starts that over. Each reset is audited as `ELECTOR_RESET`. There is no API endpoint or staff screen for it.
 
-**Unlinked tables.** `voter_participation` (roll entry, election, state) has no timestamp. `ballot_tokens` (id, election, hash, receipt reference) has no elector and no time at all (SR-12). `ballots` (id, election, division, content) has no token, no reference and no time. So the database cannot match a ballot to a token, or a token to an elector. The receipt reference on the used token row is the only handle, and it points at no ballot.
+**Unlinked tables.** `voter_participation` (roll entry, election, state) has no timestamp. `ballot_tokens` (id, election, hash, used flag, receipt hash) has no elector and no time at all (SR-12, SR-14). `ballots` (id, election, division, content) has no token, no reference and no time. So the database cannot match a ballot to a token, or a token to an elector. The receipt hash on the used token row is the only handle, and it points at no ballot.
 
-**Audit.** `BALLOT_TOKEN_ISSUED`, `BALLOT_ACCEPTED`, `BALLOT_REPLAY_BLOCKED`, and `BALLOT_TOKEN_REJECTED` with a reason (`invalid`, `wrong_state`; SR-12 removed `expired`), each with the account and the event only. No token, hash, receipt reference or ballot content.
+**Audit.** `BALLOT_TOKEN_ISSUED`, `BALLOT_ACCEPTED`, `BALLOT_REPLAY_BLOCKED`, and `BALLOT_TOKEN_REJECTED` with a reason (`invalid`, `wrong_state`; SR-12 removed `expired`), each with the account and the event only. No token, hash, receipt reference, receipt hash (SR-14) or ballot content.
 
 Run the SR-03 tests, inside `backend/` with PostgreSQL running:
 
@@ -658,7 +659,7 @@ The rules, in order, for a division with N candidates:
 | Informal | `422 {"detail": "informal_ballot", "reason": "blank"}` or `"reason": "incomplete_order"`. Shown as "Your preferences are incomplete: number every box from 1 to N" |
 | Invalid | `422 {"detail": "invalid_ballot"}`, never saying which candidate or rule. Shown as "Your ballot could not be accepted. Please check your preferences" |
 
-**When the rules run.** The check runs inside the SR-03 accept transaction, after the replay check and before the token is used. A used token still gets its stored receipt without any check. A refused ballot changes nothing: the token stays unused, the elector stays `issued` and no ballot is stored, so the voter can correct it and submit again with the same token. The server never takes the client's word that a ballot is formal.
+**When the rules run.** The check runs inside the SR-03 accept transaction, after the replay check and before the token is used. A used token still gets its receipt (SR-14: recomputed from the token) without any check. A refused ballot changes nothing: the token stays unused, the elector stays `issued` and no ballot is stored, so the voter can correct it and submit again with the same token. The server never takes the client's word that a ballot is formal.
 
 **Audit.** An invalid request is audited as `BALLOT_REJECTED_INVALID` (account only), as possible tampering. An informal ballot is deliberately not audited, because the entry would record what that elector was trying to vote.
 
@@ -850,13 +851,13 @@ From the moment a ballot is accepted, and for as long as it is kept, no persiste
 | Side | Tables |
 |---|---|
 | Identity (`IDENTITY_TABLES`) | `electoral_roll`, `accounts` (electors and staff), `sessions`, `registration_sessions`, `voter_participation` (issued or voted, never how), `audit_log`. Also the public election setup: `elections`, `divisions`, `candidates` and `ballot_definitions`. These hold no ballot content and are referenced by the roll and participation |
-| Ballot (`BALLOT_TABLES`) | `ballots` (random id, election id, SR-11 ciphertext), `ballot_tokens` (random id, election id, token hash, receipt) and, since SR-13, `ballot_chain` (the hash chain over stored ballots) |
+| Ballot (`BALLOT_TABLES`) | `ballots` (random id, election id, SR-11 ciphertext), `ballot_tokens` (random id, election id, token hash, used flag and receipt hash since SR-14) and, since SR-13, `ballot_chain` (the hash chain over stored ballots) |
 
 Sign-in rate-limit counts are identity-side too, but they live in memory only. `alembic_version` is Alembic's own bookkeeping and belongs to neither side.
 
 **What changed (migration `0010`).** Existing data is assumed to be test data only, and it is kept.
 - **Times on the ballot side.** `ballot_tokens.expires_at` and `consumed_at` matched the `BALLOT_TOKEN_ISSUED` and `BALLOT_ACCEPTED` audit entries, which name the elector, to the second. Both are removed.
-- **Token validity.** A token is now unused while its receipt is empty. It is usable while its election is open and the elector is signed in (SR-04), so `BALLOT_TOKEN_MINUTES` and `400 ballot_expired` are gone.
+- **Token validity.** A token is now unused while its receipt is empty (SR-14: while its `consumed` flag is false). It is usable while its election is open and the elector is signed in (SR-04), so `BALLOT_TOKEN_MINUTES` and `400 ballot_expired` are gone.
 - **Exact times stay on the identity side.** The audit log, sessions and participation keep theirs.
 - **Foreign keys.** `ballots` and `ballot_tokens` no longer have foreign keys to `elections`: the election id is a plain value. So the ballot side has no foreign key at all.
 - **Database errors.** They no longer show their SQL parameters (`hide_parameters=True`). If storing an accepted ballot fails, the error raised carries none of the database's text about the row, so the server log cannot repeat a ballot id, token hash or receipt.
@@ -894,7 +895,7 @@ python -m scripts.audit_separation --file ..\..\evoting-backups\identity.sql --f
 It prints PASS, FAIL or SKIPPED per check, then `SR-12 separation audit: PASS` or `FAIL (n checks)`, and exits with code 1 if any check fails:
 - **a. Foreign keys.** Every table has a side, and no foreign key joins the sides.
 - **b. Ballot-side columns.** No ballot-side column name contains `elector`, `roll`, `user`, `session` or `agent`, or has the word `ip`. No ballot-side column has a timestamp or time type, and none is serial or identity.
-- **c. Identity-side data.** Every ballot id, token id, token hash and receipt is checked against every identity-side row and the audit log. The text is scanned with patterns for 64-hex hashes, UUIDs and receipts, and each match is looked up in a set.
+- **c. Identity-side data.** Every ballot id, token id, token hash and receipt hash is checked against every identity-side row and the audit log. The text is scanned with patterns for 64-hex hashes, UUIDs and 32-hex receipt references, and each match is looked up in a set. SR-14: a 32-hex value is hashed first, so a leaked reference matches its stored hash.
 - **d. Logs.** The same scan runs on the audit log, every file in `LOG_DIR` (default `logs/`), and every `*.log` file in the project.
 - **e. Files given with `--file`.**
   - In a plain SQL dump, ballot identifiers may appear only inside the ballot tables' own `COPY` blocks or `INSERT` lines.
@@ -989,6 +990,62 @@ pytest tests/test_sr13_chain.py -v
 - external anchoring of the head hash;
 - a Merkle tree;
 - least-privilege database roles.
+
+## SR-14: ballot acceptance confirmation
+
+Once a ballot is durably accepted, the voter gets a confirmation within 10 seconds. It holds only a 128-bit reference and no ballot content.
+
+**The response.** `POST /api/ballot/submit` still answers `200 {"receipt_id": "..."}`, with no other field.
+- **New format.** `receipt_id` used to be an 8-character random code (`ABCD-EFGH`). It is now 32 lowercase hex characters (128 bits).
+- **No content.** It holds no candidate, ranking, division, ballot id, token or hash.
+- **Headers unchanged.** The response still has `Cache-Control: no-store` (SR-09) and HSTS (SR-10).
+
+**The reference.** It is the first 16 bytes of SHA-256 over `evoting-receipt-v1|` followed by the ballot token, written as hex.
+- **Derived, never stored.** The server stores only `receipt_hash`, the SHA-256 of the reference, on the used token row. The reference itself is stored nowhere and logged nowhere. There is no separate random reference.
+- **The same on retry.** A retry with the same token recomputes the reference and checks its hash against the stored one (constant-time compare). Then it returns the same reference and stores no second ballot.
+- **Generic error otherwise.** A used token whose stored hash does not match gets the generic `400 invalid_ballot`, and so does a token used before SR-14 (no stored hash).
+- **Shown once.** The token lives only in the page's memory (SR-09) and is cleared when the ballot is accepted. So a lost reference cannot be recovered: neither the voter nor the server can recompute it.
+- **Not on the identity side.** Neither the reference nor its hash is in `voter_participation`, `sessions`, the audit log or any log line. `ballots`, `ballot_chain`, SR-11 encryption and the SR-13 chain are unchanged.
+
+**Only after the commit.** The SR-03 transaction order is unchanged. The reference is worked out before the token is consumed, but it is returned only after the commit. If anything fails before the commit, everything rolls back and the voter gets an error with no reference.
+
+**Within 10 seconds.** `ACCEPT_TIMEOUT_SECONDS` (default `8`, allowed `1` to `9`) sets PostgreSQL's `lock_timeout` and `statement_timeout` for the accept transaction only (`SET LOCAL`).
+- **On a timeout.** If a lock wait or a statement takes longer, the transaction rolls back and the voter gets `503 {"detail": "try_again"}`.
+- **Nothing stored.** The token stays unused, the elector stays `issued` and no ballot is stored, so the same token works on retry.
+- **In the browser.** The frontend shows its usual "Your ballot could not be submitted. Try again, or ask a polling official for help." and keeps the token.
+- **No server retries.** There is no retry loop and no background worker.
+
+**Migration `0012`.**
+- **Columns.** Replaces `ballot_tokens.receipt_reference` with `consumed` (the used flag) and `receipt_hash`.
+- **Tokens used before SR-14.** They stay `consumed`, but have no hash. A replay of one gets the generic error, because its reference cannot be worked out again.
+- **Untouched.** Ballots and chain rows.
+- **Downgrade.** Puts `receipt_reference` back, with the placeholder `XXXX-XXXX` on used tokens.
+
+After pulling, run `alembic upgrade head`, then `python -m scripts.seed --reset` or cast new test ballots.
+
+**SR-12 audit.** Every receipt hash counts as a ballot identifier, and a leaked reference fails the audit too (check c above). The SR-11 storage audit also knows the new token columns.
+
+Run the SR-14 tests, inside `backend/` with PostgreSQL running:
+
+```
+pytest tests/test_sr14_confirmation.py -v
+```
+
+**SR-14 assumptions:**
+- **A separate used flag.** `consumed` keeps tokens used before SR-14 counted as used, now that the reference column is gone.
+- **Hex.** The 128 bits are written as 32 lowercase hex characters.
+- **Each wait is bounded, not the total.** The time limit applies to each lock wait and each statement. An accept is a handful of short statements, so in practice it ends well inside 10 seconds. This has not been load tested.
+- **No status field.** The `200` status itself says the ballot was accepted. As before, the body holds only the reference.
+- **Old test tokens.** The prototype database holds only seed and test data, so tokens used before SR-14 need no reference.
+
+**Known display issue.** The receipt screen shows the reference in its large code style, which was sized for the old 9-character code. The 32 characters do not wrap, so they run past the card. SR-14 does not change the frontend.
+
+**SR-14 design only, not implemented:**
+- a public lookup, where a voter checks a reference;
+- individual verifiability (a voter checking that their ballot was counted as cast);
+- signed receipts;
+- load testing;
+- latency monitoring.
 
 ## Folder layout
 

@@ -3,7 +3,8 @@ SR-03: no more than one ballot per elector per election. A ballot token is
 single use, 256 random bits, and is consumed in the same transaction that
 stores the ballot. Replays and simultaneous duplicates add no ballot.
 SR-12: a token has no stored expiry any more. It is usable while its election
-is open and the elector is signed in, and "used" means its receipt is set.
+is open and the elector is signed in.
+SR-14: "used" is a flag, and the token keeps only the SHA-256 of the receipt it returned.
 """
 
 import hashlib
@@ -73,6 +74,11 @@ def state_of(db_session: Session, voter, election) -> ParticipationState | None:
     return row.state if row else None
 
 
+def unused(token: BallotToken) -> bool:
+    # SR-14: not used, and no receipt hash recorded
+    return (token.consumed, token.receipt_hash) == (False, None)
+
+
 def token_row(db_session: Session, raw: str) -> BallotToken:
     db_session.expire_all()
     digest = hashlib.sha256(raw.encode()).hexdigest()
@@ -99,8 +105,8 @@ def test_valid_token_records_exactly_one_ballot(client: TestClient, db_session: 
     assert count(db_session, Ballot) == 1
     assert state_of(db_session, voter, election) == ParticipationState.VOTED
     token = token_row(db_session, ballot["ballot_token"])
-    # SR-12: the stored receipt is what marks the token used
-    assert token.receipt_reference == response.json()["receipt_id"]
+    # SR-14: used, and holding only the SHA-256 of the receipt it returned, never the receipt
+    assert token.consumed and token.receipt_hash == hashlib.sha256(response.json()["receipt_id"].encode()).hexdigest()
 
 
 def test_replayed_token_gets_the_first_answer_and_no_new_ballot(
@@ -163,7 +169,7 @@ def test_token_lasts_while_the_session_and_the_election_do(
     for voter, paper, response, expected in refused:
         assert outcome(response) == expected
         assert state_of(db_session, voter, election) == ParticipationState.ISSUED
-        assert token_row(db_session, paper["ballot_token"]).receipt_reference is None
+        assert unused(token_row(db_session, paper["ballot_token"]))
     assert count(db_session, Ballot) == 1
 
 
@@ -181,7 +187,7 @@ def test_unknown_or_tampered_token_changes_nothing(
     assert outcome(submit(client, ballot, token=bad)) == INVALID
     assert count(db_session, Ballot) == 0
     assert state_of(db_session, voter, election) == ParticipationState.ISSUED
-    assert token_row(db_session, real).receipt_reference is None  # SR-12: still unused
+    assert unused(token_row(db_session, real))  # SR-12, SR-14: still unused
     assert submit(client, ballot).status_code == 200
 
 
@@ -207,7 +213,8 @@ def test_only_the_token_hash_is_stored_and_the_tables_share_no_link(
     columns = {t: {c["name"] for c in schema.get_columns(t)} for t in ("voter_participation", "ballot_tokens", "ballots")}
     assert columns["voter_participation"] == {"roll_id", "election_id", "state"}
     # SR-12: no expiry or "used at" time on the token any more
-    assert columns["ballot_tokens"] == {"id", "election_id", "token_hash", "receipt_reference"}
+    # SR-14: a used flag and the receipt hash replace the plaintext receipt reference
+    assert columns["ballot_tokens"] == {"id", "election_id", "token_hash", "consumed", "receipt_hash"}
     # SR-11: the division and ranking now live only inside the encrypted payload
     assert columns["ballots"] == {"id", "election_id", "encrypted_payload"}
     for table in ("ballot_tokens", "ballots"):
@@ -239,7 +246,7 @@ def test_failure_while_storing_the_ballot_changes_nothing(
 
     assert count(db_session, Ballot) == 0
     assert state_of(db_session, voter, election) == ParticipationState.ISSUED
-    assert token_row(db_session, ballot["ballot_token"]).receipt_reference is None
+    assert unused(token_row(db_session, ballot["ballot_token"]))
     monkeypatch.undo()
     assert submit(client, ballot).status_code == 200
 
@@ -302,7 +309,7 @@ def test_voted_elector_with_another_unused_token_is_refused(
 
     assert outcome(response) == ALREADY_VOTED
     assert count(db_session, Ballot) == 1
-    assert token_row(db_session, other_ballot["ballot_token"]).receipt_reference is None  # SR-12: unused
+    assert unused(token_row(db_session, other_ballot["ballot_token"]))  # SR-12, SR-14: unused
 
 
 def test_audit_events_hold_no_token_reference_or_ballot_content(
