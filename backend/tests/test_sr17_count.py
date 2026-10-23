@@ -27,7 +27,7 @@ from app.deps import get_db
 from app.house_count import CountRefused, Round, break_tie, check_ballot, count_division, run_count
 from app.main import app
 from app.models import AuditLogEntry, BallotChainEntry, ParticipationState, VoterParticipation
-from app.security import audit_hash_at
+from app.security import AUDIT_FORMAT_CURRENT, audit_hash_at
 from scripts import audit_ballots, audit_checkpoint, audit_separation, count_house, verify_audit
 from scripts.seal_ballots import append_checkpoint, load_private_key, seal_batch
 
@@ -163,12 +163,13 @@ def triggers_off(db: Session, *tables: str) -> Iterator[None]:
         db.commit()
 
 
-class TestHouseCount:
+class CountedElection:
     """
     SR-17: the count runs in its own read-only transaction on a second connection, which only sees
     committed rows. So, like SR-03's and SR-14's concurrency tests, these replace the db_session and
     client fixtures with committing ones, and empty the test database afterwards (TRUNCATE, which
     the append-only triggers do not stop).
+    SR-18: fixtures and helpers only, no tests, so the release tests can build on the same setup.
     """
 
     @pytest.fixture
@@ -231,6 +232,10 @@ class TestHouseCount:
     def chain(self, db: Session, election_id: uuid.UUID) -> list[BallotChainEntry]:
         db.expire_all()
         return list(db.scalars(select(BallotChainEntry).where(BallotChainEntry.election_id == election_id).order_by(BallotChainEntry.position)))
+
+
+class TestHouseCount(CountedElection):
+    """SR-17: the count over a real, committed election, and every way it is refused."""
 
     # -- a clean count --
 
@@ -509,7 +514,9 @@ class TestHouseCount:
             ("COUNT_REFUSED", "failure", "total_mismatch", 0),
         ]
         assert all(
-            (e.category, e.actor, e.role, e.details, e.batch_no, e.format_version) == ("ballot_box", "script", "script", None, None, 2)
+            # SR-18: written in the current audit format; a count event has no release version
+            (e.category, e.actor, e.role, e.details, e.batch_no, e.version, e.format_version)
+            == ("ballot_box", "script", "script", None, None, None, AUDIT_FORMAT_CURRENT)
             and e.request_id is not None
             for e in events
         )

@@ -199,6 +199,7 @@ After 5 wrong enrolment codes the entry is locked, and the same reset unlocks it
 | `POST /api/admin/electors/{roll_id}/reset` | Staff (SR-05): clears an elector's issued ballot, never a vote. Permission `elector:reset` |
 | `GET /api/admin/audit-log` | Staff (SR-05): audit entries in order, `limit` (at most 200) and `offset`. Permission `audit:read` |
 | `GET /api/admin/audit-log/verify` | Staff (SR-05): recomputes the audit hash chain. Permission `audit:verify` |
+| `GET /api/public/results-key` | Public, no session (SR-18): the Ed25519 public key that signs released House results, and its fingerprint. `404 not_configured` if no results key exists. No route serves results themselves |
 
 Errors come back as `{"detail": "<reason>"}`:
 
@@ -264,6 +265,7 @@ Copy `backend/.env.example` to `backend/.env`. Docker Compose reads the same fil
 | `DELEGATE_KEYRING_PATH`, `REQUIRED_DELEGATE_APPROVALS`, `MIN_ACTIVATION_LEAD_HOURS` | The delegates' public keyring, the distinct delegates who must sign, and how long before polls open a definition must be activated. See [SR-07](#sr-07-signed-ballot-definitions) | `backend/keys/delegates/keyring.json`, `2`, `24` |
 | `MIN_SEAL_BATCH`, `CHECKPOINT_DIR` | SR-13: the smallest batch sealed without `--final`, and the folder of signed checkpoints (relative to `backend/`). See [SR-13](#sr-13-integrity-protected-ballot-storage) | `10`, `checkpoints` |
 | `CHECKPOINT_PUBLIC_KEY`, `CHECKPOINT_PRIVATE_KEY` | SR-13: the checkpoint key pair (`python -m scripts.gen_checkpoint_key`). The private key is for the seal script only | `keys/checkpoint_public.pem`, `keys/checkpoint_private.pem` |
+| `RESULTS_PUBLIC_KEY`, `RESULTS_PRIVATE_KEY`, `RELEASES_DIR` | SR-18: the dedicated results key pair (`python -m scripts.gen_results_key`), and where signed releases go (relative to `backend/`). The private key is for the release script only. See [SR-18](#sr-18-signed-result-releases) | `keys/results_public.pem`, `keys/results_private.pem`, `releases` |
 | `LOG_DIR` | Folder of the server's log files, if its output is saved to files. The SR-12 separation audit scans it | `logs/` at the project root |
 | `BALLOT_KEY_FILE` | The 32-byte AES-256 key that encrypts every stored ballot (`python -m scripts.gen_ballot_key`). No default key exists: without this file the API does not start. See [SR-11](#sr-11-ballots-encrypted-at-rest) | `backend/keys/ballot.key` |
 | `HSTS_MAX_AGE` | Seconds the browser must use HTTPS only for this host. `.env.example` sets `300` for local work. See [SR-10](#sr-10-tls-13-for-ballot-transmission) | `31536000` (one year) |
@@ -1335,6 +1337,101 @@ pytest tests/test_sr17_count.py -v
 - a recount workflow;
 - the statutory procedure for ties that cannot be broken.
 
+## SR-18: signed result releases
+
+Before House results leave the platform for an external system, the exact bytes of the canonical result dataset are signed with a dedicated Ed25519 key. Every release comes with its signature, so a recipient can check where it came from and that it is unchanged, using the separately published public key.
+
+**1. Create the results key, once.** Inside `backend/`:
+
+```
+python -m scripts.gen_results_key
+```
+
+- **What it writes.** `keys/results_private.pem` (0600 where supported) and `keys/results_public.pem`, and it prints the key's fingerprint. It never overwrites without `--force`.
+- **What the fingerprint is.** The SHA-256, as lowercase hex, of the raw 32-byte public key.
+- **A key of its own.** It is never the SR-07 delegate keys or the SR-13 checkpoint key. Because it signs nothing but result datasets, the signed bytes carry no domain tag, and standard tools can verify them.
+- **Who uses the private key.** Only the release script. The app serves the public key, and starts without either key.
+
+**2. Release.** After polls close and the final seal (SR-17):
+
+```
+python -m scripts.release_results --election <id>
+```
+
+Each step must pass, or nothing is released: it prints `REFUSED: <code>` and exits with code 1.
+
+| Step | What happens | Refusal |
+|---|---|---|
+| a | a fresh SR-17 count in the same run. A result file read from disk is never signed | the SR-17 code, such as `polls_open` |
+| b | the release history (`releases.jsonl`) is checked: every logged version's `result.json` still has its logged SHA-256, and each names the one before | `release_history_invalid` |
+| c | a new folder, `RELEASES_DIR/<election>/v<N>/`, is created; an existing one is never reused | `version_exists` |
+| d | `result.json`, the exact canonical bytes, and `result.json.sig`, the raw 64-byte signature over exactly those bytes, are written | |
+| e | both files are read back and checked with the published key; on failure the folder is deleted | `signature_check_failed` |
+| f | `VERIFY.txt` is written: how to check the release. It holds neither the key nor the fingerprint | |
+| g | the three files are made read-only, then one line goes into `releases.jsonl`: version, dataset SHA-256, previous SHA-256, time | |
+| h | `RESULT_RELEASED` is audited (SR-16), and the version, folder and dataset SHA-256 are printed | |
+
+A missing ballot, checkpoint or results key refuses with `keys_missing`. The release folder never holds a key.
+
+**3. The dataset** (`backend/app/result_dataset.py`).
+- **Exact bytes.** JSON with sorted keys, separators `,` and `:`, UTF-8 (no `\u` escapes) and no trailing newline. The same inputs always give the same bytes.
+- **Fields.** `schema` (`evoting-house-result-v1`), `election_id`, `release_version`, `previous_release_sha256` (null for version 1), `generated_at` (UTC), `final_chain_head` (the SR-13 final checkpoint's head hash), `ballot_count`, `signing_key_fingerprint`, and `divisions`.
+- **Divisions.** The SR-17 result for each one: id and name, formal total, rounds with totals and exclusions, elected candidate and status.
+- **Totals only.** No ballot id, ranking, token or receipt.
+
+**4. The published key.** `GET /api/public/results-key` needs no session, and is served over TLS 1.3 with no-store and HSTS like every response. It returns `{"algorithm": "Ed25519", "public_key_pem": "...", "fingerprint_sha256": "..."}`, or `404 {"detail": "not_configured"}`. No route serves a result dataset: results leave only through the release script.
+
+**5. How a recipient verifies.**
+1. Fetch the key from the official page, and compare its fingerprint with the one published elsewhere.
+2. Then run the standalone verifier, which needs only Python 3 and the `cryptography` package: no platform code, database or settings. It can be copied anywhere:
+
+```
+python verify_release.py --dataset result.json --signature result.json.sig --public-key results_public.pem --expected-fingerprint <fingerprint>
+```
+
+It prints `VALID: election ..., release version ..., final chain head ...`, or `INVALID: <reason>`, and exits with code 0 or 1. It checks:
+- the signature over the exact file bytes;
+- that the dataset names this same key;
+- if given, the expected fingerprint.
+
+With OpenSSL 3.0 or later, the signature alone can be checked with:
+
+```
+openssl pkeyutl -verify -pubin -inkey results_public.pem -rawin -in result.json -sigfile result.json.sig
+```
+
+**A correction is always a new version.** For example, after a recount, release again. The new version's `previous_release_sha256` names the version before it, and earlier versions are never changed. Editing a released file makes the next release refuse with `release_history_invalid`.
+
+**Audit.** `RESULT_RELEASED` and `RESULT_RELEASE_REFUSED` (category `ballot_box`, actor `script`) hold only:
+- the outcome;
+- the reason code;
+- the ballot count;
+- the release version: SR-16's allow-list gained one whole-number field, `version` (migration `0014`).
+
+New audit rows use hash format 3, which also covers `version`. Rows in formats 1 and 2 are not rewritten and still verify.
+
+Run the SR-18 tests, inside `backend/` with PostgreSQL running:
+
+```
+pytest tests/test_sr18_release.py -v
+```
+
+The OpenSSL test is skipped unless OpenSSL 3.0 or later is installed. Git for Windows ships 1.1.1, which cannot verify Ed25519 this way.
+
+**SR-18 assumptions:**
+- **The official page.** In the prototype it is a route on the same server, protected by TLS. A real deployment would publish the key in advance, on the official AEC website and through other channels, so recipients can confirm the fingerprint.
+- **One key.** One results key is used for the whole prototype, and its private key is on the developer's machine.
+- **Corrections.** A new release (for example after a recount) is a new version that names the one before. Earlier versions are never changed.
+- **The recipient.** The verify script stands in for the external recipient. No external system is simulated.
+
+**SR-18 design only, not implemented:**
+- an offline or HSM-held signing key;
+- two-person approval to sign a release;
+- key rotation and revocation;
+- trusted timestamps;
+- a transparency log;
+- delivery to real external systems, such as media feeds.
+
 ## Folder layout
 
 ```
@@ -1344,5 +1441,6 @@ docs/                MANUAL.md (files and how to run the app), SR-09_INSPECTION.
 certs/               SR-10: the development TLS certificate and key (python -m scripts.dev_certs). Never committed
 exports/, logs/      SR-12: ballot-side exports and server log files. Never committed
 backend/checkpoints/ SR-13: signed ballot chain checkpoints, one file per election. Never committed
+backend/releases/    SR-18: signed House result releases, one folder per election and version. Never committed
 docker-compose.yml   PostgreSQL 16 for local development
 ```

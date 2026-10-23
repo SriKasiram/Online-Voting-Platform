@@ -17,6 +17,8 @@ exports/
 logs/
 # SR-13: signed ballot chain checkpoints (CHECKPOINT_DIR). The checkpoint keys are under keys/ above.
 checkpoints/
+# SR-18: signed House result releases (RELEASES_DIR). The results keys are under keys/ above.
+releases/
 
 # Databases and dumps
 *.sqlite

@@ -31,7 +31,7 @@ from app.main import app
 from app.models import AuditLogEntry, Ballot, BallotToken, ParticipationState, VoterParticipation
 from app.request_id import REQUEST_ID_HEADER
 from app.routers import ballot as ballot_router
-from app.security import SESSION_COOKIE, AuditFieldError, audit, looks_secret, utc_now, verify_audit_chain
+from app.security import AUDIT_FORMAT_CURRENT, SESSION_COOKIE, AuditFieldError, audit, looks_secret, utc_now, verify_audit_chain
 from app import participation
 from scripts import audit_checkpoint, audit_separation, verify_audit
 from scripts.ballot_definition import activate, build_payload, sign
@@ -53,6 +53,8 @@ ALLOWED_COLUMNS = {
     "batch_no",
     "count",
     "reason",
+    # SR-18: the release version, filled by the result release events only
+    "version",
     "format_version",
     "prev_hash",
     "hash",
@@ -101,7 +103,8 @@ def check_entry(
         assert str(entry.request_id) == response.headers[REQUEST_ID_HEADER]
     assert timedelta(0) <= entry.created_at - started <= WITHIN
     filled = {column.key for column in AuditLogEntry.__table__.columns if getattr(entry, column.key) is not None}
-    assert filled <= ALLOWED_COLUMNS and entry.details is None and entry.format_version == 2
+    # SR-18: new rows are written in the current format (3), which covers the release version too
+    assert filled <= ALLOWED_COLUMNS and entry.details is None and entry.format_version == AUDIT_FORMAT_CURRENT
 
 
 def login(client: TestClient, voter, password: str | None = None):

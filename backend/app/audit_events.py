@@ -63,6 +63,10 @@ EVENT_CATEGORIES: dict[str, str] = {
     "COUNT_STARTED": BALLOT_BOX,
     "COUNT_COMPLETED": BALLOT_BOX,
     "COUNT_REFUSED": BALLOT_BOX,
+    # SR-18: a signed release of House results, by the release script. Only the outcome, a reason
+    # code, the ballot count and the release version: never the dataset, its hash or a key.
+    "RESULT_RELEASED": BALLOT_BOX,
+    "RESULT_RELEASE_REFUSED": BALLOT_BOX,
 }
 
 SUCCESS = "success"
@@ -137,5 +141,11 @@ REASON_CODES = frozenset(
         "wrong_division",
         "informal_or_invalid",
         "unresolved_tie",
+        # SR-18: why a release stopped (scripts/release_results.py). A refused count gives its SR-17
+        # code; keys_missing means the ballot, checkpoint or results key the release needs is absent.
+        "keys_missing",
+        "release_history_invalid",
+        "version_exists",
+        "signature_check_failed",
     }
 )

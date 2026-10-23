@@ -93,6 +93,14 @@ class Settings(BaseSettings):
     checkpoint_public_key: Path = Path("keys/checkpoint_public.pem")
     checkpoint_private_key: Path = Path("keys/checkpoint_private.pem")
 
+    # SR-18: the results key, used for nothing but signing released House results, so the signed
+    # bytes need no domain tag and recipients can verify with standard tools. The private key is
+    # read by scripts/release_results.py alone; the app only serves the public key, and starts
+    # without either. Releases are folders under RELEASES_DIR (relative to backend/), never committed.
+    results_private_key: Path = Path("keys/results_private.pem")
+    results_public_key: Path = Path("keys/results_public.pem")
+    releases_dir: Path = Path("releases")
+
     # SR-10: how long browsers must use HTTPS only for this host. One year by default. HSTS ignores
     # the port, so local development sets it short (.env.example) to avoid locking localhost to HTTPS.
     hsts_max_age: int = 31536000

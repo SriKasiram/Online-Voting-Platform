@@ -30,3 +30,7 @@ Work through every step, in order, before a release. A release needs every requi
     - Inside `backend/`: `python -m scripts.verify_chain --election <id>` and `python -m scripts.verify_audit` must both exit with code 0.
     - Then run `python -m scripts.count_house --election <id>`. Attach its output and the result file (`exports/house_result_<id>.json`) to the release record.
     - A `REFUSED: <code>` stops the count with no result. There is no way to skip a check.
+13. **Signed result release (SR-18).** Results leave the platform only through python -m scripts.release_results. After each release, verify it as a recipient would: fetch the key from /api/public/results-key, compare the fingerprint, run scripts/verify_release.py (VALID). Never edit a release folder; a correction is a new version.
+    - Run `python -m scripts.release_results --election <id>` inside `backend/`. Record the version and the dataset SHA-256 it prints.
+    - Copy the release folder somewhere else, fetch the key from `https://<server>/api/public/results-key`, and check its fingerprint against the one published.
+    - Then run `python verify_release.py --dataset result.json --signature result.json.sig --public-key results_public.pem --expected-fingerprint <fingerprint>`. It must print `VALID`. Attach its output to the release record.

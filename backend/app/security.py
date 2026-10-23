@@ -264,6 +264,9 @@ _AUDIT_LOCK_ID = 51_204
 # Old rows are never rewritten, so each row is verified with the formula of its own version.
 AUDIT_FORMAT_V1 = 1
 AUDIT_FORMAT_V2 = 2
+# SR-18: 3 = format 2 plus the release `version` field. New rows are written in this format.
+AUDIT_FORMAT_V3 = 3
+AUDIT_FORMAT_CURRENT = AUDIT_FORMAT_V3
 
 _UUID_TEXT = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 _ACCOUNT_ACTOR = re.compile(rf"account:{_UUID_TEXT}")
@@ -303,6 +306,7 @@ def _checked_fields(
     batch_no: int | None,
     count: int | None,
     reason: str | None,
+    version: int | None = None,
 ) -> str:
     """SR-16: raises AuditFieldError unless every value is allowed. Returns the event's category."""
     for value in (event_type, outcome, actor, role, request_id, reason):
@@ -325,32 +329,33 @@ def _checked_fields(
         raise AuditFieldError("the actor must be account:<id>, script or unknown, with a matching role")
     if not re.fullmatch(_UUID_TEXT, request_id):
         raise AuditFieldError("the request id must be a lowercase UUID")
-    for number in (batch_no, count):
+    # SR-18: the release version is a whole number too
+    for number in (batch_no, count, version):
         if number is not None and (type(number) is not int or number < 0):
-            raise AuditFieldError("batch_no and count must be whole numbers")
+            raise AuditFieldError("batch_no, count and version must be whole numbers")
     return category
 
 
-def _v2_body(entry: AuditLogEntry) -> str:
+def _structured_body(entry: AuditLogEntry) -> str:
     # SR-16: every structured field and the format version, in one canonical text form
-    return json.dumps(
-        {
-            "format_version": AUDIT_FORMAT_V2,
-            # The database may hand the time back in another zone, so use the writer's UTC form
-            "created_at": entry.created_at.astimezone(UTC).isoformat(),
-            "event_type": entry.event_type,
-            "category": entry.category,
-            "outcome": entry.outcome,
-            "actor": entry.actor,
-            "role": entry.role,
-            "request_id": str(entry.request_id),
-            "batch_no": entry.batch_no,
-            "count": entry.count,
-            "reason": entry.reason,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    )
+    # SR-18: format 3 adds `version`; a format 2 row gets exactly the body it was hashed with
+    fields = {
+        "format_version": entry.format_version,
+        # The database may hand the time back in another zone, so use the writer's UTC form
+        "created_at": entry.created_at.astimezone(UTC).isoformat(),
+        "event_type": entry.event_type,
+        "category": entry.category,
+        "outcome": entry.outcome,
+        "actor": entry.actor,
+        "role": entry.role,
+        "request_id": str(entry.request_id),
+        "batch_no": entry.batch_no,
+        "count": entry.count,
+        "reason": entry.reason,
+    }
+    if entry.format_version >= AUDIT_FORMAT_V3:
+        fields["version"] = entry.version
+    return json.dumps(fields, sort_keys=True, separators=(",", ":"))
 
 
 def _v1_body(entry: AuditLogEntry) -> str:
@@ -368,7 +373,13 @@ def _v1_body(entry: AuditLogEntry) -> str:
 
 def entry_hash(prev_hash: bytes, entry: AuditLogEntry) -> bytes:
     """The hash an entry must carry, by the formula of its own format version."""
-    body = _v1_body(entry) if entry.format_version == AUDIT_FORMAT_V1 else _v2_body(entry)
+    if entry.format_version == AUDIT_FORMAT_V1:
+        body = _v1_body(entry)
+    elif entry.format_version in (AUDIT_FORMAT_V2, AUDIT_FORMAT_V3):
+        body = _structured_body(entry)
+    else:
+        # SR-18: a format no writer ever used cannot verify
+        return b""
     return hashlib.sha256(prev_hash + body.encode()).digest()
 
 
@@ -383,6 +394,7 @@ def audit(
     batch_no: int | None = None,
     count: int | None = None,
     reason: str | None = None,
+    version: int | None = None,
     **unexpected: Any,
 ) -> None:
     """
@@ -395,12 +407,14 @@ def audit(
     time are set here, and the request id comes from the request being handled (app/request_id.py).
     Callers write it in the same transaction as the change it describes, so if this fails the
     change is rolled back too.
+
+    SR-18: `version` (a release version) joins the allow-list; the rest is unchanged.
     """
     if unexpected:
         raise AuditFieldError(f"not an allowed audit field: {', '.join(sorted(unexpected))}")
     # SR-16: outside a request (scripts, start-up) each entry gets its own random id
     request_id = request_id or current_request_id() or str(uuid.uuid4())
-    category = _checked_fields(event_type, outcome, actor, role, request_id, batch_no, count, reason)
+    category = _checked_fields(event_type, outcome, actor, role, request_id, batch_no, count, reason, version)
 
     db.execute(text("SELECT pg_advisory_xact_lock(:id)"), {"id": _AUDIT_LOCK_ID})
     prev_hash = db.scalar(select(AuditLogEntry.hash).order_by(AuditLogEntry.id.desc()).limit(1))
@@ -416,9 +430,10 @@ def audit(
         batch_no=batch_no,
         count=count,
         reason=reason,
+        version=version,
         # SR-16: the old free-text column is never written again
         details=None,
-        format_version=AUDIT_FORMAT_V2,
+        format_version=AUDIT_FORMAT_CURRENT,
         prev_hash=prev_hash,
     )
     entry.hash = entry_hash(prev_hash, entry)
@@ -440,7 +455,9 @@ def verify_audit_chain(db: Session) -> tuple[int, int | None]:
     rows = select(AuditLogEntry).order_by(AuditLogEntry.id).execution_options(populate_existing=True)
     for entry in db.scalars(rows):
         stray_details = entry.format_version != AUDIT_FORMAT_V1 and entry.details is not None
-        if stray_details or entry.prev_hash != prev_hash or entry.hash != entry_hash(prev_hash, entry):
+        # SR-18: formats 1 and 2 do not hash `version`, so a value there could only have been added later
+        stray_version = entry.format_version < AUDIT_FORMAT_V3 and entry.version is not None
+        if stray_details or stray_version or entry.prev_hash != prev_hash or entry.hash != entry_hash(prev_hash, entry):
             return checked, entry.id
         prev_hash, checked = entry.hash, checked + 1
     return checked, None

@@ -58,6 +58,8 @@ OTHER_TABLES = {
         "batch_no",
         "count",
         "reason",
+        # SR-18: a release version number, never ballot content
+        "version",
         "format_version",
         "prev_hash",
         "hash",

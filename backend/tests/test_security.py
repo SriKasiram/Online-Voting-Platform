@@ -63,7 +63,8 @@ def test_passwords_use_argon2id() -> None:
 
 
 def test_audit_entries_form_a_hash_chain(db_session: Session) -> None:
-    """SR-16: format 2 hashes every allow-listed field, written out here independently of the writer."""
+    """SR-16: the hash covers every allow-listed field, written out here independently of the writer.
+    SR-18: new rows are format 3, which adds the release `version` (empty here)."""
     audit(db_session, "auth_rate_limited", outcome="denied", actor="unknown", role="unknown")
     audit(db_session, "BALLOT_BATCH_SEALED", outcome="success", actor="script", role="script", batch_no=2, count=10)
 
@@ -71,7 +72,7 @@ def test_audit_entries_form_a_hash_chain(db_session: Session) -> None:
 
     assert second.prev_hash == first.hash
     body = {
-        "format_version": 2,
+        "format_version": 3,
         "created_at": second.created_at.isoformat(),
         "event_type": "BALLOT_BATCH_SEALED",
         "category": "ballot_box",
@@ -82,10 +83,11 @@ def test_audit_entries_form_a_hash_chain(db_session: Session) -> None:
         "batch_no": 2,
         "count": 10,
         "reason": None,
+        "version": None,
     }
     canonical = json.dumps(body, sort_keys=True, separators=(",", ":"))
     assert second.hash == hashlib.sha256(second.prev_hash + canonical.encode()).digest()
-    assert (second.format_version, second.details) == (2, None)
+    assert (second.format_version, second.details, second.version) == (3, None, None)
 
 
 def test_rate_limiter_blocks_after_the_limit() -> None:

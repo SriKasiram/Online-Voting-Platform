@@ -22,7 +22,7 @@ from app.models import Division
 from app.rbac import check_admin_routes
 from app.request_id import assign_request_id
 from app.roll_signing import check_roll_at_startup
-from app.routers import admin, auth, ballot, register
+from app.routers import admin, auth, ballot, public, register
 from app.schemas import DivisionOut
 
 
@@ -95,6 +95,9 @@ app.include_router(ballot.router, prefix="/api")
 app.include_router(register.router, prefix="/api")
 # SR-05: staff routes, all declared through AdminRouter
 app.include_router(admin.router, prefix="/api")
+# SR-18: open routes; only the published results key. It is outside /api/admin on purpose, so a
+# recipient needs no account to fetch it
+app.include_router(public.router, prefix="/api")
 
 
 @app.get("/api/health", tags=["health"])

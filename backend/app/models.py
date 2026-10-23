@@ -362,7 +362,10 @@ class AuditLogEntry(Base):
     batch_no: Mapped[int | None]
     count: Mapped[int | None]
     reason: Mapped[str | None]
-    # SR-16: which hash formula the row was written with: 1 before SR-16, 2 from SR-16 on
+    # SR-18: the release version of a result release; empty on every other entry
+    version: Mapped[int | None]
+    # SR-16: which hash formula the row was written with: 1 before SR-16, 2 from SR-16 on.
+    # SR-18: 3 from SR-18 on, which also covers `version`; older rows keep their own formula.
     format_version: Mapped[int] = mapped_column(SmallInteger, server_default=text("1"))
     # UNIQUE prev_hash stops two entries from claiming the same predecessor
     prev_hash: Mapped[bytes] = mapped_column(unique=True)
