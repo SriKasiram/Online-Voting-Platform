@@ -264,6 +264,9 @@ def extend(request: Request, response: Response, db: DbSession) -> None:
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
 def logout(request: Request, response: Response, db: DbSession) -> None:
     """Ends the session, at either sign-in stage. Safe to call when already signed out."""
+    # SR-15: every terminal reset (Done, the receipt and idle timeouts, sign-out, a 401) calls
+    # this, often after the session has already gone. So it must keep answering 204 whatever the
+    # cookie holds, and it writes no audit entry, so resets cannot flood the audit log.
     # SR-01: deletes the session row on the server as well as clearing the cookie
     if token := request.cookies.get(SESSION_COOKIE):
         db.execute(delete(AuthSession).where(AuthSession.session_id_hash == hash_token(token)))

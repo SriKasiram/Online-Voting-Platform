@@ -31,13 +31,14 @@ async function errorCode(response: Response): Promise<string | undefined> {
   return undefined;
 }
 
-async function request<T>(method: "GET" | "POST", path: string, body?: unknown): Promise<T> {
+async function request<T>(method: "GET" | "POST", path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
   const response = await fetch(`/api${path}`, {
     method,
     // Sends the HttpOnly session cookie, which page scripts cannot read
     credentials: "same-origin",
     headers: body === undefined ? undefined : { "Content-Type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
+    signal,
   });
   if (!response.ok) throw new ApiError(response.status, await errorCode(response));
   if (response.status === 204) return undefined as T;
@@ -106,8 +107,9 @@ export async function submitBallot(
   return { receiptId: result.receipt_id };
 }
 
-export async function logout(): Promise<void> {
-  await request<void>("POST", "/auth/logout");
+// SR-15: the terminal reset passes a signal, so a stalled server cannot keep the old session on screen
+export async function logout(signal?: AbortSignal): Promise<void> {
+  await request<void>("POST", "/auth/logout", undefined, signal);
 }
 
 export type RegistrationDetails = {

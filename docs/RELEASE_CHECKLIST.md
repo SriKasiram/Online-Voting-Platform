@@ -19,3 +19,4 @@ Work through every step, in order, before a release. A release needs every requi
 6. **Ballot key (SR-11).** `BALLOT_KEY_FILE` exists on the server, and a backup of it is kept separately from the database and its backups. It is never in the repository.
 7. **TLS (SR-10).** The server starts with `python -m app.serve`, and `docs/MANUAL.md` section 6 still passes.
 8. **Acceptance confirmation (SR-14).** `ACCEPT_TIMEOUT_SECONDS` on the server is between 1 and 9 (the server refuses to start otherwise), and `docs/MANUAL.md` section 10 still passes: the confirmation holds only the reference, and a held lock gets `try_again` with nothing stored.
+9. **Session reset (SR-15).** The frontend is built without demo values for `VITE_IDLE_SECONDS`, `VITE_IDLE_WARNING_SECONDS`, `VITE_RECEIPT_SECONDS` and `VITE_RESET_LOGOUT_TIMEOUT_MS` (defaults 90, 30, 60 and 3000), and `docs/MANUAL.md` section 11 still passes.

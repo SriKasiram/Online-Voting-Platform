@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { CopyIcon } from "../components/Icons";
 import { useFocusOnMount } from "../lib/hooks";
+import { countdownAnnouncement, startReceiptCountdown } from "../lib/receiptCountdown";
 
 export type ReceiptDetails = {
   receiptId: string;
@@ -11,35 +12,29 @@ export type ReceiptDetails = {
 
 type Props = {
   receipt: ReceiptDetails;
-  onFinish: () => void;
+  // SR-15: VITE_RECEIPT_SECONDS, kept in step with the backend's POST_BALLOT_SESSION_SECONDS
+  seconds: number;
+  // SR-15: both end the session through the terminal reset: Done, or the countdown reaching 0
+  onDone: () => void;
+  onTimeout: () => void;
 };
-
-/** Shared terminals: the receipt screen signs itself out after this long. */
-const RECEIPT_SECONDS = 60;
 
 const acceptedFormat = new Intl.DateTimeFormat("en-AU", { dateStyle: "long", timeStyle: "short" });
 
-export default function Receipt({ receipt, onFinish }: Props) {
+export default function Receipt({ receipt, seconds, onDone, onTimeout }: Props) {
   const heading = useFocusOnMount<HTMLHeadingElement>();
   const codeText = useRef<HTMLParagraphElement>(null);
-  const [secondsLeft, setSecondsLeft] = useState(RECEIPT_SECONDS);
+  const [secondsLeft, setSecondsLeft] = useState(seconds);
   const [copyLabel, setCopyLabel] = useState("Copy code");
 
-  const finish = useRef(onFinish);
-  finish.current = onFinish;
+  const timeout = useRef(onTimeout);
+  timeout.current = onTimeout;
 
-  useEffect(() => {
-    const deadline = Date.now() + RECEIPT_SECONDS * 1000;
-    const timer = window.setInterval(() => {
-      const left = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
-      setSecondsLeft(left);
-      if (left === 0) {
-        window.clearInterval(timer);
-        finish.current();
-      }
-    }, 1000);
-    return () => window.clearInterval(timer);
-  }, []);
+  // SR-15: starts when the receipt appears, so every elector gets the same time to note the reference
+  useEffect(
+    () => startReceiptCountdown({ seconds, onTick: setSecondsLeft, onTimeout: () => timeout.current() }),
+    [seconds],
+  );
 
   useEffect(() => {
     if (copyLabel === "Copy code") return;
@@ -105,17 +100,22 @@ export default function Receipt({ receipt, onFinish }: Props) {
         </p>
 
         <div className="signout-timer">
+          {/* SR-15: updated every second, but not a live region, so screen readers are not told every second */}
           <p>
-            For your privacy, this screen signs out in <strong className="mono">{secondsLeft}</strong>{" "}
-            seconds.
+            This screen will clear in <strong className="mono">{secondsLeft}</strong>{" "}
+            {secondsLeft === 1 ? "second" : "seconds"}.
+          </p>
+          {/* SR-15: announced politely at 30, 10 and 5 seconds only */}
+          <p className="sr-only" aria-live="polite">
+            {countdownAnnouncement(secondsLeft)}
           </p>
           <div className="track" aria-hidden="true">
-            <div className="track-fill" style={{ width: `${(secondsLeft / RECEIPT_SECONDS) * 100}%` }} />
+            <div className="track-fill" style={{ width: `${(secondsLeft / seconds) * 100}%` }} />
           </div>
         </div>
 
-        <button type="button" className="btn btn-primary btn-block" onClick={onFinish}>
-          Finish and sign out
+        <button type="button" className="btn btn-primary btn-block" onClick={onDone}>
+          Done
         </button>
       </div>
     </section>

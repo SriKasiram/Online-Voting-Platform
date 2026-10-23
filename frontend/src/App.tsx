@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { flushSync } from "react-dom";
 import {
   ApiError,
@@ -11,12 +11,18 @@ import {
   verifyCode,
 } from "./api/client";
 import type { BallotDefinition } from "./api/types";
+import IdleWarning from "./components/IdleWarning";
 import Layout from "./components/Layout";
 import SessionWarning from "./components/SessionWarning";
 import type { Ranking } from "./lib/ballotRules";
 // SR-09: one place that clears the ballot, and the pagehide/pageshow handling
-import { acceptBallot, clearBallotState, endSession, registerPageLifecycle, sessionLost } from "./lib/clientSession";
+import { acceptBallot, clearBallotState, endSession, registerPageLifecycle } from "./lib/clientSession";
 import { useSessionTimer } from "./lib/hooks";
+// SR-15: the terminal reset, its settings and the idle timer
+import { warningToShow } from "./lib/idleController";
+import { createTerminalReset, sessionEndHandlers } from "./lib/terminalReset";
+import { TERMINAL } from "./lib/terminalSettings";
+import { useIdleReset } from "./lib/useIdleReset";
 import Ballot from "./pages/Ballot";
 import Login from "./pages/Login";
 import Receipt, { type ReceiptDetails } from "./pages/Receipt";
@@ -65,17 +71,43 @@ export default function App() {
   // SR-09: the ballot paper, its token and the ranking, cleared only through clearBallotState
   const clearBallot = useCallback(() => clearBallotState({ setBallot, setRanking }), []);
 
-  // Clears everything held in the browser, so the next voter on a shared
-  // terminal starts from a blank screen.
-  const signOut = useCallback(
-    async (message = "") => {
+  // SR-15: everything the app holds about this elector, cleared before the server is even told,
+  // in case the navigation that follows is slow
+  const clearAll = useCallback(() => {
+    clearBallot();
+    setReceipt(null);
+    setVoterName(null);
+    setNotice("");
+    setExtension("allowed");
+    setLoginKey((key) => key + 1);
+    setScreen("login");
+  }, [clearBallot]);
+
+  // SR-15: made once per page load, so its guard lets only the first reset run. The full
+  // navigation discards memory, and replace() stops Back from returning to the old session.
+  const reset = useMemo(
+    () =>
+      createTerminalReset({
+        clear: clearAll,
+        logout,
+        navigate: () => window.location.replace(import.meta.env.BASE_URL),
+        logoutTimeoutMs: TERMINAL.logoutTimeoutMs,
+      }),
+    [clearAll],
+  );
+  const ends = useMemo(() => sessionEndHandlers((reason) => void reset(reason)), [reset]);
+
+  // Returns to the sign-in form with a message, for the cases where the voter must be told why
+  // they cannot vote. SR-15: no ballot is open by then, and the idle reset still applies there.
+  const returnToSignIn = useCallback(
+    async (message: string) => {
       setScreen("login");
       setVoterName(null);
       setReceipt(null);
       setNotice(message);
       setLoginKey((key) => key + 1);
       setExtension("allowed"); // SR-04: the next sign in starts with its extensions unused
-      // SR-09: the voter, the session timer and a lost session (401) all sign out here
+      // SR-09: the selections go first, then the server is told
       await endSession(clearBallot, logout);
     },
     [clearBallot],
@@ -87,9 +119,11 @@ export default function App() {
 
   // Runs only while someone is signed in. Registration has its own 10-minute limit on the server.
   const signedIn = screen === "ballot" || screen === "review" || screen === "receipt";
-  const session = useSessionTimer(signedIn, SESSION_MINUTES, () => {
-    void signOut(SESSION_ENDED);
-  });
+  // SR-15: the end of the SR-04 session resets the terminal like any other end
+  const session = useSessionTimer(signedIn, SESSION_MINUTES, ends.sessionExpired);
+
+  // SR-15: every elector screen except the receipt, which has its own countdown
+  const idle = useIdleReset(screen !== "receipt", TERMINAL.idleSeconds, TERMINAL.idleWarningSeconds, ends.idleTimeout);
 
   // Leaving registration, finished or not, starts the sign-in form afresh.
   // Everything typed into registration lived in the Register screen and goes with it.
@@ -103,6 +137,8 @@ export default function App() {
   // SR-04: once the voter has read that no more time is available, the warning stays closed
   const warningOpen =
     ballotOpen && session.secondsLeft > 0 && session.secondsLeft <= WARN_SECONDS && extension !== "acknowledged";
+  // SR-15: never both warnings at once; the one that ends sooner is shown
+  const shownWarning = warningToShow(warningOpen ? session.secondsLeft : null, idle.warningSecondsLeft);
 
   async function handleKeepVoting() {
     // SR-04: after a refusal the button only closes the warning, and the session ends on time
@@ -120,7 +156,9 @@ export default function App() {
         setExtension("refused");
         return;
       }
-      void signOut(SESSION_ENDED);
+      // SR-15: a 401 means the session is gone, so the terminal resets
+      if (ends.apiError(error)) return;
+      void returnToSignIn(SESSION_ENDED);
     }
   }
 
@@ -131,8 +169,10 @@ export default function App() {
     try {
       definition = await getBallot();
     } catch (error) {
+      // SR-15: a 401 means the session is gone, so the terminal resets
+      if (ends.apiError(error)) return;
       // Signed in, but this account gets no ballot. End the session and say why.
-      void signOut(noBallotMessage(error));
+      void returnToSignIn(noBallotMessage(error));
       return;
     }
     setNotice("");
@@ -148,13 +188,10 @@ export default function App() {
     try {
       ({ receiptId } = await submitBallot(ballotToken, ranked));
     } catch (error) {
-      // SR-09: session lost: signing out clears the ballot
-      if (sessionLost(error)) {
-        void signOut(SESSION_ENDED);
-        return;
-      }
+      // SR-09: session lost, so the ballot goes. SR-15: through the terminal reset.
+      if (ends.apiError(error)) return;
       if (error instanceof ApiError && error.code === "already_voted") {
-        void signOut(noBallotMessage(error));
+        void returnToSignIn(noBallotMessage(error));
         return;
       }
       // Anything else: the review screen offers to try again
@@ -170,7 +207,8 @@ export default function App() {
       step={STEP[screen]}
       voterName={voterName}
       sessionSecondsLeft={ballotOpen ? session.secondsLeft : null}
-      onSignOut={() => void signOut("You have signed out.")}
+      // SR-15: signing out resets the terminal like finishing does
+      onSignOut={ends.signOut}
     >
       {screen === "login" && (
         <Login
@@ -199,19 +237,23 @@ export default function App() {
         />
       )}
       {screen === "receipt" && receipt && (
-        <Receipt
-          receipt={receipt}
-          onFinish={() => void signOut("You have been signed out. Thank you for voting.")}
-        />
+        // SR-15: finishing, by Done or by the countdown, resets the terminal
+        <Receipt receipt={receipt} seconds={TERMINAL.receiptSeconds} onDone={ends.done} onTimeout={ends.receiptTimeout} />
       )}
       <SessionWarning
-        open={warningOpen}
+        open={shownWarning === "session"}
         secondsLeft={session.secondsLeft}
         minutes={SESSION_MINUTES}
         // SR-04: the warning offers more time only while the server still allows it
         canExtend={extension === "allowed"}
         onKeep={() => void handleKeepVoting()}
-        onSignOut={() => void signOut("You have signed out.")}
+        onSignOut={ends.signOut}
+      />
+      {/* SR-15: an elector who has stopped using the screen is asked before the session ends */}
+      <IdleWarning
+        open={shownWarning === "idle"}
+        secondsLeft={idle.warningSecondsLeft ?? 0}
+        onStillHere={idle.stillHere}
       />
     </Layout>
   );

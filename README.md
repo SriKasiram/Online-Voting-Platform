@@ -239,6 +239,9 @@ Optional. The defaults work as they are. To change them, copy `frontend/.env.exa
 |---|---|---|
 | `VITE_SESSION_MINUTES` | Length of a voting session. The voter is warned 1 minute before it ends. Keep it equal to `SESSION_MINUTES` | `10` |
 | `VITE_API_TARGET` | Where the dev server forwards `/api` requests (SR-10: HTTPS) | `https://localhost:8443` |
+| `VITE_IDLE_SECONDS`, `VITE_IDLE_WARNING_SECONDS` | SR-15: seconds without input before "Are you still there?", and how long that warning stays before the reset. See [SR-15](#sr-15-ending-finished-and-abandoned-sessions) | `90`, `30` |
+| `VITE_RECEIPT_SECONDS` | SR-15: seconds the receipt screen stays. Keep it equal to the backend's `POST_BALLOT_SESSION_SECONDS` | `60` |
+| `VITE_RESET_LOGOUT_TIMEOUT_MS` | SR-15: how long the reset waits for the logout request (500 to 3000) | `3000` |
 
 ### Backend
 
@@ -277,7 +280,7 @@ Never commit a real `.env` file. Only `.env.example` belongs in Git.
 - Sign in and registration step 1 each show one generic message for every failure, so the screen never reveals which detail was wrong, or who is on the roll.
 - Passwords are cleared from the page as soon as they are sent. The authenticator secret and QR code exist only while step 3 is on screen.
 - The session timer counts down from sign in. Ordinary activity does not reset it. Only the voter choosing Keep voting in the warning calls `POST /api/auth/extend`, and only that call extends the server session. The timer restarts only once the server agrees. After the second extension the warning says no more time is available, and the session ends on time (SR-04).
-- The receipt screen signs itself out after 60 seconds, for shared terminals.
+- Finishing or leaving a session resets the screen within 5 seconds: Done or 60 seconds on the receipt screen, 120 seconds without input, sign out, session end or a lost session. The start page is then loaded afresh (see [SR-15](#sr-15-ending-finished-and-abandoned-sessions)).
 - Fonts are bundled with the app (no font CDN), and the QR code is drawn in the browser, so the page makes no third-party requests.
 - Sessions live in `HttpOnly`, `SameSite=Strict` cookies, so page scripts cannot read them and other sites cannot send them. The frontend and API are served from one origin, https://localhost:8443 (SR-10).
 
@@ -703,9 +706,11 @@ The elector's selections exist only in the browser tab's memory, and only while 
 | When | How |
 |---|---|
 | The ballot is accepted | `acceptBallot` clears it before the receipt shows |
-| Sign out: top bar, the session warning, the receipt screen and its 60-second timer | `signOut`, then `endSession`: cleared first, then `POST /api/auth/logout`. A failed logout still leaves it cleared |
-| The session timer runs out | The timer calls `signOut` |
-| The session is lost: a 401 when submitting, or any failure to extend the session or load the ballot | `signOut` |
+| Sign out: top bar, the session warning, the receipt screen's Done and its 60-second timer | SR-15: the terminal reset: cleared first, then `POST /api/auth/logout`, then the start page is loaded afresh. A failed logout still leaves it cleared |
+| The session timer runs out | SR-15: the terminal reset |
+| No input for 120 seconds (SR-15) | The terminal reset |
+| The session is lost: a 401 when submitting, extending the session or loading the ballot | SR-15: the terminal reset |
+| Any other failure to extend the session or load the ballot, or `already_voted` on submit | `returnToSignIn`, then `endSession`: cleared first, then `POST /api/auth/logout`, and the reason is shown on the sign-in screen |
 | The page is left (`pagehide`) | Cleared at once |
 
 Ballot and Review render only while a ballot is open, so their own state goes with it: the undo history, the screen reader announcements, the confirm tick and messages. Closing the tab discards all of it anyway.
@@ -1046,6 +1051,99 @@ pytest tests/test_sr14_confirmation.py -v
 - signed receipts;
 - load testing;
 - latency monitoring.
+
+## SR-15: ending finished and abandoned sessions
+
+On every voting device, polling-place terminals included, the app ends the elector's session, clears all ballot data and returns to the start screen within 5 seconds of the elector finishing or abandoning the session.
+
+**When it happens.**
+
+| Trigger | When |
+|---|---|
+| Done | The elector selects **Done** on the receipt screen |
+| Receipt countdown | 60 seconds after the receipt appears (`VITE_RECEIPT_SECONDS`). The screen shows "This screen will clear in N seconds." |
+| Idle | 90 seconds without input (`VITE_IDLE_SECONDS`) opens "Are you still there?". 30 more seconds without input (`VITE_IDLE_WARNING_SECONDS`) ends the session: 120 seconds in all |
+| Sign out | **Sign out** in the top bar or in the SR-04 session warning |
+| Session expiry | The SR-04 session timer runs out |
+| Lost session | A 401 from a signed-in call: loading the ballot, submitting it or extending the session |
+
+**The idle timer** runs on every elector screen: sign in, code entry, registration, ballot and review. The receipt screen has its own countdown instead.
+- **What counts as input.** `keydown`, `pointerdown`, `pointermove`, `wheel` and `touchstart` on the window, with at most one timer restart a second.
+- **The warning.** It is an alert dialog with one button, **I'm still here**, which gets the focus. Any input, or the button, closes the warning and restarts the 90 seconds.
+- **Never two warnings.** If the SR-04 session warning would show at the same time, the one that ends sooner is shown.
+- **A fresh start page.** There, the timer starts at the first input. A blank start page holds nothing to clear, and every session begins with input on it.
+
+**The receipt screen** shows the SR-14 reference, a **Done** button and the countdown. Focus moves to its heading when it opens. Screen readers hear the countdown at 30, 10 and 5 seconds, not every second.
+
+**The reset** (`frontend/src/lib/terminalReset.ts`). Every trigger above calls the same function. It does three things, in order:
+1. clears the ballot, its token, the selections, the receipt and the rest of the app's state, through the SR-09 `clearBallotState`;
+2. calls `POST /api/auth/logout`, aborted after 3 seconds (`VITE_RESET_LOGOUT_TIMEOUT_MS`), and ignores any error;
+3. loads the start page afresh with `window.location.replace`. This discards everything in memory, and Back cannot return to the old session.
+
+More about the reset:
+- **5 seconds, even with the server down.** A safety timer loads the start page 4.5 seconds after the reset starts, even if the logout and its abort both stall.
+- **Once only.** Only the first call runs. Pressing Done just as the countdown ends resets once.
+- **The reason** (`done`, `receipt_timeout`, `idle_timeout`, `sign_out`, `session_expired` or `unauthorised`) exists only for readable code and tests. It is never logged, stored or sent.
+- **No message after a reset.** The start page is loaded afresh, and nothing may be kept in browser storage (SR-09). So it no longer says "You have signed out" or "Your session ended".
+- **Messages that are still shown.** "You have already voted" and "You are not enrolled" still appear. Those cases return to sign-in without a reset, and no ballot is open by then.
+- **On page close.** The SR-09 `pagehide` clearing is unchanged.
+
+**Everywhere, and always on.** The same rules apply on polling-place terminals and on personal devices. There is no terminal mode and no setting that turns the reset off. The staff page (SR-06) keeps its own session rules.
+
+**The server.** Logout already did what SR-15 needs, so no backend logic changed.
+- **Ends the session.** It deletes the session row and clears the cookie with the same attributes it was set with: Secure, HttpOnly, SameSite=Strict and path `/`.
+- **Same answer every time.** It answers `204` with no session, an unknown one or an expired one, so a repeated reset never shows an error.
+- **No audit entry,** so resets cannot flood the audit log.
+- **Unchanged.** Session lifetimes and the SR-04 60-second rule after a ballot.
+
+**Shorter timers for a demo.** Set these in `frontend/.env` (copied from `frontend/.env.example`):
+
+| Variable | Default | Allowed |
+|---|---|---|
+| `VITE_IDLE_SECONDS` | `90` | 5 to 600 |
+| `VITE_IDLE_WARNING_SECONDS` | `30` | 5 to 120 |
+| `VITE_RECEIPT_SECONDS` | `60` | 5 to 120 |
+| `VITE_RESET_LOGOUT_TIMEOUT_MS` | `3000` | 500 to 3000 |
+
+- **Demo only.** Lower values exist only so a demo can be recorded quickly, for example `VITE_IDLE_SECONDS=10` and `VITE_IDLE_WARNING_SECONDS=5`.
+- **No way to turn it off.** A missing, non-numeric, zero or negative value uses the default, and any other value is clamped to its range.
+- **Before a release,** remove the demo values and build again.
+
+**Build again after frontend changes.** The backend serves the built frontend over HTTPS (SR-10), and these settings are built into it. So after pulling this change, or changing a setting, run `npm run build` in `frontend/`, then restart `python -m app.serve`.
+
+**A polling-place style demo (optional).** Start Chrome in kiosk mode with a fresh, throwaway profile (PowerShell), and close it with Alt+F4:
+
+```powershell
+& "C:\Program Files\Google\Chrome\Application\chrome.exe" --kiosk --incognito --user-data-dir="$env:TEMP\evoting-kiosk" https://localhost:8443
+```
+
+This only shows what a terminal session looks like. Real terminal lockdown is design only (below).
+
+Run the SR-15 tests:
+
+```
+cd frontend
+npm test                                   # includes src/lib/terminalReset, idleController, receiptCountdown and terminalSettings tests
+cd ../backend
+pytest tests/test_sr15_logout.py -v
+```
+
+**SR-15 assumptions:**
+- **One app everywhere.** Supervised polling-place terminals and electors' own devices use the same web app. Personal devices may be shared too, so the reset applies everywhere.
+- **The browser does the timing.** If the browser is closed, crashes or is tampered with, the server session still ends at its SR-04 expiry: 10 minutes after sign in, or 60 seconds after a ballot.
+- **How the 5 seconds is measured.** In the browser, from the finish or abandonment event to the start screen.
+- **60 seconds is enough** to note the SR-14 reference.
+- **A fresh start page waits for input** before its idle timer starts (see above).
+- **Lost session means signed-in calls only.** A 401 resets only after the ballot, submit or extend calls. The sign-in steps' own 401 for wrong details still shows the usual sign-in message.
+
+**SR-15 design only (polling-place terminals), not implemented:**
+- kiosk mode with a fresh browser profile for each session;
+- managed, signed terminal images;
+- Secure Boot;
+- application allow-listing;
+- a watchdog that restarts the voting browser;
+- a server-side idle timeout with a heartbeat;
+- a `Clear-Site-Data` header on logout.
 
 ## Folder layout
 
