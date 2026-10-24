@@ -25,7 +25,13 @@ def readable_by_others(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(key_files, "readable_by_others", lambda path: True)
 
 
-def test_symmetric_key_reasons(tmp_path: Path) -> None:
+@pytest.fixture
+def owner_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A key file only its owner can read, on any system (a file a test writes is 0644 on Linux)."""
+    monkeypatch.setattr(key_files, "readable_by_others", lambda path: False)
+
+
+def test_symmetric_key_reasons(tmp_path: Path, owner_only) -> None:
     """SR-11, SR-20: a missing file, a wrong size, and a good 32-byte key."""
     with pytest.raises(KeyFileProblem) as missing:
         read_symmetric_key(tmp_path / "none.key")
@@ -56,6 +62,8 @@ def test_the_ballot_key_messages_are_unchanged(tmp_path: Path, monkeypatch: pyte
     with pytest.raises(BallotKeyError, match=re.escape(f"No ballot key at {path}. Create it with: python -m scripts.gen_ballot_key")):
         load_key(path)
     path.write_bytes(b"x" * 16)
+    # owner-only on every system, so the size check is reached (SR-11 checks the permissions first)
+    monkeypatch.setattr(key_files, "readable_by_others", lambda p: False)
     with pytest.raises(BallotKeyError, match=re.escape(f"The ballot key {path} must be exactly 32 bytes (AES-256), not 16")):
         load_key(path)
     monkeypatch.setattr(key_files, "readable_by_others", lambda p: True)
