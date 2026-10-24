@@ -19,6 +19,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session
 
+from helpers import outcome, start_api
 from app.ballot_definitions import active_definition, canonical, payload_hash, verify_definition
 from app.config import BACKEND_DIR, settings
 from app.main import app
@@ -76,10 +77,6 @@ def signed(keys: dict, payload: str, *delegates: str) -> list[dict[str, str]]:
     return [sign(keys[d], payload) for d in delegates]
 
 
-def outcome(response) -> tuple[int, dict]:
-    return response.status_code, response.json()
-
-
 def ballot_entry(payload: str, division: str) -> dict:
     return next(d for d in json.loads(payload)["divisions"] if d["name"] == division)
 
@@ -91,12 +88,6 @@ def tamper(db_session: Session, election_id, old: str, new: str) -> None:
         update(BallotDefinition).where(BallotDefinition.id == definition.id).values(payload=definition.payload.replace(old, new))
     )
     db_session.commit()
-
-
-def start_api() -> None:
-    """The API's start-up, against the test database (the client fixture has pointed it there)."""
-    with TestClient(app):
-        pass
 
 
 # ---------------------------------------------------------------

@@ -14,12 +14,12 @@ from pathlib import Path
 
 from app.config import settings
 # SR-20: the same 32-random-byte, owner-only (0600) writer as the SR-11 ballot key, for a separate file
-from scripts.gen_ballot_key import generate_ballot_key
+from scripts.signing_keys import write_secret_key
 
 
 def generate_backup_key(path: Path, force: bool = False) -> Path:
     """SR-20: a new backup key. Never overwrites unless force (raises FileExistsError)."""
-    return generate_ballot_key(path, force=force)
+    return write_secret_key(path, force=force)
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -32,11 +32,12 @@ from sqlalchemy.orm import Session
 
 import app.models  # noqa: F401  (registers every table on Base.metadata)
 from app.db import Base
+# SR-20: the key file checks are shared with the SR-11 ballot key (app/key_files.py)
+from app.key_files import KEY_BYTES, KeyFileProblem, read_symmetric_key
 from app.stores import BALLOT_TABLES, IDENTITY_TABLES, NOT_APPLICATION_DATA
 
 FORMAT_VERSION = 0x01
 NONCE_BYTES = 12
-KEY_BYTES = 32
 AAD_TAG = b"evoting-backup-v1|"
 IDENTITY_FILE = "identity.jsonl"
 BALLOT_FILE = "ballot.jsonl"
@@ -62,14 +63,16 @@ class BackupRefused(Exception):
 def load_backup_key(path: Path) -> bytes:
     """SR-20: the 32-byte backup key, or BackupRefused. On POSIX it must not be readable by others."""
     path = Path(path)
-    if not path.is_file():
-        raise BackupRefused("backup_key_missing", f"no backup key at {path}. Create it with: python -m scripts.gen_backup_key")
-    key = path.read_bytes()
-    if len(key) != KEY_BYTES:
-        raise BackupRefused("backup_key_invalid", f"{path} must be exactly {KEY_BYTES} bytes (AES-256)")
-    if os.name == "posix" and path.stat().st_mode & 0o077:
-        raise BackupRefused("backup_key_invalid", f"{path} can be read by other users: chmod 600 it")
-    return key
+    try:
+        # SR-20: the size is checked before the permissions, as it always was here
+        return read_symmetric_key(path, size_first=True)
+    except KeyFileProblem as problem:
+        refusals = {
+            "missing": ("backup_key_missing", f"no backup key at {path}. Create it with: python -m scripts.gen_backup_key"),
+            "wrong_size": ("backup_key_invalid", f"{path} must be exactly {KEY_BYTES} bytes (AES-256)"),
+            "readable_by_others": ("backup_key_invalid", f"{path} can be read by other users: chmod 600 it"),
+        }
+        raise BackupRefused(*refusals[problem.reason]) from None
 
 
 # ---------------------------------------------------------------

@@ -16,7 +16,6 @@ you trust. Nothing under app/ imports this file or the private key.
 
 from pathlib import Path
 
-from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -25,6 +24,8 @@ from app.config import BACKEND_DIR, settings
 from app.db import SessionLocal
 from app.models import ElectoralRollEntry
 from app.roll_signing import record_message
+# SR-02: the shared key-pair helper and the one signing call (scripts/signing_keys.py)
+from scripts.signing_keys import load_or_create_key_pair, sign
 
 PRIVATE_KEY_PATH = BACKEND_DIR / "keys" / "roll_private.pem"
 
@@ -36,29 +37,12 @@ def load_or_create_private_key(
     SR-02: loads the private key, first creating a new development key pair if
     there is none, and writes the matching public key where the API reads it.
     """
-    public_path = public_path or settings.roll_public_key_path
-    if private_path.exists():
-        key = serialization.load_pem_private_key(private_path.read_bytes(), password=None)
-        if not isinstance(key, Ed25519PrivateKey):
-            raise SystemExit(f"{private_path} is not an Ed25519 private key")
-    else:
-        key = Ed25519PrivateKey.generate()
-        private_path.parent.mkdir(parents=True, exist_ok=True)
-        private_path.write_bytes(
-            key.private_bytes(
-                serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
-            )
-        )
-    public_path.parent.mkdir(parents=True, exist_ok=True)
-    public_path.write_bytes(
-        key.public_key().public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo)
-    )
-    return key
+    return load_or_create_key_pair(private_path, public_path or settings.roll_public_key_path)
 
 
 def sign_record(key: Ed25519PrivateKey, entry: ElectoralRollEntry) -> bytes:
     # SR-02: signs the same bytes that app/roll_signing.py verifies
-    return key.sign(record_message(entry))
+    return sign(key, record_message(entry))
 
 
 def sign_all(session: Session, key: Ed25519PrivateKey) -> int:

@@ -12,9 +12,7 @@ import json
 import os
 import subprocess
 import sys
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -31,6 +29,8 @@ from app.ballot_crypto import (
 from app.config import PROJECT_DIR, settings
 from app.db import SessionLocal
 from app.stores import ballot_rows
+# SR-11: the shared check type and report lines (scripts/report.py), kept importable from here
+from scripts.report import Check, Status, check_line, exit_code, summary_line, tally  # noqa: F401
 
 # SR-11: the only columns ballots may have. Any other column could hold a readable ballot.
 BALLOT_COLUMNS = {"id", "election_id", "encrypted_payload"}
@@ -66,16 +66,6 @@ OTHER_TABLES = {
     },
 }
 SKIP_DIRS = {".git", "node_modules", ".venv", "dist", "__pycache__", ".pytest_cache"}
-
-Status = Literal["PASS", "FAIL", "SKIPPED"]
-
-
-@dataclass
-class Check:
-    name: str
-    status: Status
-    reason: str
-
 
 def columns_of(db: Session, table: str) -> dict[str, str]:
     rows = db.execute(
@@ -221,15 +211,13 @@ def main() -> int:
     with SessionLocal() as db:
         checks = run_audit(db, PROJECT_DIR)
     for check in checks:
-        print(f"{check.status:<8} {check.name}: {check.reason}")
-    failed = sum(check.status == "FAIL" for check in checks)
-    skipped = sum(check.status == "SKIPPED" for check in checks)
-    passed = len(checks) - failed - skipped
-    print(f"Summary: {passed} passed, {failed} failed, {skipped} skipped")
+        print(check_line(check))
+    _, failed, skipped = tally(checks)
+    print(summary_line(checks))
     if skipped:
         print("WARNING: a skipped check was not verified. Run the audit where git is available, inside the repository.")
     print("Result: FAIL (exit code 1)" if failed else "Result: PASS (exit code 0)")
-    return 1 if failed else 0
+    return exit_code(not failed)
 
 
 if __name__ == "__main__":

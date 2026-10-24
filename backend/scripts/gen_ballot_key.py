@@ -9,12 +9,11 @@ the database: without it no stored ballot can ever be read again.
 """
 
 import argparse
-import os
 from pathlib import Path
 
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-
 from app.config import settings
+# SR-11: the shared secret-key writer (scripts/signing_keys.py), also used for the SR-20 backup key
+from scripts.signing_keys import write_secret_key
 
 WARNING = """
 WARNING: back this key up now, somewhere safe and separate from the database.
@@ -25,15 +24,7 @@ Never commit it, email it or copy it into the project's documents. keys/ is in .
 
 def generate_ballot_key(path: Path, force: bool = False) -> Path:
     """SR-11: writes 32 random bytes to path, owner-only (0600) where the OS supports it. Never overwrites unless force."""
-    if path.exists() and not force:
-        raise FileExistsError(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # SR-11: created owner-only, never readable by others even for a moment
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "wb") as file:
-        file.write(AESGCM.generate_key(bit_length=256))
-    os.chmod(path, 0o600)  # also when --force replaced an older, wider file
-    return path
+    return write_secret_key(path, force=force)
 
 
 def main() -> None:

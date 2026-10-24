@@ -21,7 +21,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -37,6 +36,8 @@ from app.ballot_chain import (
     verify_chain,
 )
 from app.ballot_definitions import canonical
+# SR-13: the shared private key loader (kept importable from here) and the one signing call
+from scripts.signing_keys import load_private_key, sign  # noqa: F401
 from app.config import settings
 from app.db import SessionLocal
 from app.audit_events import FAILURE, SCRIPT, SUCCESS
@@ -163,17 +164,10 @@ def append_checkpoint(path: Path, content: dict[str, Any], private_key: Ed25519P
     SR-13: signs one checkpoint and appends it to the file as a JSON line, with a base64 signature.
     SR-16: shared with scripts/audit_checkpoint.py, which passes the audit log's own tag.
     """
-    signature = base64.b64encode(private_key.sign(checkpoint_message(content, tag))).decode()
+    signature = base64.b64encode(sign(private_key, checkpoint_message(content, tag))).decode()
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8", newline="\n") as file:
         file.write(canonical(content | {"signature": signature}) + "\n")
-
-
-def load_private_key(path: Path) -> Ed25519PrivateKey:
-    key = serialization.load_pem_private_key(path.read_bytes(), password=None)
-    if not isinstance(key, Ed25519PrivateKey):
-        raise SystemExit(f"{path} is not an Ed25519 private key")
-    return key
 
 
 def main(argv: list[str] | None = None) -> int:

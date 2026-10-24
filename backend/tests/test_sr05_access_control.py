@@ -17,6 +17,7 @@ from sqlalchemy import func, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from helpers import last_id
 from app import rbac
 from app.main import app
 from app.models import Account, AccountRole, AuditLogEntry, ParticipationState, VoterParticipation
@@ -69,10 +70,6 @@ def state(db_session: Session, roll_id: uuid.UUID) -> ParticipationState | None:
 def audit_since(db_session: Session, before: int, *events: str) -> list[AuditLogEntry]:
     query = select(AuditLogEntry).where(AuditLogEntry.id > before).order_by(AuditLogEntry.id)
     return list(db_session.scalars(query.where(AuditLogEntry.event_type.in_(events)) if events else query))
-
-
-def last_id(db_session: Session) -> int:
-    return db_session.scalar(select(func.coalesce(func.max(AuditLogEntry.id), 0)))
 
 
 # ---------------------------------------------------------------

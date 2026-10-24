@@ -10,12 +10,13 @@ from datetime import timedelta
 import pyotp
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import func, select, text
+from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from helpers import account_row, last_id, outcome
 from app.config import Settings, settings
-from app.models import Account, AuditLogEntry, AuthSession, SessionStage
+from app.models import AuditLogEntry, AuthSession, SessionStage
 from app.security import SESSION_COOKIE, decrypt, hash_token
 
 EXTEND = "/api/auth/extend"
@@ -37,10 +38,6 @@ def shipped_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(settings, name, Settings.model_fields[name].default)
 
 
-def outcome(response) -> tuple[int, dict]:
-    return response.status_code, response.json()
-
-
 def login(client: TestClient, user, password: str | None = None):
     return client.post("/api/auth/login", json={"username": user.username, "password": password or user.password})
 
@@ -58,18 +55,9 @@ def wrong_code(user, clock) -> str:
     return next(c for c in ("000000", "111111", "222222", "333333") if c not in valid)
 
 
-def account_row(db_session: Session, user) -> Account:
-    db_session.expire_all()
-    return db_session.get_one(Account, user.account_id)
-
-
 def session_row(db_session: Session, token: str) -> AuthSession:
     db_session.expire_all()
     return db_session.get_one(AuthSession, hash_token(token))
-
-
-def last_id(db_session: Session) -> int:
-    return db_session.scalar(select(func.coalesce(func.max(AuditLogEntry.id), 0)))
 
 
 def events(db_session: Session, before: int, *types: str) -> list[AuditLogEntry]:

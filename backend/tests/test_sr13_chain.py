@@ -9,8 +9,7 @@ import base64
 import json
 import os
 import uuid
-from collections.abc import Iterator
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from pathlib import Path
 
 import pytest
@@ -20,6 +19,7 @@ from sqlalchemy import select, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 
+from helpers import triggers_off
 from app.ballot_chain import (
     checkpoint_file,
     checkpoint_message,
@@ -83,18 +83,6 @@ def three_batches(db: Session, election_id: uuid.UUID, keys: Keys) -> None:
 def chain(db: Session, election_id: uuid.UUID) -> list[BallotChainEntry]:
     db.expire_all()
     return list(db.scalars(select(BallotChainEntry).where(BallotChainEntry.election_id == election_id).order_by(BallotChainEntry.position)))
-
-
-@contextmanager
-def triggers_off(db: Session, *tables: str) -> Iterator[None]:
-    """SR-13: tampering as only a database owner could. Back on afterwards (and the test's transaction is rolled back)."""
-    for table in tables:
-        db.execute(text(f"ALTER TABLE {table} DISABLE TRIGGER {table}_append_only"))
-    try:
-        yield
-    finally:
-        for table in tables:
-            db.execute(text(f"ALTER TABLE {table} ENABLE TRIGGER {table}_append_only"))
 
 
 # ---------------------------------------------------------------

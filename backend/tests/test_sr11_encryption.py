@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from helpers import start_api
 from app.ballot_crypto import (
     DIVISION_FIELD,
     PAYLOAD_FIELDS,
@@ -28,7 +29,6 @@ from app.ballot_crypto import (
     encrypt_ballot,
 )
 from app.config import settings
-from app.main import app
 from scripts import audit_ballots
 from scripts.gen_ballot_key import generate_ballot_key
 
@@ -146,12 +146,6 @@ def test_wrong_key_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Non
 # ---------------------------------------------------------------
 # The key at start-up
 # ---------------------------------------------------------------
-
-
-def start_api() -> None:
-    """The API's real start-up (its lifespan), as uvicorn runs it."""
-    with TestClient(app):
-        pass
 
 
 POSIX_ONLY = pytest.mark.skipif(os.name != "posix", reason="Windows has no group or other permission bits")

@@ -7,20 +7,18 @@ import hashlib
 import logging
 import re
 import time
-from collections.abc import Iterator
 
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
-from sqlalchemy import Engine, func, select, text
+from sqlalchemy import Engine, select, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
+from helpers import CommittedDatabase, count, state_of, token_row
 from app.config import Settings, settings
-from app.db import Base
-from app.deps import get_db
 from app.main import app
-from app.models import Account, Ballot, BallotToken, ParticipationState, VoterParticipation
+from app.models import Account, Ballot, ParticipationState
 from app.routers import ballot as ballot_router
 from app.security import SESSION_COOKIE
 from scripts import audit_separation
@@ -47,22 +45,6 @@ def open_paper(client: TestClient, make_voter, sign_in) -> tuple[dict, object]:
 def submit(client: TestClient, paper: dict, token: str | None = None):
     ranking = [c["id"] for c in reversed(paper["candidates"])]
     return client.post(SUBMIT, json={"ballot_token": token or paper["ballot_token"], "ranked_candidate_ids": ranking})
-
-
-def token_row(db: Session, token: str) -> BallotToken:
-    db.expire_all()
-    return db.scalars(select(BallotToken).where(BallotToken.token_hash == hashlib.sha256(token.encode()).hexdigest())).one()
-
-
-def count(db: Session, model) -> int:
-    db.expire_all()
-    return db.scalar(select(func.count()).select_from(model))
-
-
-def state_of(db: Session, voter) -> ParticipationState:
-    db.expire_all()
-    roll_id = db.get_one(Account, voter.account_id).roll_id
-    return db.scalars(select(VoterParticipation.state).where(VoterParticipation.roll_id == roll_id)).one()
 
 
 def rows_text(db: Session, *tables: str) -> str:
@@ -239,30 +221,12 @@ def test_only_lock_and_statement_timeouts_count_as_timeouts(sqlstate: str | None
     assert ballot_router.timed_out(OperationalError("statement", {}, cause)) is expected
 
 
-class TestAcceptTimeout:
+class TestAcceptTimeout(CommittedDatabase):
     """
     SR-14: a real lock held by a second connection. Like SR-03's concurrency tests, these replace the
     db_session and client fixtures with committing ones (a second connection only sees committed
     rows), and empty the test database afterwards.
     """
-
-    @pytest.fixture
-    def db_session(self, engine: Engine) -> Iterator[Session]:
-        with Session(engine) as session:
-            yield session
-        with engine.begin() as connection:
-            tables = ", ".join(table.name for table in Base.metadata.sorted_tables)
-            connection.execute(text(f"TRUNCATE {tables} RESTART IDENTITY CASCADE"))
-
-    @pytest.fixture
-    def client(self, engine: Engine) -> Iterator[TestClient]:
-        def real_db() -> Iterator[Session]:
-            with Session(engine) as session:
-                yield session
-
-        app.dependency_overrides[get_db] = real_db
-        yield TestClient(app, base_url="https://testserver")
-        app.dependency_overrides.clear()
 
     def test_locked_participation_row_gets_try_again_and_the_retry_works(
         self, client: TestClient, db_session: Session, engine: Engine, election, make_voter, sign_in, monkeypatch

@@ -25,7 +25,8 @@ from sqlalchemy.orm import Session
 from app.audit_events import FAILURE, UNKNOWN
 from app.config import settings
 from app.models import BallotDefinition, Election, ElectionStatus
-from app.roll_signing import parse_public_key, verify_signature
+# SR-07: the shared public key parser and Ed25519 check (app/key_files.py)
+from app.key_files import parse_public_key, verify_signature
 from app.security import audit, utc_now
 
 logger = logging.getLogger(__name__)

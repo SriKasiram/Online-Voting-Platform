@@ -47,10 +47,11 @@ from app.config import settings
 from app.db import engine
 from app.house_count import CountRefused, run_count
 from app.result_dataset import build_dataset, key_fingerprint, load_results_public_key
-from app.roll_signing import verify_signature
+# SR-18: the shared Ed25519 check (app/key_files.py)
+from app.key_files import verify_signature
 from app.security import audit
-# SR-18: the SR-13 Ed25519 private key loader, used here for the dedicated results key
-from scripts.seal_ballots import load_private_key
+# SR-18: the shared Ed25519 private key loader, for the dedicated results key, and the one signing call
+from scripts.signing_keys import load_private_key, sign
 
 DATASET = "result.json"
 SIGNATURE = "result.json.sig"
@@ -203,7 +204,7 @@ def release(
         )
         # d. the exact bytes, in binary mode, and the raw signature over exactly those bytes
         (target / DATASET).write_bytes(dataset)
-        (target / SIGNATURE).write_bytes(private_key.sign(dataset))
+        (target / SIGNATURE).write_bytes(sign(private_key, dataset))
         # e. read back and checked as a recipient would, with the published key
         written = (target / DATASET).read_bytes()
         if written != dataset or not verify_signature(published_key, (target / SIGNATURE).read_bytes(), written):

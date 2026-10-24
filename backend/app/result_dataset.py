@@ -18,7 +18,8 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 # SR-18: SR-07's canonical JSON (sorted keys, compact, ensure_ascii=False), reused rather than copied
 from app.ballot_definitions import canonical
-from app.roll_signing import parse_public_key
+# SR-18: the shared public key loader (app/key_files.py)
+from app.key_files import load_public_key_file
 
 SCHEMA = "evoting-house-result-v1"
 
@@ -33,7 +34,7 @@ def key_fingerprint(public_key: Ed25519PublicKey) -> str:
 
 def load_results_public_key(path: Path) -> Ed25519PublicKey:
     """SR-18: the published results key. Read only to serve and verify, so the app starts without it."""
-    return parse_public_key(Path(path).read_bytes())
+    return load_public_key_file(path)
 
 
 def build_dataset(

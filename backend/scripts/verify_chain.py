@@ -19,6 +19,8 @@ from app.config import settings
 from app.db import SessionLocal
 # SR-16: the same failure entries as the seal script, one per reason code
 from scripts.seal_ballots import record_failure
+# SR-13: the shared report lines (scripts/report.py)
+from scripts.report import exit_code, status_line, verdict_line
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -28,9 +30,9 @@ def main(argv: list[str] | None = None) -> int:
     public_path = settings.backend_path(settings.checkpoint_public_key)
     print("SR-13 ballot chain verification")
     if not public_path.is_file():
-        print(f"FAIL     checkpoint public key not found ({public_path.name}); nothing can be verified")
-        print("SR-13 chain verification: FAIL")
-        return 1
+        print(status_line("FAIL", f"checkpoint public key not found ({public_path.name}); nothing can be verified"))
+        print(verdict_line("SR-13 chain verification", False))
+        return exit_code(False)
     with SessionLocal() as db:
         reasons = verify_chain(db, args.election, load_checkpoint_public_key(public_path), checkpoint_file(args.election))
         entries, head = db.execute(
@@ -47,10 +49,10 @@ def main(argv: list[str] | None = None) -> int:
     for group, codes in CHECK_GROUPS.items():
         found = [code for code in reasons if code in codes]
         failed += bool(found)
-        print(f"FAIL     {group}: {', '.join(found)}" if found else f"PASS     {group}")
+        print(status_line("FAIL", group, ", ".join(found)) if found else status_line("PASS", group))
     print(f"Entries: {entries}. Head hash: {head or 'none (nothing sealed yet)'}")  # SR-13: on purpose, for the release record
-    print("SR-13 chain verification: PASS" if not reasons else f"SR-13 chain verification: FAIL ({failed} checks)")
-    return 1 if reasons else 0
+    print(verdict_line("SR-13 chain verification", not reasons, failed))
+    return exit_code(not reasons)
 
 
 if __name__ == "__main__":

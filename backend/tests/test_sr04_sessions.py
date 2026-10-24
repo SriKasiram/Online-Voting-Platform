@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import Engine, delete, func, select, text
 from sqlalchemy.orm import Session
 
+from helpers import outcome
 from app.config import Settings, settings
 from app.deps import get_db
 from app.main import app
@@ -39,10 +40,6 @@ def shipped_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
 def as_session(token: str) -> TestClient:
     """A client that presents exactly this identifier and nothing else."""
     return TestClient(app, base_url="https://testserver", headers={"cookie": f"{SESSION_COOKIE}={token}"})
-
-
-def outcome(response) -> tuple[int, dict]:
-    return response.status_code, response.json()
 
 
 def login(client: TestClient, voter):

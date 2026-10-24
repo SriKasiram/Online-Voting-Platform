@@ -31,7 +31,8 @@ from sqlalchemy.orm import Session
 # SR-13: SR-07's canonical JSON and the shared Ed25519 helpers, reused rather than copied
 from app.ballot_definitions import canonical
 from app.config import settings
-from app.roll_signing import parse_public_key, verify_signature
+# SR-13, SR-16: the shared public key loader and Ed25519 check (app/key_files.py)
+from app.key_files import load_public_key_file, verify_signature
 
 START_TAG = b"evoting-ballot-chain-start-v1|"
 ENTRY_TAG = b"evoting-ballot-chain-v1|"
@@ -77,7 +78,7 @@ def checkpoint_file(election_id: UUID | str) -> Path:
 
 def load_checkpoint_public_key(path: Path) -> Ed25519PublicKey:
     """SR-13: read only when verifying, so the API starts without it (CI and tests have none)."""
-    return parse_public_key(Path(path).read_bytes())
+    return load_public_key_file(path)
 
 
 def read_checkpoints(

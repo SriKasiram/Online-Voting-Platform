@@ -18,6 +18,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from helpers import outcome, start_api
 from app.config import BACKEND_DIR, settings
 from app.eligibility import age_on
 from app.main import app
@@ -65,10 +66,6 @@ def ballot_for(client: TestClient, voter, clock):
     return client.get("/api/ballot")
 
 
-def outcome(response) -> tuple[int, dict]:
-    return response.status_code, response.json()
-
-
 def roll_of(db_session: Session, voter) -> ElectoralRollEntry:
     db_session.expire_all()
     return db_session.get_one(ElectoralRollEntry, db_session.get_one(Account, voter.account_id).roll_id)
@@ -99,12 +96,6 @@ def denials(db_session: Session) -> list[str]:
 
 def last_audit(db_session: Session) -> AuditLogEntry:
     return db_session.scalars(select(AuditLogEntry).order_by(AuditLogEntry.id.desc()).limit(1)).one()
-
-
-def start_api() -> None:
-    """Runs the API's start-up. The client fixture has already pointed the API at the test database."""
-    with TestClient(app):
-        pass
 
 
 # ---------------------------------------------------------------

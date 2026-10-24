@@ -9,29 +9,16 @@ uses the private key; the server side only ever reads the public key, and only t
 """
 
 import argparse
-import os
 from pathlib import Path
 
 from app.config import settings
-# SR-13: the same key-pair helper as the SR-02 roll key and the SR-07 delegate keys
-from scripts.sign_roll import load_or_create_private_key
+# SR-13: the same key-pair helper as the SR-02 roll key and the SR-07 delegate keys (scripts/signing_keys.py)
+from scripts.signing_keys import write_key_pair
 
 
 def generate_checkpoint_keys(private_path: Path, public_path: Path, force: bool = False) -> tuple[Path, Path]:
     """SR-13: writes a new key pair, private key owner-only (0600) where the OS supports it. Never overwrites unless force."""
-    if not force and (private_path.exists() or public_path.exists()):
-        raise FileExistsError(private_path)
-    private_path.unlink(missing_ok=True)
-    public_path.unlink(missing_ok=True)
-    # SR-13: on POSIX the files are created owner-only from the first byte, not narrowed afterwards
-    previous = os.umask(0o077)
-    try:
-        load_or_create_private_key(private_path, public_path)
-    finally:
-        os.umask(previous)
-    os.chmod(private_path, 0o600)
-    os.chmod(public_path, 0o644)  # the public key is not secret
-    return private_path, public_path
+    return write_key_pair(private_path, public_path, force=force)
 
 
 def main() -> None:

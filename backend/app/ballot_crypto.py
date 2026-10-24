@@ -22,11 +22,12 @@ from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from app.config import settings
+# SR-11: the key file checks are shared with the SR-20 backup key (app/key_files.py)
+from app.key_files import KEY_BYTES, KeyFileProblem, read_symmetric_key
 
 FORMAT_VERSION = 0x01
 NONCE_BYTES = 12
 TAG_BYTES = 16
-KEY_BYTES = 32
 MIN_BLOB_BYTES = 1 + NONCE_BYTES + TAG_BYTES
 
 # SR-11: the payload's field names. The pre-release audit scans logs for them.
@@ -55,14 +56,16 @@ def load_key(path: Path) -> bytes:
     permission check is skipped there.
     """
     path = Path(path)
-    if not path.is_file():
-        raise BallotKeyError(f"No ballot key at {path}. Create it with: python -m scripts.gen_ballot_key")
-    if os.name == "posix" and path.stat().st_mode & 0o077:
-        raise BallotKeyError(f"The ballot key {path} can be read by other users. Run: chmod 600 {path}")
-    key = path.read_bytes()
-    if len(key) != KEY_BYTES:
-        raise BallotKeyError(f"The ballot key {path} must be exactly {KEY_BYTES} bytes (AES-256), not {len(key)}")
-    return key
+    try:
+        return read_symmetric_key(path)
+    except KeyFileProblem as problem:
+        # SR-11: the same messages, in the same order of checks, as before the checks were shared
+        messages = {
+            "missing": f"No ballot key at {path}. Create it with: python -m scripts.gen_ballot_key",
+            "readable_by_others": f"The ballot key {path} can be read by other users. Run: chmod 600 {path}",
+            "wrong_size": f"The ballot key {path} must be exactly {KEY_BYTES} bytes (AES-256), not {problem.size}",
+        }
+        raise BallotKeyError(messages[problem.reason]) from None
 
 
 def check_ballot_key_at_startup() -> None:

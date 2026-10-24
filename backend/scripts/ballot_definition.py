@@ -34,7 +34,9 @@ from app.db import SessionLocal
 from app.models import BallotDefinition, Candidate, Division, Election
 from app.audit_events import REJECTED, SCRIPT, SUCCESS
 from app.security import audit, utc_now
-from scripts.sign_roll import load_or_create_private_key
+# SR-07: the shared key-pair helper and the one signing call (scripts/signing_keys.py)
+from scripts.signing_keys import load_or_create_key_pair
+from scripts.signing_keys import sign as sign_bytes
 
 DELEGATES = ("delegate_a", "delegate_b", "delegate_c")
 
@@ -66,7 +68,7 @@ def ensure_delegate_keys(folder: Path | None = None) -> dict[str, Ed25519Private
     the keyring's folder, creating any that are missing, and rewrites the keyring.
     """
     keyring = settings.delegate_keyring_path if folder is None else folder / "keyring.json"
-    keys = {d: load_or_create_private_key(keyring.parent / f"{d}.pem", keyring.parent / f"{d}.pub.pem") for d in DELEGATES}
+    keys = {d: load_or_create_key_pair(keyring.parent / f"{d}.pem", keyring.parent / f"{d}.pub.pem") for d in DELEGATES}
     write_keyring(keyring, list(keys.items()))
     return keys
 
@@ -113,7 +115,7 @@ def build_payload(db: Session, election: Election, valid_from: datetime, valid_u
 
 def sign(key: Ed25519PrivateKey, payload: str) -> dict[str, str]:
     # SR-07: one delegate's approval of this exact payload
-    return {"key_id": key_id_for(key.public_key()), "signature": base64.b64encode(key.sign(message(payload))).decode()}
+    return {"key_id": key_id_for(key.public_key()), "signature": base64.b64encode(sign_bytes(key, message(payload))).decode()}
 
 
 def store_active(db: Session, election_id: uuid.UUID, payload: str, signatures: list, activated_at: datetime) -> None:

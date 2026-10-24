@@ -15,9 +15,7 @@ import hashlib
 import os
 import re
 import sys
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -25,8 +23,8 @@ from sqlalchemy.orm import Session
 from app.config import PROJECT_DIR, settings
 from app.db import SessionLocal
 from app.stores import BALLOT_TABLES, IDENTITY_TABLES, NOT_APPLICATION_DATA
-
-Status = Literal["PASS", "FAIL", "SKIPPED"]
+# SR-12: the shared check type and report lines (scripts/report.py), kept importable from here
+from scripts.report import Check, Status, check_line, exit_code, summary_line, tally, verdict_line  # noqa: F401
 
 # SR-12: the three shapes a ballot-side identifier takes. Text is scanned once per pattern and the
 # matches are looked up in a set, never searched for one by one.
@@ -59,13 +57,6 @@ EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+")
 WORD = re.compile(r"[A-Za-z0-9._]{3,32}")
 
 SKIP_DIRS = {".git", "node_modules", ".venv", "dist", "__pycache__", ".pytest_cache"}
-
-
-@dataclass
-class Check:
-    name: str
-    status: Status
-    reason: str
 
 
 def identifiers_in(content: str) -> set[str]:
@@ -281,13 +272,12 @@ def main(argv: list[str] | None = None) -> int:
     with SessionLocal() as db:
         checks = run_audit(db, args.file, PROJECT_DIR, settings.log_dir)
     for check in checks:
-        print(f"{check.status:<8} {check.name}: {check.reason}")
-    failed = sum(check.status == "FAIL" for check in checks)
-    skipped = sum(check.status == "SKIPPED" for check in checks)
-    print(f"Summary: {len(checks) - failed - skipped} passed, {failed} failed, {skipped} skipped")
+        print(check_line(check))
+    _, failed, _ = tally(checks)
+    print(summary_line(checks))
     # SR-12 (f): the one-line verdict
-    print("SR-12 separation audit: PASS" if not failed else f"SR-12 separation audit: FAIL ({failed} checks)")
-    return 1 if failed else 0
+    print(verdict_line("SR-12 separation audit", not failed, failed))
+    return exit_code(not failed)
 
 
 if __name__ == "__main__":

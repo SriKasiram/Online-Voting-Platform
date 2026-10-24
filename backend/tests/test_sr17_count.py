@@ -8,8 +8,6 @@ import json
 import logging
 import random
 import uuid
-from collections.abc import Iterator
-from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -18,14 +16,12 @@ from sqlalchemy import Engine, select, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 
+from helpers import committed_triggers_off as triggers_off, CommittedDatabase
 from app import house_count
 from app.ballot_chain import checkpoint_file, compute_entry_hash, load_checkpoint_public_key, verify_chain
 from app.ballot_crypto import ballot_payload, encrypt_ballot
 from app.config import settings
-from app.db import Base
-from app.deps import get_db
 from app.house_count import CountRefused, Round, break_tie, check_ballot, count_division, run_count
-from app.main import app
 from app.models import AuditLogEntry, BallotChainEntry, ParticipationState, VoterParticipation
 from app.security import AUDIT_FORMAT_CURRENT, audit_hash_at
 from scripts import audit_ballots, audit_checkpoint, audit_separation, count_house, verify_audit
@@ -150,20 +146,7 @@ def test_a_ballot_that_would_exhaust_stops_the_count() -> None:
 # ---------------------------------------------------------------
 
 
-@contextmanager
-def triggers_off(db: Session, *tables: str) -> Iterator[None]:
-    """SR-17: tampering as only a database owner could, inside the test only; on again afterwards."""
-    for table in tables:
-        db.execute(text(f"ALTER TABLE {table} DISABLE TRIGGER {table}_append_only"))
-    try:
-        yield
-    finally:
-        for table in tables:
-            db.execute(text(f"ALTER TABLE {table} ENABLE TRIGGER {table}_append_only"))
-        db.commit()
-
-
-class CountedElection:
+class CountedElection(CommittedDatabase):
     """
     SR-17: the count runs in its own read-only transaction on a second connection, which only sees
     committed rows. So, like SR-03's and SR-14's concurrency tests, these replace the db_session and
@@ -171,24 +154,6 @@ class CountedElection:
     the append-only triggers do not stop).
     SR-18: fixtures and helpers only, no tests, so the release tests can build on the same setup.
     """
-
-    @pytest.fixture
-    def db_session(self, engine: Engine) -> Iterator[Session]:
-        with Session(engine) as session:
-            yield session
-        with engine.begin() as connection:
-            tables = ", ".join(table.name for table in Base.metadata.sorted_tables)
-            connection.execute(text(f"TRUNCATE {tables} RESTART IDENTITY CASCADE"))
-
-    @pytest.fixture
-    def client(self, engine: Engine) -> Iterator[TestClient]:
-        def real_db() -> Iterator[Session]:
-            with Session(engine) as session:
-                yield session
-
-        app.dependency_overrides[get_db] = real_db
-        yield TestClient(app, base_url="https://testserver")
-        app.dependency_overrides.clear()
 
     @pytest.fixture
     def keys(self, checkpoint_keys):

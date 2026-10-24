@@ -19,12 +19,12 @@ from pathlib import Path
 from app.config import settings
 from app.result_dataset import key_fingerprint, load_results_public_key
 # SR-18: the same key-pair writer as the SR-13 checkpoint key (private key 0600 where supported)
-from scripts.gen_checkpoint_key import generate_checkpoint_keys
+from scripts.signing_keys import write_key_pair
 
 
 def generate_results_keys(private_path: Path, public_path: Path, force: bool = False) -> tuple[Path, Path]:
     """SR-18: a new results key pair. Never overwrites unless force (raises FileExistsError)."""
-    return generate_checkpoint_keys(private_path, public_path, force=force)
+    return write_key_pair(private_path, public_path, force=force)
 
 
 def main(argv: list[str] | None = None) -> int:

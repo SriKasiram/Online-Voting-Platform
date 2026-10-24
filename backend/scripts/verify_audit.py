@@ -29,6 +29,8 @@ from sqlalchemy.orm import Session
 from app.ballot_chain import load_checkpoint_public_key, read_checkpoints
 from app.config import settings
 from app.db import SessionLocal
+# SR-16: the shared report lines (scripts/report.py)
+from scripts.report import exit_code, status_line, verdict_line
 from app.models import AuditLogEntry
 from app.security import audit_hash_at, verify_audit_chain
 
@@ -87,18 +89,18 @@ def main(argv: list[str] | None = None) -> int:
     print("SR-16 audit log verification")
     public_path = settings.backend_path(settings.checkpoint_public_key)
     if not public_path.is_file():
-        print(f"FAIL     checkpoint public key not found ({public_path.name}); the checkpoints cannot be checked")
-        print("SR-16 audit verification: FAIL")
-        return 1
+        print(status_line("FAIL", f"checkpoint public key not found ({public_path.name}); the checkpoints cannot be checked"))
+        print(verdict_line("SR-16 audit verification", False))
+        return exit_code(False)
     with SessionLocal() as db:
         results = verify_audit(db, load_checkpoint_public_key(public_path), audit_checkpoint_file())
         entries, head = audit_head(db)
     for check, problem in results.items():
-        print(f"FAIL     {check}: {problem}" if problem else f"PASS     {check}")
+        print(status_line("FAIL", check, problem) if problem else status_line("PASS", check))
     print(f"Entries: {entries}. Head hash: {head or 'none (the log is empty)'}")
     failed = sum(problem is not None for problem in results.values())
-    print("SR-16 audit verification: PASS" if not failed else f"SR-16 audit verification: FAIL ({failed} checks)")
-    return 1 if failed else 0
+    print(verdict_line("SR-16 audit verification", not failed, failed))
+    return exit_code(not failed)
 
 
 if __name__ == "__main__":

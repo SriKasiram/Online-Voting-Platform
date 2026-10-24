@@ -10,7 +10,7 @@ SR-14: "used" is a flag, and the token keeps only the SHA-256 of the receipt it 
 import hashlib
 import threading
 import traceback
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from datetime import timedelta
 
 import pytest
@@ -18,9 +18,9 @@ from fastapi.testclient import TestClient
 from sqlalchemy import Engine, func, inspect, select, text
 from sqlalchemy.orm import Session
 
+from helpers import CommittedDatabase, count, outcome, token_row
 from app.config import settings
 from app.db import Base
-from app.deps import get_db
 from app.main import app
 from app.models import (
     Account,
@@ -56,16 +56,6 @@ def submit(client: TestClient, ballot: dict, token: str | None = None, ranking: 
     )
 
 
-def outcome(response) -> tuple[int, dict]:
-    return response.status_code, response.json()
-
-
-def count(db_session: Session, model, *where) -> int:
-    db_session.expire_all()
-    query = select(func.count()).select_from(model)
-    return db_session.scalar(query.where(*where) if where else query)
-
-
 def state_of(db_session: Session, voter, election) -> ParticipationState | None:
     db_session.expire_all()
     roll_id = db_session.get_one(Account, voter.account_id).roll_id
@@ -76,12 +66,6 @@ def state_of(db_session: Session, voter, election) -> ParticipationState | None:
 def unused(token: BallotToken) -> bool:
     # SR-14: not used, and no receipt hash recorded
     return (token.consumed, token.receipt_hash) == (False, None)
-
-
-def token_row(db_session: Session, raw: str) -> BallotToken:
-    db_session.expire_all()
-    digest = hashlib.sha256(raw.encode()).hexdigest()
-    return db_session.scalars(select(BallotToken).where(BallotToken.token_hash == digest)).one()
 
 
 VOTED = VoterParticipation.state == ParticipationState.VOTED
@@ -433,30 +417,12 @@ def signed_in_sessions(db_session: Session, voter, count: int) -> list[str]:
     return tokens
 
 
-class TestConcurrency:
+class TestConcurrency(CommittedDatabase):
     """
     SR-03: real, separate transactions on threads. These tests replace the
     db_session and client fixtures with committing ones, so every factory
     commits for real, and they empty the test database afterwards.
     """
-
-    @pytest.fixture
-    def db_session(self, engine: Engine) -> Iterator[Session]:
-        with Session(engine) as session:
-            yield session
-        with engine.begin() as connection:
-            tables = ", ".join(table.name for table in Base.metadata.sorted_tables)
-            connection.execute(text(f"TRUNCATE {tables} RESTART IDENTITY CASCADE"))
-
-    @pytest.fixture
-    def client(self, engine: Engine) -> Iterator[TestClient]:
-        def real_db() -> Iterator[Session]:
-            with Session(engine) as session:
-                yield session
-
-        app.dependency_overrides[get_db] = real_db
-        yield TestClient(app, base_url="https://testserver")
-        app.dependency_overrides.clear()
 
     def test_twenty_simultaneous_submissions_of_one_token_store_one_ballot(
         self, client: TestClient, db_session: Session, election, make_voter

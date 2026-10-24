@@ -184,6 +184,33 @@ It deletes the reviewer's account, clears the registration and wrong-code count,
 
 After 5 wrong enrolment codes the entry is locked, and the same reset unlocks it. A registration must be finished within 10 minutes of step 1.
 
+## Staff console
+
+The staff page, https://localhost:8443/staff.html, signs staff in (SR-06) and then becomes a small console for the four existing admin routes (SR-05), so staff do not need the API docs page.
+
+1. **Create a staff account**, inside `backend/` with the virtual environment active:
+   ```
+   python -m scripts.create_staff --username official1 --role polling_official
+   python -m scripts.create_staff --username auditor1 --role auditor
+   ```
+   Each asks for a new password twice (at least 12 characters, not the username) and prints an authenticator setup key once. Add it to an authenticator app.
+2. **Sign in** at https://localhost:8443/staff.html: the username and password, then the 6-digit code. Use a separate private window if a voter is signed in, because a browser holds one session at a time.
+3. **The tabs depend on the role:**
+
+| Role | Tabs | Routes |
+|---|---|---|
+| Polling official | Turnout, Reset elector | `GET /api/admin/turnout`, `POST /api/admin/electors/{roll_id}/reset` |
+| Auditor | Turnout, Audit log, Verify chain | `GET /api/admin/turnout`, `GET /api/admin/audit-log?limit=N`, `GET /api/admin/audit-log/verify` |
+
+- **Display only.** The tabs follow the role the server returned at sign-in, but the server decides access on every request (SR-05). A polling official who calls an auditor route directly still gets `403 forbidden`.
+- **Turnout.** Electors issued a ballot but not yet voted, and electors who voted, per division and in total. Refresh reloads it and shows the time.
+- **Audit log.** 20, 50 or 100 entries, oldest first (the server returns at most 200): id, time, event type, actor and the first 16 characters of each entry's hash. The route returns only these fields, so the other SR-16 columns are not shown.
+- **Verify chain.** The server recomputes the SR-16 hash chain. The result is PASS or FAIL in words as well as colour, with the number of entries checked or the first bad entry.
+- **Reset elector.** A roll ID and a confirmation box that must be ticked first. The answer is "Elector reset", "This elector has already voted and cannot be reset" or "Reset failed". A cast ballot can never be reset.
+- **Session.** Fixed at 10 minutes (SR-06). Any `401` returns to sign-in with "Your session has ended. Sign in again." and clears the console. A `403` shows "You do not have access to this function." Nothing is kept in browser storage (SR-09), and everything is shown as plain text.
+
+The backend serves the built frontend: after any frontend change, run `npm run build` in `frontend/`, then restart `python -m app.serve`.
+
 ## API
 
 | Request | Purpose |
@@ -290,6 +317,7 @@ Never commit a real `.env` file. Only `.env.example` belongs in Git.
 - The session timer counts down from sign in. Ordinary activity does not reset it. Only the voter choosing Keep voting in the warning calls `POST /api/auth/extend`, and only that call extends the server session. The timer restarts only once the server agrees. After the second extension the warning says no more time is available, and the session ends on time (SR-04).
 - Finishing or leaving a session resets the screen within 5 seconds: Done or 60 seconds on the receipt screen, 120 seconds without input, sign out, session end or a lost session. The start page is then loaded afresh (see [SR-15](#sr-15-ending-finished-and-abandoned-sessions)).
 - Fonts are bundled with the app (no font CDN), and the QR code is drawn in the browser, so the page makes no third-party requests.
+- The staff console (SR-05) renders every server value as plain text through React, and keeps its data in memory only, cleared on sign out, a `401` or the end of the 10-minute session.
 - Sessions live in `HttpOnly`, `SameSite=Strict` cookies, so page scripts cannot read them and other sites cannot send them. The frontend and API are served from one origin, https://localhost:8443 (SR-10).
 
 ## Backend security notes
@@ -542,7 +570,8 @@ Design only, not implemented:
 
 - The `returning_officer` role, with dual control for ballot-definition activation, roll replacement and result release.
 - The `system_administrator` role.
-- Admin screens. Staff use the API directly.
+- Full admin screens. SR-05 now has a basic staff console (see [Staff console](#staff-console)) for the four existing routes; anything more is design only.
+- Disable `/docs` in production. It lists every route; the prototype keeps it for development.
 - An access review before each election and after any staff change.
 - Separation of privileged services, and least-privilege database roles.
 - Phishing-resistant passkeys (WebAuthn) for staff. SR-06 requires a password and a TOTP code for every staff sign in, but TOTP is not phishing-resistant, and passkeys remain design only.
@@ -569,8 +598,8 @@ Every account must have a TOTP secret: `accounts.totp_secret_enc` is `NOT NULL`,
    ```
 2. Add the setup link or key it prints, shown only once, to an authenticator app.
 3. With the server running (`python -m app.serve`), open https://localhost:8443/staff.html. This page is separate from the voter app.
-4. Enter the username and password, then the 6-digit code. The page shows your role and when the session ends, and signs you out after 10 minutes. It does not call any admin route.
-5. Use the admin routes from the API docs page (https://localhost:8443/docs) or curl (see SR-05). The docs page is on the same address, so the session cookie works there too.
+4. Enter the username and password, then the 6-digit code. The page shows your role and when the session ends, and signs you out after 10 minutes.
+5. Once signed in, the page offers role-based views of the existing admin routes: the [staff console](#staff-console). The API docs page (https://localhost:8443/docs) and curl (see SR-05) still work too; the docs page is on the same address, so the session cookie works there.
 
 Run the SR-06 tests, inside `backend/` with PostgreSQL running:
 

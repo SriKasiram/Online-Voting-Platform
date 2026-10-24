@@ -15,9 +15,10 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 # SR-11: ballots are stored encrypted
+from helpers import count, outcome, state_of
 from app.ballot_crypto import RANKING_FIELD, decrypt_ballot
 from app.ballot_rules import Verdict, evaluate_house_ballot
-from app.models import Account, AuditLogEntry, Ballot, BallotToken, Candidate, ParticipationState, VoterParticipation
+from app.models import AuditLogEntry, Ballot, BallotToken, Candidate, ParticipationState
 from app.routers import ballot as ballot_router
 from scripts.ballot_definition import build_payload, sign, store_active
 
@@ -60,21 +61,6 @@ def open_ballot(client: TestClient, make_voter, sign_in) -> tuple[dict, object]:
 
 def submit(client: TestClient, ballot: dict, ranking: list[int]):
     return client.post("/api/ballot/submit", json={"ballot_token": ballot["ballot_token"], "ranked_candidate_ids": ranking})
-
-
-def outcome(response) -> tuple[int, dict]:
-    return response.status_code, response.json()
-
-
-def count(db_session: Session, model) -> int:
-    db_session.expire_all()
-    return db_session.scalar(select(func.count()).select_from(model))
-
-
-def state_of(db_session: Session, voter) -> ParticipationState:
-    db_session.expire_all()
-    roll_id = db_session.get_one(Account, voter.account_id).roll_id
-    return db_session.scalars(select(VoterParticipation.state).where(VoterParticipation.roll_id == roll_id)).one()
 
 
 # ---------------------------------------------------------------

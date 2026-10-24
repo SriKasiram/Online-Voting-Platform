@@ -1,5 +1,5 @@
-import { useEffect, useRef } from "react";
-import { ClockIcon } from "./Icons";
+import { useRef } from "react";
+import WarningDialog from "./WarningDialog";
 
 type Props = {
   open: boolean;
@@ -13,48 +13,29 @@ type Props = {
  * alertdialog with one button, because the elector must respond or lose the session.
  */
 export default function IdleWarning({ open, secondsLeft, onStillHere }: Props) {
-  const dialog = useRef<HTMLDialogElement>(null);
   const button = useRef<HTMLButtonElement>(null);
 
-  useEffect(() => {
-    const el = dialog.current;
-    if (!el) return;
-    if (open && !el.open) {
-      el.showModal();
-      button.current?.focus();
-    } else if (!open && el.open) {
-      el.close();
-    }
-  }, [open]);
-
   return (
-    <dialog
-      ref={dialog}
-      className="idle"
+    <WarningDialog
+      open={open}
       role="alertdialog"
-      aria-labelledby="idle-warning-title"
-      aria-describedby="idle-warning-desc"
-      onCancel={(e) => {
-        // SR-15: Escape means someone is there, so it counts as "I'm still here"
-        e.preventDefault();
-        onStillHere();
-      }}
-    >
-      <div className="idle-body">
-        <span className="idle-icon">
-          <ClockIcon size={22} />
-        </span>
-        <h2 id="idle-warning-title">Are you still there?</h2>
-        <p id="idle-warning-desc">
+      titleId="idle-warning-title"
+      descriptionId="idle-warning-desc"
+      focusRef={button}
+      // SR-15: Escape means someone is there, so it counts as "I'm still here"
+      onEscape={onStillHere}
+      title="Are you still there?"
+      description={
+        <>
           This session will end in <strong className="mono">{secondsLeft}</strong>{" "}
           {secondsLeft === 1 ? "second" : "seconds"} to protect your vote.
-        </p>
-        <div className="idle-actions">
-          <button ref={button} type="button" className="btn btn-primary" onClick={onStillHere}>
-            I'm still here
-          </button>
-        </div>
-      </div>
-    </dialog>
+        </>
+      }
+      actions={
+        <button ref={button} type="button" className="btn btn-primary" onClick={onStillHere}>
+          I'm still here
+        </button>
+      }
+    />
   );
 }

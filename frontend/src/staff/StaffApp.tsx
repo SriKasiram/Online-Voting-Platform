@@ -5,10 +5,12 @@ import Layout from "../components/Layout";
 import { ErrorAlert, Notice, Spinner } from "../components/Messages";
 import OtpInput from "../components/OtpInput";
 import { useFocusOnMount, useSessionTimer } from "../lib/hooks";
+import { SESSION_ENDED } from "./consoleLogic";
+import StaffConsole from "./StaffConsole";
 
 // SR-06: one message for every failure, so the page never says which detail was wrong
 const FAILED = "Sign in failed";
-const ENDED = "Your session has ended. Sign in again.";
+const ENDED = SESSION_ENDED;
 const ROLE_NAMES: Record<string, string> = { polling_official: "Polling official", auditor: "Auditor" };
 const timeFormat = new Intl.DateTimeFormat("en-AU", { timeStyle: "short" });
 
@@ -16,7 +18,8 @@ type View = { name: "details" } | { name: "code" } | { name: "signed-in"; role: 
 
 // SR-06: the staff sign-in page (staff.html). Password, then the authenticator code, then a
 // 10-minute session that cannot be extended. Only the view is kept, in memory (no browser
-// storage), and the page never calls an admin route.
+// storage). SR-05: once signed in, the staff console (StaffConsole.tsx) shows the role's admin
+// views; signing out, a 401 or the end of the session closes it and its state goes with it.
 export default function StaffApp() {
   const [view, setView] = useState<View>({ name: "details" });
   const [notice, setNotice] = useState("");
@@ -43,34 +46,46 @@ export default function StaffApp() {
       onSignOut={() => void signOut("")}
     >
       <section className="screen" aria-labelledby="staff-title">
-        <div className="login">
-          <div className="login-form">
-            <div className="intro">
-              <p className="eyebrow">Election staff only</p>
-              <h1 id="staff-title">Staff access</h1>
-            </div>
-            {notice && <Notice>{notice}</Notice>}
-            {view.name === "details" && (
-              <DetailsStep
-                onDone={() => {
-                  setNotice("");
-                  setView({ name: "code" });
-                }}
-              />
-            )}
-            {view.name === "code" && (
-              <CodeStep
-                onDone={(role) =>
-                  setView({ name: "signed-in", role, endsAt: new Date(Date.now() + SESSION_MINUTES * 60_000) })
-                }
-                onStartAgain={() => void signOut("")}
-              />
-            )}
-            {view.name === "signed-in" && (
+        {view.name === "signed-in" ? (
+          // SR-05: the staff console, wider than the sign-in card so its tables fit
+          <div className="console-page">
+            <div className="console-head">
+              <div className="intro">
+                <p className="eyebrow">Election staff only</p>
+                <h1 id="staff-title">Staff access</h1>
+              </div>
               <SignedIn role={view.role} endsAt={view.endsAt} onSignOut={() => void signOut("You have signed out.")} />
-            )}
+            </div>
+            {/* SR-06: a 401 from any admin route signs out with the session-ended message */}
+            <StaffConsole role={view.role} onSessionEnded={(message) => void signOut(message)} />
           </div>
-        </div>
+        ) : (
+          <div className="login">
+            <div className="login-form">
+              <div className="intro">
+                <p className="eyebrow">Election staff only</p>
+                <h1 id="staff-title">Staff access</h1>
+              </div>
+              {notice && <Notice>{notice}</Notice>}
+              {view.name === "details" && (
+                <DetailsStep
+                  onDone={() => {
+                    setNotice("");
+                    setView({ name: "code" });
+                  }}
+                />
+              )}
+              {view.name === "code" && (
+                <CodeStep
+                  onDone={(role) =>
+                    setView({ name: "signed-in", role, endsAt: new Date(Date.now() + SESSION_MINUTES * 60_000) })
+                  }
+                  onStartAgain={() => void signOut("")}
+                />
+              )}
+            </div>
+          </div>
+        )}
       </section>
     </Layout>
   );

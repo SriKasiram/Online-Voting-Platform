@@ -23,8 +23,9 @@ from sqlalchemy.orm import Session
 from app.ballot_chain import load_checkpoint_public_key
 from app.config import settings
 from app.db import SessionLocal
-# SR-16: the SR-13 signing and key helpers, reused with the audit log's own tag
-from scripts.seal_ballots import append_checkpoint, load_private_key
+# SR-16: the SR-13 checkpoint writer, reused with the audit log's own tag, and the shared key loader
+from scripts.seal_ballots import append_checkpoint
+from scripts.signing_keys import load_private_key
 from scripts.verify_audit import AUDIT_CHECKPOINT_TAG, audit_checkpoint_file, audit_head, verify_audit
 
 

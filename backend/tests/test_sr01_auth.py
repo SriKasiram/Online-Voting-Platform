@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import Engine, delete, func, select, text
 from sqlalchemy.orm import Session
 
+from helpers import account_row
 from app import security
 from app.config import Settings, settings
 from app.deps import get_db
@@ -52,11 +53,6 @@ def login(client: TestClient, voter, password: str | None = None):
 
 def verify(client: TestClient, otp: str, **kwargs):
     return client.post(VERIFY, json={"otp_code": otp}, **kwargs)
-
-
-def account_row(db_session: Session, voter) -> Account:
-    db_session.expire_all()
-    return db_session.get_one(Account, voter.account_id)
 
 
 def test_password_alone_opens_no_voting_route(client: TestClient, make_voter) -> None:

@@ -10,15 +10,17 @@ import logging
 from functools import lru_cache
 from pathlib import Path
 
-from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm
+from cryptography.exceptions import UnsupportedAlgorithm
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-from cryptography.hazmat.primitives.serialization import load_pem_public_key
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.audit_events import FAILURE, SUCCESS, UNKNOWN
 from app.config import settings
+# SR-02, SR-07: the public key parsing and the one Ed25519 check moved to app/key_files.py, shared
+# with SR-13, SR-16 and SR-18; imported here so app.roll_signing still offers both
+from app.key_files import load_public_key_file, parse_public_key, verify_signature  # noqa: F401
 from app.models import ElectoralRollEntry
 from app.security import audit, decrypt_or_none
 
@@ -45,31 +47,14 @@ def record_message(entry: ElectoralRollEntry) -> bytes:
     return DOMAIN_TAG + b"\n" + json.dumps(fields, sort_keys=True, separators=(",", ":")).encode()
 
 
-def parse_public_key(pem: bytes) -> Ed25519PublicKey:
-    # SR-07: split out of load_public_key so the ballot definition keyring uses it too
-    key = load_pem_public_key(pem)
-    if not isinstance(key, Ed25519PublicKey):
-        raise ValueError("not an Ed25519 public key")
-    return key
-
-
 @lru_cache
 def load_public_key(path: Path) -> Ed25519PublicKey:
     # SR-02: read once per path. Raises if the file is missing or is not an Ed25519 public key.
-    return parse_public_key(path.read_bytes())
+    return load_public_key_file(path)
 
 
 def public_key() -> Ed25519PublicKey:
     return load_public_key(settings.roll_public_key_path)
-
-
-def verify_signature(key: Ed25519PublicKey, signature: bytes, message: bytes) -> bool:
-    # SR-07: the one Ed25519 check, shared by roll records (SR-02) and ballot definitions. Never raises.
-    try:
-        key.verify(signature, message)
-    except InvalidSignature:
-        return False
-    return True
 
 
 def verify_record(key: Ed25519PublicKey, entry: ElectoralRollEntry) -> bool:
