@@ -530,7 +530,9 @@ class TestBackupAndRestore(CountedElection):
         done = take_backup(engine, backup_key, backups_dir)
         copy = writable_copy(done.folder, tmp_path / "copy")
         script = ScriptDirectory.from_config(Config(str(BACKEND_DIR / "alembic.ini")))
-        older = script.get_revision(head_revision()).down_revision
+        # VULN-05, VULN-06: head is no longer the revision that added audit_log.version (0014), so
+        # the revision before that one is named, not the one before head
+        older = script.get_revision("0014").down_revision
         edit_manifest(copy, lambda manifest: manifest.update(alembic_revision=older))
 
         assert refusal(copy, target, engine.url, backup_key) == "restore_failed"

@@ -7,6 +7,8 @@ SR-12: exports the ballot side only, as JSON Lines. Run inside backend/:
 One line per ballot: {"ballot_id", "election_id", "encrypted_payload_b64"}, in ballot id order.
 It reads the ballots table and nothing else: no identity-side table, no token, no receipt. It never
 decrypts (the payload stays the SR-11 ciphertext). exports/ is in .gitignore.
+VULN-01: "the ballots table" now means ballots and pending_ballots (sealed and held), through
+app/stores.py's ballot_rows, still in ballot id order.
 """
 
 import argparse

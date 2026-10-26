@@ -120,6 +120,17 @@ class Settings(BaseSettings):
     tls_key_file: Path = Path("certs/dev-key.pem")
     # SR-10: the single HTTPS port for the API and the built frontend. There is no plaintext port.
     server_port: int = 8443
+    # VULN-04: where the SR-10 launcher listens. This computer only by default; the container image
+    # sets 0.0.0.0, and docker run publishes the port on 127.0.0.1 of the host.
+    server_host: str = "127.0.0.1"
+
+    # VULN-06: taken usernames one registration session may try at step 2 before it is ended
+    max_username_attempts: int = Field(default=5, ge=1)
+    # VULN-09: FastAPI's /docs, /redoc and /openapi.json, off unless switched on (development only)
+    api_docs: bool = False
+    # VULN-09: the Host header values the server answers; anything else gets 400. The TLS certificate
+    # names localhost and 127.0.0.1. As JSON in .env: TRUSTED_HOSTS=["localhost","127.0.0.1"]
+    trusted_hosts: list[str] = ["localhost", "127.0.0.1"]
 
     def tls_path(self, path: Path) -> Path:
         """SR-10: a certificate or key path, with relative paths taken from the project root."""

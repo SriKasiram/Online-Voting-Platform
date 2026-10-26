@@ -145,6 +145,14 @@ def fresh_rate_limits() -> Iterator[None]:
 
 
 @pytest.fixture(scope="session", autouse=True)
+def trusted_test_host() -> Iterator[None]:
+    """VULN-09: TestClient sends Host: testserver, so it is trusted for the run, beside the defaults."""
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(settings, "trusted_hosts", [*settings.trusted_hosts, "testserver"])
+        yield
+
+
+@pytest.fixture(scope="session", autouse=True)
 def roll_key(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Ed25519PrivateKey]:
     """
     SR-02: a signing key made for this test run. The API checks roll records

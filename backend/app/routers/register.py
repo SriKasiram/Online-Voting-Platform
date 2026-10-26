@@ -11,6 +11,8 @@ Registration, in three steps, for people already on the electoral roll.
 The steps share a registration session held on the server and named by an
 HttpOnly cookie that lasts REGISTRATION_SESSION_MINUTES. Steps cannot be
 skipped or repeated: each one needs the session at the stage it expects.
+VULN-12: the cookie is Secure (COOKIE_SECURE), like the session cookie.
+VULN-06: step 2 says "username_taken" at most MAX_USERNAME_ATTEMPTS times per registration session.
 """
 
 import re
@@ -138,8 +140,14 @@ def verify(body: RegisterVerifyIn, request: Request, response: Response, db: DbS
     )
     audit(db, "REGISTRATION_STARTED", outcome=SUCCESS, actor=UNKNOWN, role=UNKNOWN)
     db.commit()
+    # VULN-12: Secure like the session cookie (COOKIE_SECURE), so it never travels over plain HTTP
     set_cookie(
-        response, REGISTRATION_COOKIE, token, REGISTRATION_PATH, max_age=config.REGISTRATION_SESSION_MINUTES * 60
+        response,
+        REGISTRATION_COOKIE,
+        token,
+        REGISTRATION_PATH,
+        max_age=config.REGISTRATION_SESSION_MINUTES * 60,
+        secure=config.settings.cookie_secure,
     )
 
 
@@ -163,6 +171,14 @@ def account(body: RegisterAccountIn, request: Request, response: Response, db: D
         )
     )
     if in_use:
+        # VULN-06: each registration session may learn of only MAX_USERNAME_ATTEMPTS taken usernames.
+        # Within the limit the answer stays helpful; past it the session ends, with the same answer
+        # an ended session gets, so the step cannot be used to list the platform's usernames.
+        registration.username_attempts += 1
+        if registration.username_attempts > config.settings.max_username_attempts:
+            end_registration(db, registration, "too_many_attempts")
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "registration_session_invalid")
+        db.commit()
         raise HTTPException(status.HTTP_409_CONFLICT, "username_taken")
 
     secret = new_totp_secret()
@@ -238,4 +254,5 @@ def confirm(body: RegisterConfirmIn, request: Request, response: Response, db: D
         end_registration(db, registration, "already_registered")
         raise HTTPException(status.HTTP_409_CONFLICT, "already_registered") from None
 
-    clear_cookie(response, REGISTRATION_COOKIE, REGISTRATION_PATH)
+    # VULN-12: cleared with the same Secure attribute it was set with
+    clear_cookie(response, REGISTRATION_COOKIE, REGISTRATION_PATH, secure=config.settings.cookie_secure)

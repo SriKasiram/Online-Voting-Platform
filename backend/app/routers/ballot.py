@@ -12,8 +12,14 @@ time. The token row stores no voter. Participation stores no time.
 SR-11: the ballot itself (division and ranking) is stored only AES-256-GCM encrypted.
 SR-12: the token row has no time either. A token is usable while its election is
 open and the elector is signed in (SR-04), and is used once its receipt is set.
+VULN-05: and only in the session it was issued to: that session's row keeps an HMAC of the token,
+checked in constant time on every submit and replay. There is no 10-minute token lifetime: a token
+lasts as long as its session (at most (1 + MAX_SESSION_EXTENSIONS) x SESSION_MINUTES) and its
+open election, whichever ends first.
 Nothing here logs a ballot id, token hash, receipt or selection.
-SR-14: the confirmation is a 128-bit reference derived from the presented token,
+VULN-01: the accepted ballot is stored in pending_ballots (the holding table), and only the SR-13
+seal moves it to ballots, so a sealed ballot shares no transaction id or disk order with this one.
+SR-14:the confirmation is a 128-bit reference derived from the presented token,
 returned only after the commit. The server keeps only its SHA-256, and the accept
 transaction is bounded by ACCEPT_TIMEOUT_SECONDS, well inside 10 seconds.
 """
@@ -44,17 +50,17 @@ from app.eligibility import eligible_division
 from app.models import (
     Account,
     AuthSession,
-    Ballot,
     BallotToken,
     Election,
     ElectionStatus,
     ParticipationState,
+    PendingBallot,
     VoterParticipation,
 )
 from app.schemas import BallotOut, CandidateOut, SubmitIn, SubmitOut
 # SR-16: the outcome of each event, and the account's id and role as the actor
 from app.audit_events import DENIED, FAILURE, REJECTED, SUCCESS
-from app.security import account_actor, audit, hash_token, new_token, utc_now
+from app.security import account_actor, audit, ballot_binding, hash_token, new_token, utc_now
 
 router = APIRouter(prefix="/ballot", tags=["ballot"])
 
@@ -169,7 +175,7 @@ def replay(db: Session, voter: Account, presented_token: str, stored_hash: str |
 
 
 @router.get("")
-def get_ballot(voter: CurrentElector, db: DbSession) -> BallotOut:
+def get_ballot(voter: CurrentElector, session: CurrentSession, db: DbSession) -> BallotOut:
     """The ballot paper for the voter's division, with a one-time token to submit it."""
     election = open_election(db)
     # SR-02: eligibility from the signed roll record, before any ballot token exists. The division
@@ -203,6 +209,14 @@ def get_ballot(voter: CurrentElector, db: DbSession) -> BallotOut:
         ],
     )
     db.add(BallotToken(election_id=election.id, token_hash=token_hash(token)))
+    # VULN-05: the token is bound to this session, in the same transaction: the session row (identity
+    # side) keeps an HMAC of it, never the token or its hash, and the ballot side gets nothing new
+    db.execute(
+        update(AuthSession)
+        .where(AuthSession.session_id_hash == session.session_id_hash)
+        .values(ballot_token_mac=ballot_binding(election.id, token))
+        .execution_options(synchronize_session=False)
+    )
     # SR-16: in the same transaction as the token, so a token never exists without its entry
     log(db, "BALLOT_TOKEN_ISSUED", voter, SUCCESS)
     db.commit()
@@ -233,9 +247,19 @@ def accept_ballot(body: SubmitIn, voter: Account, session: AuthSession, db: Sess
     db.execute(text(f"SET LOCAL statement_timeout = '{limit}'"))
     # SR-04: the same session CurrentElector checked, kept here so acceptance can end it
     session_hash = session.session_id_hash
+    # VULN-05: and the HMAC of the token issued in it, read before anything can roll the session back
+    bound = session.ballot_token_mac
     election = open_election(db)
     # SR-02: checked again before the vote is accepted, and the division comes from the signed record
     division_id = eligible_division(db, voter, election)
+    # VULN-05: before any lock, the replay check or the rules: a token issued to another session (stolen,
+    # or from before a sign out) is refused like an unknown one, compared in constant time, and nothing
+    # is consumed. So a replay of someone else's used token gets no receipt either.
+    if bound is None or not hmac.compare_digest(bound, ballot_binding(election.id, body.ballot_token)):
+        # SR-16: the reason says whether a real token was presented in the wrong session (a theft
+        # attempt) or the token is unknown, as before; the answer is the same either way
+        known = db.scalar(select(BallotToken.id).where(BallotToken.token_hash == token_hash(body.ballot_token)))
+        reject(db, voter, "wrong_session" if known else "invalid", status.HTTP_400_BAD_REQUEST, "invalid_ballot")
 
     # SR-03 (a): lock the elector's participation row first, then the token row, always in that order
     participation = db.scalars(
@@ -311,7 +335,9 @@ def accept_ballot(body: SubmitIn, voter: Account, session: AuthSession, db: Sess
     sealed = encrypt_ballot(ballot_payload(division_id, ranking), ballot_id, election.id)
     stored = True
     try:
-        db.add(Ballot(id=ballot_id, election_id=election.id, encrypted_payload=sealed))
+        # VULN-01: held in pending_ballots until the SR-13 seal moves it to ballots, still in this one
+        # SR-03 transaction. The held row shares this transaction's xmin; the sealed copy will not.
+        db.add(PendingBallot(id=ballot_id, election_id=election.id, encrypted_payload=sealed))
         db.execute(
             update(VoterParticipation)
             .where(VoterParticipation.roll_id == voter.roll_id, VoterParticipation.election_id == election.id)

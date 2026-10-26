@@ -94,7 +94,8 @@ def take_backup(db_engine: Engine, key: bytes, backups_dir: Path, label: str = "
             }
             for name, blob in encrypted.items()
         ],
-        "ballot_count": len(rows["ballots"]),
+        # VULN-01: every accepted ballot, sealed (ballots) or still held for its seal (pending_ballots)
+        "ballot_count": len(rows["ballots"]) + len(rows["pending_ballots"]),
     }
     for name, blob in encrypted.items():
         (folder / (name + ENCRYPTED)).write_bytes(blob)

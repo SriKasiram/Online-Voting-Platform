@@ -34,6 +34,8 @@ from scripts.report import Check, Status, check_line, exit_code, summary_line, t
 
 # SR-11: the only columns ballots may have. Any other column could hold a readable ballot.
 BALLOT_COLUMNS = {"id", "election_id", "encrypted_payload"}
+# VULN-01: the sealed ballots and the held ones, under the same rule
+BALLOT_STORES = ("ballots", "pending_ballots")
 LEGACY_BALLOT_COLUMNS = {"division_id", "ciphertext", "nonce", "key_id"}
 # SR-11: the other tables that touch ballots (receipts, participation, the audit log), with the
 # columns they may have. A new column there has to be reviewed before a release.
@@ -91,7 +93,8 @@ def readable_reason(blob: bytes) -> str | None:
 
 
 def check_ballot_records(db: Session) -> Check:
-    """SR-11 (a): every ballot row is version 1, long enough, and decrypts with its own ballot and election id."""
+    """SR-11 (a): every ballot row is version 1, long enough, and decrypts with its own ballot and election id.
+    VULN-01: held ballots included (ballot_rows reads both stores)."""
     name = "a. ballot records"
     if "encrypted_payload" not in columns_of(db, "ballots"):
         return Check(name, "FAIL", "ballots has no encrypted_payload column (run alembic upgrade head)")
@@ -120,16 +123,19 @@ def check_ballot_records(db: Session) -> Check:
 
 
 def check_ballot_columns(db: Session) -> Check:
-    """SR-11 (b): the old plaintext columns are gone, and ballots has nothing but id, election and the ciphertext."""
+    """SR-11 (b): the old plaintext columns are gone, and ballots has nothing but id, election and the ciphertext.
+    VULN-01: the same for pending_ballots, which holds the same ballots until their seal."""
     name = "b. ballots columns"
-    columns = columns_of(db, "ballots")
-    unexpected = sorted(set(columns) - BALLOT_COLUMNS)
-    if unexpected:
-        legacy = sorted(set(unexpected) & LEGACY_BALLOT_COLUMNS)
-        detail = f" (old plaintext columns: {', '.join(legacy)})" if legacy else ""
-        return Check(name, "FAIL", f"unexpected column(s) {', '.join(unexpected)}{detail}")
-    if columns.get("encrypted_payload") != "bytea":
-        return Check(name, "FAIL", "encrypted_payload is missing or is not bytea")
+    for table in BALLOT_STORES:
+        columns = columns_of(db, table)
+        unexpected = sorted(set(columns) - BALLOT_COLUMNS)
+        prefix = "" if table == "ballots" else f"{table}: "
+        if unexpected:
+            legacy = sorted(set(unexpected) & LEGACY_BALLOT_COLUMNS)
+            detail = f" (old plaintext columns: {', '.join(legacy)})" if legacy else ""
+            return Check(name, "FAIL", f"{prefix}unexpected column(s) {', '.join(unexpected)}{detail}")
+        if columns.get("encrypted_payload") != "bytea":
+            return Check(name, "FAIL", f"{prefix}encrypted_payload is missing or is not bytea")
     return Check(name, "PASS", "only id, election_id and encrypted_payload (bytea); no plaintext ballot columns")
 
 

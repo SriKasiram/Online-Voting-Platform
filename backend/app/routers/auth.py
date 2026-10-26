@@ -37,6 +37,10 @@ from app.security import (
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
+# VULN-15: the nil UUID, which no account has (account ids are random version 4 UUIDs). An unknown
+# username's failure UPDATE and every non-locking failure's DELETE name it, so they match nothing.
+NO_ACCOUNT = UUID(int=0)
+
 
 def display_name(db: Session, account: Account) -> str:
     # SR-05: staff have no roll entry, so they see their username. Electors are unchanged.
@@ -70,11 +74,13 @@ def check_ip_limit(request: Request, db: Session) -> None:
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "too_many_requests")
 
 
-def record_failure(db: Session, account_id: UUID, event_type: str) -> None:
+def record_failure(db: Session, account_id: UUID | None, event_type: str) -> None:
     """
     SR-01: counts a failed attempt in one UPDATE, so parallel attempts cannot
     lose a count. A lock that has run out starts the count again, and reaching
     MAX_FAILED_ATTEMPTS locks the account for LOCK_MINUTES.
+    VULN-15: also for an unknown username (account_id None): the same UPDATE, on an id no account
+    has, and the same DELETE, so every failed sign in does the same work whether or not it exists.
     """
     now = utc_now()
     lock_ended = Account.locked_until <= now
@@ -82,7 +88,7 @@ def record_failure(db: Session, account_id: UUID, event_type: str) -> None:
     locked_until = db.execute(
         update(Account)
         # An account locked right now is not counted again, so its lock never grows
-        .where(Account.id == account_id, or_(Account.locked_until.is_(None), lock_ended))
+        .where(Account.id == (account_id or NO_ACCOUNT), or_(Account.locked_until.is_(None), lock_ended))
         .values(
             failed_logins=count,
             locked_until=case(
@@ -94,13 +100,15 @@ def record_failure(db: Session, account_id: UUID, event_type: str) -> None:
         .execution_options(synchronize_session=False)
     ).scalar()
     log(db, event_type, account_id, FAILURE)
-    if locked_until is not None:
-        # A sign in waiting for its code cannot finish once the account is locked
-        db.execute(
-            delete(AuthSession).where(
-                AuthSession.account_id == account_id, AuthSession.stage == SessionStage.MFA_PENDING
-            )
+    # A sign in waiting for its code cannot finish once the account is locked
+    # VULN-15: the DELETE runs on every failure, and matches rows only when this one locked the account
+    db.execute(
+        delete(AuthSession).where(
+            AuthSession.account_id == (account_id if locked_until is not None else NO_ACCOUNT),
+            AuthSession.stage == SessionStage.MFA_PENDING,
         )
+    )
+    if locked_until is not None:
         log(db, "auth_account_locked", account_id, DENIED)
     db.commit()
 
@@ -133,14 +141,14 @@ def login(body: LoginIn, request: Request, response: Response, db: DbSession) ->
     # Committed with whatever this request commits next.
     db.execute(delete(AuthSession).where(AuthSession.expires_at < utc_now()))
     account = db.scalar(select(Account).where(Account.username == body.username.strip()))
-    if account is None or (account.locked_until is not None and account.locked_until > utc_now()):
-        # SR-01: the same Argon2id work as a real check, so the response time reveals neither case
-        verify_password(None, body.password)
-        log(db, "auth_password_failed", account.id if account else None, FAILURE)
-        db.commit()
-        raise rejected()
-    if not verify_password(account.password_hash, body.password):
-        record_failure(db, account.id, "auth_password_failed")
+    usable = account is not None and (account.locked_until is None or account.locked_until <= utc_now())
+    # SR-01: the same Argon2id work as a real check, so the response time reveals neither case
+    # VULN-15: and the same steps after it. An unknown username, a locked account and a wrong
+    # password all go through record_failure (one UPDATE, one audit entry, one DELETE, one commit)
+    # and get the same 401. A locked account is checked against the dummy hash, as before, and its
+    # UPDATE changes nothing (record_failure never counts a locked account again).
+    if not verify_password(account.password_hash if usable else None, body.password):
+        record_failure(db, account.id if account else None, "auth_password_failed")
         raise rejected()
     # SR-01: failed_logins is not reset yet. Only a correct code completes sign in.
     start_session(db, response, account.id, SessionStage.MFA_PENDING, settings.mfa_pending_minutes)
@@ -238,6 +246,8 @@ def extend(request: Request, response: Response, db: DbSession) -> None:
                 AuthSession.expires_at > now,
                 AuthSession.extensions < settings.max_session_extensions,
             )
+            # VULN-05: the same row gets the new identifier, so its ballot_token_mac is carried over
+            # with it and a ballot token issued before the extension still works after it
             .values(
                 session_id_hash=hash_token(token),
                 expires_at=now + timedelta(minutes=settings.session_minutes),

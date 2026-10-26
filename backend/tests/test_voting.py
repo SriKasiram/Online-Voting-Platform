@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 # SR-11: stored ballots are encrypted, so tests read them back only through decrypt_ballot
 from app.ballot_crypto import RANKING_FIELD, decrypt_ballot
-from app.models import Account, Ballot, BallotToken, ElectionStatus, ParticipationState, VoterParticipation
+from app.models import Account, BallotToken, ElectionStatus, ParticipationState, PendingBallot, VoterParticipation  # VULN-01: an accepted ballot is held in pending_ballots until its seal
 from app.security import hash_token
 
 
@@ -66,7 +66,7 @@ def test_stored_ballot_holds_the_preferences_and_nothing_about_the_voter(
 
     assert submit(client, ballot, ranking).status_code == 200
 
-    stored = db_session.scalars(select(Ballot)).one()
+    stored = db_session.scalars(select(PendingBallot)).one()
     assert decrypt_ballot(stored.encrypted_payload, stored.id, stored.election_id)[RANKING_FIELD] == ranking  # SR-11
     token_hash = hash_token(ballot["ballot_token"]).hex()
     token = db_session.scalars(select(BallotToken).where(BallotToken.token_hash == token_hash)).one()

@@ -47,7 +47,17 @@ CHECK_GROUPS = {
     "d. checkpoint signatures": ("missing_checkpoint", "malformed_checkpoint", "bad_checkpoint_signature"),
     "e. checkpoints against the chain": ("checkpoint_mismatch", "tail_mismatch"),
     "f. nothing unsealed after the final seal": ("unsealed_after_final",),
+    # VULN-02: a held ballot removed (or one stuffed in) before its seal is in no chain, so totals catch it
+    "g. electors who voted = sealed + held ballots": ("ballot_count_mismatch",),
 }
+
+# VULN-02: three totals for one election in a single statement, so one snapshot: electors marked
+# voted (identity side), sealed ballots and held ballots (ballot side). Counts only, never a join.
+BALLOT_TOTALS = text(
+    "SELECT (SELECT count(*) FROM voter_participation WHERE election_id = :election AND state = 'voted'), "
+    "(SELECT count(*) FROM ballots WHERE election_id = :election), "
+    "(SELECT count(*) FROM pending_ballots WHERE election_id = :election)"
+)
 
 
 def _sha256_hex(data: bytes) -> str:
@@ -114,6 +124,8 @@ def verify_chain(session: Session, election_id: UUID | str, public_key: Ed25519P
     SR-13: checks an election's chain, its ballots and its signed checkpoints. Returns the reason
     codes found, sorted; an empty list means the chain verifies. Unsealed ballots are normal until a
     final seal. Reads ciphertext only: no ballot is decrypted.
+    VULN-02: and the election's totals (check g), so the seal, the verify script and the count all
+    notice a held ballot that was removed before it could be sealed.
     """
     election = str(UUID(str(election_id)))
     reasons: set[str] = set()
@@ -175,14 +187,20 @@ def verify_chain(session: Session, election_id: UUID | str, public_key: Ed25519P
         reasons.add("missing_checkpoint")
 
     # f. after a final seal every ballot of the election must be in the chain
+    # VULN-01: a ballot still in the holding table is unsealed too
     if any(checkpoint["final"] for checkpoint in checkpoints):
         unsealed = session.scalar(
             text(
-                "SELECT count(*) FROM ballots b WHERE b.election_id = :election "
-                "AND NOT EXISTS (SELECT 1 FROM ballot_chain c WHERE c.ballot_id = b.id)"
+                "SELECT (SELECT count(*) FROM ballots b WHERE b.election_id = :election "
+                "AND NOT EXISTS (SELECT 1 FROM ballot_chain c WHERE c.ballot_id = b.id)) "
+                "+ (SELECT count(*) FROM pending_ballots WHERE election_id = :election)"
             ),
             {"election": election},
         )
         if unsealed:
             reasons.add("unsealed_after_final")
+    # g. VULN-02: every elector marked voted has exactly one ballot, sealed or held
+    voted, sealed, held = session.execute(BALLOT_TOTALS, {"election": election}).one()
+    if voted != sealed + held:
+        reasons.add("ballot_count_mismatch")
     return sorted(reasons)

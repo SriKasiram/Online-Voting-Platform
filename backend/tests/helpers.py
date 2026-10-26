@@ -4,6 +4,8 @@ Fixtures every test can use live in conftest.py; these are plain functions and o
 """
 
 import hashlib
+import secrets
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 
@@ -59,6 +61,23 @@ def account_row(db: Session, user) -> Account:
     # SR-01, SR-06: the account's row, read fresh
     db.expire_all()
     return db.get_one(Account, user.account_id)
+
+
+def mark_electors_voted(db: Session, election_id, count: int) -> None:
+    """
+    VULN-02: `count` electors marked voted, each on a minimal roll record of their own, so that
+    ballots a test stores directly keep the totals check (voted = sealed + held) in balance.
+    """
+    for _ in range(count):
+        roll_id = uuid.uuid4()
+        db.execute(
+            text("INSERT INTO electoral_roll (id, roll_lookup, full_name_enc, address_enc, enrolled) VALUES (:i, :l, :n, :a, true)"),
+            {"i": roll_id, "l": secrets.token_bytes(32), "n": b"x", "a": b"x"},
+        )
+        db.execute(
+            text("INSERT INTO voter_participation (roll_id, election_id, state) VALUES (:r, :e, 'voted')"),
+            {"r": roll_id, "e": election_id},
+        )
 
 
 def _set_append_only_triggers(db: Session, tables: tuple[str, ...], state: str) -> None:

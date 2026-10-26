@@ -361,13 +361,18 @@ class TestHouseCount(CountedElection):
 
         assert (refused.code, refused.checked) == (code, 0)
 
-    def test_refused_when_the_voted_total_does_not_match(self, engine: Engine, db_session: Session, sealed, keys) -> None:
-        """SR-17 check f: one fewer elector marked voted than ballots sealed: total_mismatch (totals only)."""
+    def test_refused_when_the_voted_total_does_not_match(self, engine: Engine, db_session: Session, sealed, keys, monkeypatch) -> None:
+        """SR-17 check f: one fewer elector marked voted than ballots sealed: total_mismatch (totals only).
+        VULN-02: check d now compares the totals first (ballot_count_mismatch); with d out of the way,
+        as if it had a bug, check f still refuses with total_mismatch."""
         db_session.execute(
             text("UPDATE voter_participation SET state = 'issued' WHERE roll_id = (SELECT roll_id FROM voter_participation LIMIT 1)")
         )
         db_session.commit()
 
+        refused = self.refusal(engine, keys, sealed["election_id"])
+        assert (refused.code, refused.details) == ("chain_invalid", ["ballot_count_mismatch"])
+        monkeypatch.setattr(house_count, "verify_chain", lambda *args: [])
         assert self.refusal(engine, keys, sealed["election_id"]).code == "total_mismatch"
 
     # -- how the ballots are read --
@@ -476,7 +481,8 @@ class TestHouseCount(CountedElection):
             ("COUNT_STARTED", "success", None, None),
             ("COUNT_COMPLETED", "success", None, 5),
             ("COUNT_STARTED", "success", None, None),
-            ("COUNT_REFUSED", "failure", "total_mismatch", 0),
+            # VULN-02: the changed total is now caught by check d, the chain check, before check f
+            ("COUNT_REFUSED", "failure", "chain_invalid", 0),
         ]
         assert all(
             # SR-18: written in the current audit format; a count event has no release version

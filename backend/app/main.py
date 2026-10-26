@@ -46,9 +46,61 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     yield
 
 
-app = FastAPI(title="Electronic voting prototype API", version="0.1.0", lifespan=lifespan)
+# VULN-09: /docs, /redoc and /openapi.json are a map of every route and field, so they exist only
+# when API_DOCS is on (development); otherwise each is a plain 404
+app = FastAPI(
+    title="Electronic voting prototype API",
+    version="0.1.0",
+    lifespan=lifespan,
+    docs_url="/docs" if settings.api_docs else None,
+    redoc_url="/redoc" if settings.api_docs else None,
+    openapi_url="/openapi.json" if settings.api_docs else None,
+)
 
 BALLOT_SUBMIT_PATH = "/api/ballot/submit"
+
+# VULN-07: the browser policy for every response. The built pages load only their own script,
+# style, font and image files. The one exception, img-src data:, is the small SVG image the built
+# stylesheet carries inline (a data: URL in the CSS); nothing else needs it.
+CONTENT_SECURITY_POLICY = (
+    "default-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; "
+    "form-action 'self'; img-src 'self' data:"
+)
+# VULN-09: only with API_DOCS on, and only on the docs pages: FastAPI's Swagger UI and ReDoc pages load
+# their scripts, styles and fonts from cdn.jsdelivr.net and Google Fonts and start with an inline script
+DOCS_PATHS = frozenset({"/docs", "/docs/oauth2-redirect", "/redoc"})
+DOCS_CONTENT_SECURITY_POLICY = (
+    "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+    "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com; "
+    "font-src 'self' https://fonts.gstatic.com; img-src 'self' data: https://fastapi.tiangolo.com https://cdn.redoc.ly; "
+    "worker-src 'self' blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+)
+SECURITY_HEADERS = {
+    # VULN-07: no page of the platform may be framed (clickjacking), as frame-ancestors says for newer browsers
+    "X-Frame-Options": "DENY",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    # VULN-07: none of these browser features is used, so no page (or injected script) may ask for one
+    "Permissions-Policy": (
+        "accelerometer=(), camera=(), display-capture=(), geolocation=(), gyroscope=(), magnetometer=(), "
+        "microphone=(), payment=(), usb=()"
+    ),
+}
+
+
+def harden(response: Response, path: str) -> Response:
+    """VULN-07: the security headers, set on a response (refusals made outside the inner middleware included)."""
+    docs = settings.api_docs and path in DOCS_PATHS
+    response.headers["Content-Security-Policy"] = DOCS_CONTENT_SECURITY_POLICY if docs else CONTENT_SECURITY_POLICY
+    response.headers.update(SECURITY_HEADERS)
+    return response
+
+
+def refusal(detail: str, path: str) -> Response:
+    """SR-09, SR-10, VULN-07, VULN-09: a 400 from the outer middleware, with no-store and the security headers."""
+    return harden(
+        JSONResponse({"detail": detail}, status_code=400, headers={"Cache-Control": "no-store", "Pragma": "no-cache"}), path
+    )
 
 
 @app.exception_handler(RequestValidationError)
@@ -78,18 +130,36 @@ async def no_store(request: Request, call_next: Callable[[Request], Awaitable[Re
 
 
 @app.middleware("http")
+async def security_headers(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
+    # VULN-07: declared after no_store, so every response it passes back (API answers, errors, 404s
+    # and the built elector and staff pages) carries the policy too
+    return harden(await call_next(request), request.url.path)
+
+
+@app.middleware("http")
 async def require_tls(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
     # SR-10: declared after no_store, so it is the outermost middleware. A plaintext request is
     # refused before anything else runs (so a plain `uvicorn app.main:app` is no way around TLS),
     # and every HTTPS response, errors included, tells the browser to use HTTPS only.
+    # VULN-09: only trusted_host is outside it now, and it lets nothing through on a wrong Host.
     if request.url.scheme != "https":
         # SR-09 still applies: this refusal never reaches no_store, so it sets the headers itself
-        return JSONResponse(
-            {"detail": "tls_required"}, status_code=400, headers={"Cache-Control": "no-store", "Pragma": "no-cache"}
-        )
+        # VULN-07: and the security headers, which it never reaches either
+        return refusal("tls_required", request.url.path)
     response = await call_next(request)
     response.headers["Strict-Transport-Security"] = f"max-age={settings.hsts_max_age}"
     return response
+
+
+@app.middleware("http")
+async def trusted_host(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
+    # VULN-09: the outermost middleware. A Host header naming anything but TRUSTED_HOSTS (this
+    # computer, by default) is refused before any route runs, so the app cannot be reached, or
+    # build links, under another name (DNS rebinding, poisoned absolute URLs). Read per request.
+    host = request.headers.get("host", "").split(":")[0].lower()
+    if host not in {trusted.lower() for trusted in settings.trusted_hosts}:
+        return refusal("invalid_host", request.url.path)
+    return await call_next(request)
 
 
 app.include_router(auth.router, prefix="/api")

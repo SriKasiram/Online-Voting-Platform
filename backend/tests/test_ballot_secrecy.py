@@ -16,6 +16,8 @@ EXPECTED_COLUMNS = {
     "ballot_tokens": {"id", "election_id", "token_hash", "consumed", "receipt_hash"},
     # SR-11: the division and the ranking exist only inside the AES-256-GCM encrypted payload
     "ballots": {"id", "election_id", "encrypted_payload"},
+    # VULN-01: accepted ballots waiting for their seal, with exactly the columns of ballots
+    "pending_ballots": {"id", "election_id", "encrypted_payload"},
 }
 ANONYMOUS_TABLES = sorted(EXPECTED_COLUMNS)
 
@@ -23,7 +25,8 @@ ANONYMOUS_TABLES = sorted(EXPECTED_COLUMNS)
 ALLOWED_REFERENCES: set[str] = set()
 
 # SR-12: no time of any kind on the ballot side (SR-03 used to allow a token's expiry and use time)
-ALLOWED_TIME_COLUMNS: dict[str, set[str]] = {"ballot_tokens": set(), "ballots": set()}
+# VULN-01: nor on the holding table
+ALLOWED_TIME_COLUMNS: dict[str, set[str]] = {"ballot_tokens": set(), "ballots": set(), "pending_ballots": set()}
 
 
 @pytest.mark.parametrize("table", ANONYMOUS_TABLES)

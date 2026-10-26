@@ -208,6 +208,9 @@ class AuthSession(Base):
     expires_at: Mapped[datetime]
     # SR-04: extensions used so far. Each one also gives the session a new identifier.
     extensions: Mapped[int] = mapped_column(default=0, server_default=text("0"))
+    # VULN-05: HMAC of the election and the ballot token issued in this session (app/security.py
+    # ballot_binding), so the token works in this session only. It equals no ballot-side value.
+    ballot_token_mac: Mapped[bytes | None]
 
 
 class RegistrationStage(enum.StrEnum):
@@ -234,6 +237,8 @@ class RegistrationSession(Base):
     attempts: Mapped[int] = mapped_column(default=0, server_default=text("0"))
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     expires_at: Mapped[datetime]
+    # VULN-06: taken usernames tried at step 2, at most MAX_USERNAME_ATTEMPTS
+    username_attempts: Mapped[int] = mapped_column(default=0, server_default=text("0"))
 
 
 class ParticipationState(enum.StrEnum):
@@ -301,6 +306,26 @@ class Ballot(Base):
     election_id: Mapped[uuid.UUID]
     # SR-11: the division and the ranking, encrypted: version byte, nonce, ciphertext and tag.
     # The division is ballot content too, so it has no readable column any more.
+    encrypted_payload: Mapped[bytes]
+
+
+class PendingBallot(Base):
+    """
+    VULN-01: an accepted ballot waiting for its SR-13 seal, with exactly the columns of ballots. The
+    accept transaction writes here, so the row shares an xmin with the elector's participation and
+    audit rows; the seal copies it into ballots in ballot id order, in a subtransaction of its own,
+    deletes it here, and then VACUUM FULL removes the dead row from disk. So a ballot is linkable
+    through system columns only while it is held, never once sealed.
+    VULN-02: a trigger refuses every UPDATE, and every DELETE unless ballots already holds an
+    identical copy. There is no bypass flag.
+    """
+
+    __tablename__ = "pending_ballots"
+
+    # SR-11: the id the ciphertext is bound to, kept when the seal copies the ballot
+    id: Mapped[uuid.UUID] = uuid_pk()
+    # SR-12: a plain value, no foreign key: the ballot side does not join the identity side
+    election_id: Mapped[uuid.UUID]
     encrypted_payload: Mapped[bytes]
 
 

@@ -26,11 +26,11 @@ from app.models import (
     Account,
     AuditLogEntry,
     AuthSession,
-    Ballot,
     BallotToken,
     ElectoralRollEntry,
     Election,
     ParticipationState,
+    PendingBallot,  # VULN-01: an accepted ballot is held in pending_ballots until its seal
     SessionStage,
     VoterParticipation,
 )
@@ -85,7 +85,7 @@ def test_valid_token_records_exactly_one_ballot(client: TestClient, db_session: 
     response = submit(client, ballot)
 
     assert response.status_code == 200
-    assert count(db_session, Ballot) == 1
+    assert count(db_session, PendingBallot) == 1
     assert state_of(db_session, voter, election) == ParticipationState.VOTED
     token = token_row(db_session, ballot["ballot_token"])
     # SR-14: used, and holding only the SHA-256 of the receipt it returned, never the receipt
@@ -103,7 +103,7 @@ def test_replayed_token_gets_the_first_answer_and_no_new_ballot(
     again = [submit(client, ballot) for _ in range(3)]
 
     assert all(outcome(r) == outcome(first) for r in again) and first.status_code == 200
-    assert count(db_session, Ballot) == 1
+    assert count(db_session, PendingBallot) == 1
 
 
 def test_second_ballot_request_is_refused_after_issue_and_after_voting(
@@ -153,7 +153,7 @@ def test_token_lasts_while_the_session_and_the_election_do(
         assert outcome(response) == expected
         assert state_of(db_session, voter, election) == ParticipationState.ISSUED
         assert unused(token_row(db_session, paper["ballot_token"]))
-    assert count(db_session, Ballot) == 1
+    assert count(db_session, PendingBallot) == 1
 
 
 @pytest.mark.parametrize("kind", ["unknown", "tampered"])
@@ -168,7 +168,7 @@ def test_unknown_or_tampered_token_changes_nothing(
     bad = new_token() if kind == "unknown" else real[:-1] + ("A" if real[-1] != "A" else "B")
 
     assert outcome(submit(client, ballot, token=bad)) == INVALID
-    assert count(db_session, Ballot) == 0
+    assert count(db_session, PendingBallot) == 0
     assert state_of(db_session, voter, election) == ParticipationState.ISSUED
     assert unused(token_row(db_session, real))  # SR-12, SR-14: still unused
     assert submit(client, ballot).status_code == 200
@@ -214,10 +214,10 @@ def test_failure_while_storing_the_ballot_changes_nothing(
     voter = make_voter()
     sign_in(voter)
     ballot = client.get("/api/ballot").json()
-    real_ballot = ballot_router.Ballot
+    real_ballot = ballot_router.PendingBallot
     # A missing ciphertext makes the database refuse the INSERT (SR-11 removed the division column and
     # SR-12 the election foreign key, which earlier versions of this test broke instead)
-    monkeypatch.setattr(ballot_router, "Ballot", lambda **fields: real_ballot(**(fields | {"encrypted_payload": None})))
+    monkeypatch.setattr(ballot_router, "PendingBallot", lambda **fields: real_ballot(**(fields | {"encrypted_payload": None})))
 
     # SR-12: the error that reaches the server log carries none of the database's text about the row
     with pytest.raises(ballot_router.BallotStoreError) as failed:
@@ -227,7 +227,7 @@ def test_failure_while_storing_the_ballot_changes_nothing(
     logged = "".join(traceback.format_exception(failed.value))
     assert not any(word in logged for word in ("IntegrityError", "NotNullViolation", "Failing row", "DETAIL"))
 
-    assert count(db_session, Ballot) == 0
+    assert count(db_session, PendingBallot) == 0
     assert state_of(db_session, voter, election) == ParticipationState.ISSUED
     assert unused(token_row(db_session, ballot["ballot_token"]))
     monkeypatch.undo()
@@ -271,15 +271,17 @@ def test_ballots_always_equal_voted_electors(
             submit(client, ballot)
         client.post("/api/auth/logout")
 
-    by_election = Ballot.election_id == election.election.id
-    assert count(db_session, Ballot, by_election) == count(db_session, VoterParticipation, VOTED) == 4
+    by_election = PendingBallot.election_id == election.election.id
+    assert count(db_session, PendingBallot, by_election) == count(db_session, VoterParticipation, VOTED) == 4
     assert count(db_session, VoterParticipation, VoterParticipation.state == ParticipationState.ISSUED) == 1
 
 
 def test_voted_elector_with_another_unused_token_is_refused(
     client: TestClient, db_session: Session, make_voter, sign_in
 ) -> None:
-    """SR-03 test 12: someone who has voted cannot use any other unused token either."""
+    """SR-03 test 12: someone who has voted cannot use any other unused token either.
+    VULN-05: the other token was issued to another session, so it is now refused before the voted
+    check, with the generic invalid_ballot instead of already_voted; it still changes nothing."""
     first, second = make_voter(), make_voter()
     sign_in(second)
     other_ballot = client.get("/api/ballot").json()
@@ -290,8 +292,8 @@ def test_voted_elector_with_another_unused_token_is_refused(
 
     response = submit(client, ballot, token=other_ballot["ballot_token"])
 
-    assert outcome(response) == ALREADY_VOTED
-    assert count(db_session, Ballot) == 1
+    assert outcome(response) == (400, {"detail": "invalid_ballot"})
+    assert count(db_session, PendingBallot) == 1
     assert unused(token_row(db_session, other_ballot["ballot_token"]))  # SR-12, SR-14: unused
 
 
@@ -329,7 +331,8 @@ def test_audit_events_hold_no_token_reference_or_ballot_content(
         "BALLOT_REPLAY_BLOCKED",
         "BALLOT_TOKEN_REJECTED",
     }
-    assert {r.reason for r in rows if r.event_type == "BALLOT_TOKEN_REJECTED"} == {"invalid", "wrong_state"}
+    # VULN-05: the unissued elector presented another session's token: wrong_session, before the state check
+    assert {r.reason for r in rows if r.event_type == "BALLOT_TOKEN_REJECTED"} == {"invalid", "wrong_session"}
     assert {r.actor for r in rows} == {f"account:{v.account_id}" for v in (voted, late_voter, unissued)}
     assert all(r.details is None and r.batch_no is None and r.count is None for r in rows)
     assert {r.category for r in rows} == {"eligibility"} and {r.role for r in rows} == {"elector"}
@@ -429,14 +432,26 @@ class TestConcurrency(CommittedDatabase):
     ) -> None:
         """SR-03 test 3: 20 submissions of the same token at once, in 3 rounds: exactly one ballot each round."""
         for round_number in range(1, 4):
-            sessions = signed_in_sessions(db_session, make_voter(), 20)
+            voter = make_voter()
+            sessions = signed_in_sessions(db_session, voter, 20)
             ballot = as_voter(sessions[0]).get("/api/ballot").json()
+            # VULN-05: the token works only in the session it was issued to, so every one of the 20
+            # devices is given that session's binding, as if each had been issued it (separate
+            # sessions still matter: see signed_in_sessions)
+            db_session.execute(
+                text(
+                    "UPDATE sessions SET ballot_token_mac = (SELECT ballot_token_mac FROM sessions WHERE session_id_hash = :first) "
+                    "WHERE account_id = :account"
+                ),
+                {"first": hash_token(sessions[0]), "account": voter.account_id},
+            )
+            db_session.commit()
 
             responses = run_together([lambda s=s: submit(as_voter(s), ballot) for s in sessions])
 
             assert [r.status_code for r in responses] == [200] * 20
             assert len({r.json()["receipt_id"] for r in responses}) == 1
-            assert count(db_session, Ballot) == count(db_session, VoterParticipation, VOTED) == round_number
+            assert count(db_session, PendingBallot) == count(db_session, VoterParticipation, VOTED) == round_number
 
     def test_simultaneous_ballot_requests_issue_one_token(
         self, client: TestClient, db_session: Session, election, make_voter

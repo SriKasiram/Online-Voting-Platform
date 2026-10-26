@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 from helpers import CommittedDatabase, count, state_of, token_row
 from app.config import Settings, settings
 from app.main import app
-from app.models import Account, Ballot, ParticipationState
+from app.models import Account, ParticipationState, PendingBallot  # VULN-01: an accepted ballot is held in pending_ballots until its seal
 from app.routers import ballot as ballot_router
 from app.security import SESSION_COOKIE
 from scripts import audit_separation
@@ -68,7 +68,7 @@ def test_confirmation_comes_within_10_seconds_and_holds_only_the_reference(
 
     assert response.status_code == 200 and elapsed < 10
     assert list(response.json()) == ["receipt_id"]
-    ballot_id = str(db_session.scalar(select(Ballot.id)))
+    ballot_id = str(db_session.scalar(select(PendingBallot.id)))
     leaks = [ballot_id, paper["ballot_token"], hashlib.sha256(paper["ballot_token"].encode()).hexdigest(), paper["division_name"]]
     leaks += [part for c in paper["candidates"] for part in (c["given_name"], c["surname"], c["party"])]
     assert [leak for leak in leaks if leak in response.text] == []
@@ -108,7 +108,7 @@ def test_retry_with_the_same_token_returns_the_same_reference(
     again = [submit(client, paper) for _ in range(2)]
 
     assert [(r.status_code, r.json()) for r in again] == [(200, first.json())] * 2
-    assert count(db_session, Ballot) == 1
+    assert count(db_session, PendingBallot) == 1
 
 
 def test_retry_with_a_modified_token_gets_the_generic_error(
@@ -122,7 +122,7 @@ def test_retry_with_a_modified_token_gets_the_generic_error(
     response = submit(client, paper, token=token[:-1] + ("A" if token[-1] != "A" else "B"))
 
     assert (response.status_code, response.json()) == GENERIC_ERROR
-    assert count(db_session, Ballot) == 1
+    assert count(db_session, PendingBallot) == 1
 
 
 @pytest.mark.parametrize("stored", ["missing (used before SR-14)", "altered"])
@@ -145,7 +145,7 @@ def test_used_token_without_a_matching_receipt_hash_gets_the_generic_error(
     assert "receipt_id" not in response.text
     token = token_row(db_session, paper["ballot_token"])
     assert (token.consumed, token.receipt_hash) == (True, value)
-    assert count(db_session, Ballot) == 1 and state_of(db_session, voter) == ParticipationState.VOTED
+    assert count(db_session, PendingBallot) == 1 and state_of(db_session, voter) == ParticipationState.VOTED
 
 
 def test_reference_and_hash_are_not_on_the_identity_side_or_in_logs(
@@ -170,8 +170,8 @@ def test_failure_while_storing_returns_no_confirmation(
 ) -> None:
     """SR-14 test 8: the ballot INSERT fails (the SR-03 pattern): an error, no reference, and the token still unused."""
     paper, voter = open_paper(client, make_voter, sign_in)
-    real_ballot = ballot_router.Ballot
-    monkeypatch.setattr(ballot_router, "Ballot", lambda **fields: real_ballot(**(fields | {"encrypted_payload": None})))
+    real_ballot = ballot_router.PendingBallot
+    monkeypatch.setattr(ballot_router, "PendingBallot", lambda **fields: real_ballot(**(fields | {"encrypted_payload": None})))
     server = TestClient(app, base_url="https://testserver", raise_server_exceptions=False, cookies={SESSION_COOKIE: client.cookies[SESSION_COOKIE]})
 
     response = submit(server, paper)
@@ -180,7 +180,7 @@ def test_failure_while_storing_returns_no_confirmation(
     assert expected_reference(paper["ballot_token"]) not in response.text
     token = token_row(db_session, paper["ballot_token"])
     assert (token.consumed, token.receipt_hash) == (False, None)
-    assert count(db_session, Ballot) == 0 and state_of(db_session, voter) == ParticipationState.ISSUED
+    assert count(db_session, PendingBallot) == 0 and state_of(db_session, voter) == ParticipationState.ISSUED
 
 
 def test_separation_audit_passes_and_covers_receipts(
@@ -246,9 +246,9 @@ class TestAcceptTimeout(CommittedDatabase):
         assert 1 <= elapsed < 10
         token = token_row(db_session, paper["ballot_token"])
         assert (token.consumed, token.receipt_hash) == (False, None)
-        assert count(db_session, Ballot) == 0 and state_of(db_session, voter) == ParticipationState.ISSUED
+        assert count(db_session, PendingBallot) == 0 and state_of(db_session, voter) == ParticipationState.ISSUED
 
         retry = submit(client, paper)
 
         assert (retry.status_code, retry.json()) == (200, {"receipt_id": expected_reference(paper["ballot_token"])})
-        assert count(db_session, Ballot) == 1 and state_of(db_session, voter) == ParticipationState.VOTED
+        assert count(db_session, PendingBallot) == 1 and state_of(db_session, voter) == ParticipationState.VOTED

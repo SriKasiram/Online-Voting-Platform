@@ -6,6 +6,8 @@ Stack: React with TypeScript (Vite), FastAPI (Python 3.12, SQLAlchemy 2.0, Alemb
 
 New to the project? [docs/MANUAL.md](docs/MANUAL.md) lists every file and shows how to start, reset and stop the app.
 
+Changes made after the penetration test are in [Security fixes after VAPT](#security-fixes-after-vapt).
+
 ## Status
 
 | Part | State |
@@ -129,7 +131,7 @@ Open https://localhost:8443. To vote, register first (see [Registering as a revi
 - https://localhost:8443/staff.html is the staff sign-in page (SR-06)
 - https://localhost:8443/api/health returns `{"status": "ok"}`
 - https://localhost:8443/api/divisions lists the divisions stored in the database
-- https://localhost:8443/docs lists every endpoint and lets you try them
+- https://localhost:8443/docs lists every endpoint and lets you try them, only with `API_DOCS=true` in `backend/.env` (VULN-09: off by default, a 404 otherwise)
 
 The server refuses to start without the certificate and key, and never falls back to plain HTTP. It also refuses without a usable ballot key (SR-11). It does not reload on code changes: stop it with Ctrl+C and start it again.
 
@@ -303,6 +305,9 @@ Copy `backend/.env.example` to `backend/.env`. Docker Compose reads the same fil
 | `BALLOT_KEY_FILE` | The 32-byte AES-256 key that encrypts every stored ballot (`python -m scripts.gen_ballot_key`). No default key exists: without this file the API does not start. See [SR-11](#sr-11-ballots-encrypted-at-rest) | `backend/keys/ballot.key` |
 | `HSTS_MAX_AGE` | Seconds the browser must use HTTPS only for this host. `.env.example` sets `300` for local work. See [SR-10](#sr-10-tls-13-for-ballot-transmission) | `31536000` (one year) |
 | `TLS_CERT_FILE`, `TLS_KEY_FILE`, `SERVER_PORT` | The TLS certificate and key `python -m app.serve` uses (relative to the project root), and its single HTTPS port (SR-10) | `certs/dev-cert.pem`, `certs/dev-key.pem`, `8443` |
+| `SERVER_HOST` | VULN-04: where `python -m app.serve` listens; the container image sets `0.0.0.0` | `127.0.0.1` |
+| `MAX_USERNAME_ATTEMPTS` | VULN-06: taken usernames one registration session may try at step 2 before it ends | `5` |
+| `API_DOCS`, `TRUSTED_HOSTS` | VULN-09: serve `/docs`, `/redoc` and `/openapi.json` (development only), and the `Host` values the server answers (JSON) | `false`, `["localhost","127.0.0.1"]` |
 
 The fixed limits (registration time, wrong-code limits, rate limits, password length) are named constants in `backend/app/config.py`.
 
@@ -334,9 +339,9 @@ Never commit a real `.env` file. Only `.env.example` belongs in Git.
 ### Limitations, for later stages
 
 - Ballots are now stored AES-256-GCM encrypted (SR-11), and ballot definitions are signed (SR-07). The ballot key sits on the same machine as the database (see SR-11's limits).
-- A ballot holds no voter and no time, but it is stored in the same transaction that marks the voter. Someone with direct access to the database could match the two through PostgreSQL's internal transaction ids. A later stage should store ballots separately or in shuffled batches.
+- A ballot holds no voter and no time, but it is stored in the same transaction that marks the voter. Someone with direct access to the database could match the two through PostgreSQL's internal transaction ids. A later stage should store ballots separately or in shuffled batches. VULN-01: done for sealed ballots; a ballot is linkable this way only while it is held, until its seal (see [Security fixes after VAPT](#security-fixes-after-vapt)).
 - The rate limiter keeps its counts in memory, so they reset when the API restarts and are not shared between several API processes. Behind the dev server's proxy every request comes from `127.0.0.1`, so the per-IP limit counts all users together.
-- There is no CSRF token yet. `SameSite=Strict` cookies are the only protection. The session cookie is marked `Secure` (SR-10: `.env.example` now sets `COOKIE_SECURE=true`). The registration cookie is not marked `Secure` yet, although it now travels only over TLS (SR-10).
+- There is no CSRF token yet. `SameSite=Strict` cookies are the only protection. The session cookie is marked `Secure` (SR-10: `.env.example` now sets `COOKIE_SECURE=true`). The registration cookie is not marked `Secure` yet, although it now travels only over TLS (SR-10). VULN-12: it is now, set and cleared, like every cookie.
 - Docker Compose passes all of `backend/.env` into the database container, including `SECRET_KEY`, which the database does not need.
 - The receipt reference is derived from the ballot token, and only its hash is stored, on the used token row (SR-14). There is no way for a voter to check it yet.
 
@@ -428,10 +433,11 @@ Design only, not implemented:
 
 No elector can have more than one ballot accepted in an election, however many requests, devices or replays there are.
 
-**Issue** (`GET /api/ballot`). First the SR-01 signed-in session, then the SR-02 eligibility check. Then, in one transaction, the elector's row is inserted into `voter_participation` with state `issued` (`INSERT ... ON CONFLICT DO NOTHING`). If the row already exists, the elector already has a token or has voted: the answer is `409 already_voted` and nothing is issued. Otherwise the server creates a token of 256 random bits (`secrets.token_urlsafe(32)`), stores only its SHA-256 (hex), and returns the token once in `ballot_token`. SR-12: no expiry is stored; the token is usable while the election is open and the elector is signed in. The token itself is never stored or logged.
+**Issue** (`GET /api/ballot`). First the SR-01 signed-in session, then the SR-02 eligibility check. Then, in one transaction, the elector's row is inserted into `voter_participation` with state `issued` (`INSERT ... ON CONFLICT DO NOTHING`). If the row already exists, the elector already has a token or has voted: the answer is `409 already_voted` and nothing is issued. Otherwise the server creates a token of 256 random bits (`secrets.token_urlsafe(32)`), stores only its SHA-256 (hex), and returns the token once in `ballot_token`. SR-12: no expiry is stored; the token is usable while the election is open and the elector is signed in. The token itself is never stored or logged. VULN-05: and only in the session that received it; the session row keeps an HMAC of it (see [how long a token lasts](#sr-03-how-long-a-ballot-token-lasts)).
 
 **Accept** (`POST /api/ballot/submit`). Again, the signed-in session and eligibility come first. Then, in one transaction:
 
+0. VULN-05: before anything else, the token must match the HMAC on this session's row (constant-time); otherwise `400 invalid_ballot`, and nothing changes;
 1. lock the elector's participation row (`SELECT ... FOR UPDATE`), then the token row, always in that order;
 2. reject an unknown or altered token (`400 invalid_ballot`);
 3. if the token was already used, return the first answer again (`200`, same receipt reference) and store nothing;
@@ -439,7 +445,7 @@ No elector can have more than one ballot accepted in an election, however many r
 5. reject an elector who is not `issued`: `409 already_voted` if they have voted, `400 invalid_ballot` if they were never issued a ballot;
 6. check the ballot content as before;
 7. consume the token with one conditional `UPDATE` that must change exactly one row, recording the SHA-256 of the receipt reference (SR-14; it was a random reference before) and no time (SR-12);
-8. store the ballot and mark the elector `voted`, then commit.
+8. store the ballot and mark the elector `voted`, then commit. VULN-01: the ballot is held in `pending_ballots` until the SR-13 seal moves it to `ballots`.
 
 Any failure rolls everything back: a token is never used without a ballot, and a ballot never exists without the elector marked voted. A token stays unused after a rejected ballot, so the voter can correct it and submit again.
 
@@ -453,7 +459,7 @@ It refuses once the reviewer has voted, because a cast ballot cannot be undone b
 
 **Unlinked tables.** `voter_participation` (roll entry, election, state) has no timestamp. `ballot_tokens` (id, election, hash, used flag, receipt hash) has no elector and no time at all (SR-12, SR-14). `ballots` (id, election, division, content) has no token, no reference and no time. So the database cannot match a ballot to a token, or a token to an elector. The receipt hash on the used token row is the only handle, and it points at no ballot.
 
-**Audit.** `BALLOT_TOKEN_ISSUED`, `BALLOT_ACCEPTED`, `BALLOT_REPLAY_BLOCKED`, and `BALLOT_TOKEN_REJECTED` with a reason (`invalid`, `wrong_state`; SR-12 removed `expired`), each with the account and the event only. No token, hash, receipt reference, receipt hash (SR-14) or ballot content.
+**Audit.** `BALLOT_TOKEN_ISSUED`, `BALLOT_ACCEPTED`, `BALLOT_REPLAY_BLOCKED`, and `BALLOT_TOKEN_REJECTED` with a reason (`invalid`, `wrong_state`; SR-12 removed `expired`; VULN-05 added `wrong_session`), each with the account and the event only. No token, hash, receipt reference, receipt hash (SR-14) or ballot content.
 
 Run the SR-03 tests, inside `backend/` with PostgreSQL running:
 
@@ -465,7 +471,7 @@ Design only, not implemented:
 
 - Paper and absent-vote channels. They would mark the same `voter_participation` row, so an elector who voted on paper could not vote online, and the reverse.
 - Staff screens for resetting an elector.
-- Binding the token to the elector. A token works for any eligible elector who holds it, and the participation row still allows only one ballot each.
+- Binding the token to the elector. A token works for any eligible elector who holds it, and the participation row still allows only one ballot each. VULN-05: a token is now bound to the session that received it, so another elector's session cannot use it.
 
 ## SR-04: session lifetime and binding
 
@@ -548,7 +554,7 @@ No API endpoint creates staff, and the seed creates none.
 
 **Try the admin routes:**
 1. Start the server (`python -m app.serve`, SR-10).
-2. Open https://localhost:8443/docs.
+2. Open https://localhost:8443/docs. VULN-09: set `API_DOCS=true` in `backend/.env` and restart first (development only); otherwise use the [staff console](#staff-console) or curl below.
 3. Sign in with `POST /api/auth/login` (username and password), then `POST /api/auth/verify` (the 6-digit code from the authenticator app). In this prototype staff use a TOTP code like electors. The staff sign-in page (SR-06) does the same.
 4. Call the `/api/admin` routes from the same page; the browser keeps the session cookie. With curl, keep the cookie in a file:
 
@@ -571,7 +577,7 @@ Design only, not implemented:
 - The `returning_officer` role, with dual control for ballot-definition activation, roll replacement and result release.
 - The `system_administrator` role.
 - Full admin screens. SR-05 now has a basic staff console (see [Staff console](#staff-console)) for the four existing routes; anything more is design only.
-- Disable `/docs` in production. It lists every route; the prototype keeps it for development.
+- Disable `/docs` in production. It lists every route; the prototype keeps it for development. VULN-09: done; it is off unless `API_DOCS=true`.
 - An access review before each election and after any staff change.
 - Separation of privileged services, and least-privilege database roles.
 - Phishing-resistant passkeys (WebAuthn) for staff. SR-06 requires a password and a TOTP code for every staff sign in, but TOTP is not phishing-resistant, and passkeys remain design only.
@@ -599,7 +605,7 @@ Every account must have a TOTP secret: `accounts.totp_secret_enc` is `NOT NULL`,
 2. Add the setup link or key it prints, shown only once, to an authenticator app.
 3. With the server running (`python -m app.serve`), open https://localhost:8443/staff.html. This page is separate from the voter app.
 4. Enter the username and password, then the 6-digit code. The page shows your role and when the session ends, and signs you out after 10 minutes.
-5. Once signed in, the page offers role-based views of the existing admin routes: the [staff console](#staff-console). The API docs page (https://localhost:8443/docs) and curl (see SR-05) still work too; the docs page is on the same address, so the session cookie works there.
+5. Once signed in, the page offers role-based views of the existing admin routes: the [staff console](#staff-console). The API docs page (https://localhost:8443/docs) and curl (see SR-05) still work too; the docs page is on the same address, so the session cookie works there. VULN-09: the docs page only with `API_DOCS=true` (development).
 
 Run the SR-06 tests, inside `backend/` with PostgreSQL running:
 
@@ -943,6 +949,7 @@ It prints PASS, FAIL or SKIPPED per check, then `SR-12 separation audit: PASS` o
   - In a plain SQL dump, ballot identifiers may appear only inside the ballot tables' own `COPY` blocks or `INSERT` lines.
   - Any other file (an export) fails if it holds a ballot identifier together with an identity marker: an e-mail address, an elector's or staff member's username, or an account or roll id.
   - Without `--file`, this check is SKIPPED.
+- **f. System columns** (VULN-01). No sealed ballot has the `xmin` of any identity-side row, and within each seal batch the ballots sit on disk (`ctid`) in ballot id order. Held ballots are counted, not checked: they stay linkable until their seal.
 
 It prints only counts and table or file names.
 
@@ -967,7 +974,7 @@ Every accepted ballot ends up in an integrity-protected repository: a SHA-256 ha
 - **What the entry hash covers.** SHA-256 over a version tag, the previous entry's hash, the ballot id, the election id, and the SHA-256 of the stored SR-11 ciphertext. Changing a ballot's bytes, removing or adding one, or swapping two breaks the chain.
 - **Where it starts.** Position 1 links to a start value derived from the election id.
 - **Nothing to decrypt.** Verifying reads only the ciphertext, so it never decrypts a ballot and never needs the SR-11 key.
-- **Unchanged parts.** The `ballots` table and the SR-03 accept transaction are unchanged. The chain holds no time, elector, roll, session or IP.
+- **Unchanged parts.** The `ballots` table and the SR-03 accept transaction are unchanged. The chain holds no time, elector, roll, session or IP. VULN-01: accepted ballots now wait in `pending_ballots`, and the seal copies each batch into `ballots`.
 
 **Sealing in shuffled batches.** Ballots are not chained when they are accepted. The returning officer seals them, inside `backend/`:
 
@@ -982,6 +989,7 @@ python -m scripts.seal_ballots --election <election id> --final   # after polls 
   - It appends one signed checkpoint line to `CHECKPOINT_DIR/<election id>.jsonl` (default `backend/checkpoints/`, never committed). The line holds the election, batch number, entry count, head hash and final flag, signed with Ed25519.
   - It verifies the whole chain and prints the head hash.
   - It audits `BALLOT_BATCH_SEALED` with the batch number and count only.
+  - VULN-01: it runs `VACUUM FULL pending_ballots` and prints `VACUUM: PASS`, or `VACUUM: FAIL` with the command to run by hand.
 - **After a `--final` seal,** no more ballots may be accepted for that election. One that arrives later fails verification (`unsealed_after_final`).
 
 **Keys.** Create them once, inside `backend/`:
@@ -1006,7 +1014,8 @@ It prints one PASS or FAIL line per check group, the entry count and the head ha
 - `missing_checkpoint`, `malformed_checkpoint`, `bad_checkpoint_signature`: a checkpoint file or line that is missing, unreadable or wrongly signed;
 - `checkpoint_mismatch`: a checkpoint that does not match the chain at its batch;
 - `tail_mismatch`: a last checkpoint that does not match the chain's tail, which catches a truncated tail;
-- `unsealed_after_final`: a ballot that is not in the chain after a final seal.
+- `unsealed_after_final`: a ballot that is not in the chain after a final seal (VULN-01: or still held);
+- `ballot_count_mismatch` (VULN-02, group g): electors marked voted differ from sealed plus held ballots.
 
 Failures are audited as `BALLOT_CHAIN_VERIFY_FAILED` with the reason codes only. No option skips a check. SR-17's House count calls `verify_chain` first and refuses to count on any failure.
 
@@ -1649,6 +1658,166 @@ pytest tests/test_sr20_backup.py -v
 - the backup key in a KMS or HSM;
 - signed manifests;
 - in production, `pg_dump` or point-in-time recovery (PITR) alongside these logical backups.
+
+## Security fixes after VAPT
+
+The vulnerability assessment and penetration test (VAPT) reported VULN-01 to VULN-15. Nine are fixed here: VULN-01, VULN-02 (before the seal), VULN-04, VULN-05, VULN-06, VULN-07, VULN-09, VULN-12 and VULN-15. Every change is marked `VULN-XX: <reason>` in the code, next to the SR comments it touches. Every fix has an attack test that failed against the code before the fix and passes after it. All SR-01 to SR-20 tests still pass; the few whose expected answers changed are listed under "SR behaviour that changed" below.
+
+After pulling these changes, inside `backend/` with PostgreSQL running:
+
+```
+alembic upgrade head      # 0015, 0016 and 0017
+pytest
+```
+
+### VULN-01: a ballot could be linked to its elector through PostgreSQL's system columns
+
+- **Was:** the ballot row was written in the same transaction as the elector's participation update, their session update and the `BALLOT_ACCEPTED` audit entry. All of them carried that transaction's id (`xmin`), so one join named the elector of every ballot. The row's disk position (`ctid`) also replayed the order ballots arrived in.
+- **Now:**
+  - Acceptance writes the ballot to `pending_ballots`, the holding table, which has exactly the columns of `ballots`. It is still the one SR-03 transaction, still bounded by SR-14's timeout.
+  - Each SR-13 seal copies its batch into `ballots` in ballot id order, with the same id and ciphertext (so SR-11's binding still holds). It does this in a subtransaction of its own, then deletes the held rows.
+  - After the commit, the seal script runs `VACUUM FULL pending_ballots`, so the dead held rows, with their accept-time `xmin`, leave the disk too. It prints `VACUUM: PASS`.
+  - That VACUUM needs a brief exclusive lock on the holding table, so ballots being accepted wait for it. It gives up after 5 seconds rather than hold them, and prints `VACUUM: FAIL`; running the seal again retries it.
+  - After a seal, a batch's ballots share one `xmin` that no identity-side row has, and their disk order is ballot id order.
+  - `pending_ballots` is append-only: UPDATE is always refused, and DELETE only when `ballots` already holds an identical copy. There is no bypass flag.
+- **Every reader follows:**
+  - SR-11 audit: checks both tables.
+  - SR-12: registry (ballot side) and audit, with a new check `f. system columns` that fails on a planted `xmin` or disk-order link.
+  - SR-13: seal and verify (a held ballot after the final seal is `unsealed_after_final`).
+  - SR-17: the count refuses while any ballot is still held after the final seal.
+  - SR-18: the release.
+  - SR-20: the backup's `ballot_count` counts sealed plus held ballots, the restore writes the ballot side in a subtransaction of its own (so restored ballots share no `xmin` with restored identity rows), and the recovery test's totals include held ballots.
+- **Migration 0015** moves any ballot that was accepted but not yet sealed from `ballots` to `pending_ballots`. If your database had such ballots, run `VACUUM FULL ballots` once afterwards (`docker compose exec db psql -U evoting -d evoting -c "VACUUM FULL ballots;"`), so their old rows leave the disk as well.
+- **Verify:** `pytest tests/test_vuln01_ballot_linkage.py tests/test_vuln01_02_end_to_end.py -v`, and by hand [docs/MANUAL.md](docs/MANUAL.md) section 18.
+
+### VULN-02: a held ballot could be deleted before its seal without anyone noticing
+
+- **Was:** before the seal, a ballot is in no hash chain. Only the count, at the very end, compared the number of ballots with the electors who voted.
+- **Now:**
+  - The holding table's trigger refuses deletion, as above.
+  - The seal, every chain verification (`verify_chain`, check `g. electors who voted = sealed + held ballots`) and the count compare three totals per election in one statement: electors marked voted = sealed ballots + held ballots. They read totals only and never join the two sides.
+  - A mismatch fails loudly with reason `ballot_count_mismatch`. The seal refuses and seals nothing, the verify script exits 1, and the count is refused (`chain_invalid`, with `ballot_count_mismatch` as its detail). Each also writes a `BALLOT_CHAIN_VERIFY_FAILED` audit entry with the allowed fields only.
+  - This also catches a ballot stuffed into the holding table.
+- **Not prevented:** the database owner. `evoting` is still a superuser in `docker-compose.yml`, and an owner can disable the triggers or `TRUNCATE` (which fires no row trigger). The totals check is what detects that. Least-privilege roles stay design only.
+- **Verify:** `pytest tests/test_vuln02_held_ballots.py -v`. The tests delete a held ballot with the trigger switched off, as an owner could, and the seal, `verify_chain` and the count all report it.
+
+### VULN-05: a ballot token was not bound to its session
+
+- **Was:** a stolen token could be submitted from another signed-in session. Another elector's ballot then used up the victim's token, and a replay from another session returned the victim's receipt.
+- **Now:**
+  - When the token is issued, the session row (identity side) keeps an HMAC-SHA256 of the election and the token. Its key is derived from `SECRET_KEY` with HKDF under its own label, so there is no new key file. The ballot side gets nothing new.
+  - Submit and replay compare it with `hmac.compare_digest` before any lock, rule or replay check.
+  - A mismatch gets the generic `400 invalid_ballot`, consumes nothing, and is audited as `BALLOT_TOKEN_REJECTED` with reason `wrong_session` (a real token from another session) or `invalid` (an unknown token).
+  - SR-04's extension moves the same row to a new identifier, so the binding is carried over.
+- **Migration 0016** adds `sessions.ballot_token_mac`.
+- **Verify:** `pytest tests/test_vuln05_token_binding.py -v`, and MANUAL section 18.
+
+### VULN-06: registration step 2 listed which usernames exist
+
+- **Was:** `409 username_taken` came back as often as asked.
+- **Now:** each registration session may learn of at most `MAX_USERNAME_ATTEMPTS` (default 5) taken usernames, each still answered helpfully. The next one ends the registration session with the generic `401 registration_session_invalid`, audited as `REGISTRATION_FAILED` / `too_many_attempts`. Every registration session needs a fresh enrolment code, so this caps the probing. The SR-01 sign-in lockout is unchanged.
+- **Migration 0017** adds `registration_sessions.username_attempts`.
+- **Verify:** `pytest tests/test_vuln06_username_attempts.py -v`.
+
+### VULN-15: a failed sign in took different steps for an unknown username
+
+- **Was:** a wrong password also updated the account's failure count (and could delete pending sessions), while an unknown username did not, so timing could tell them apart.
+- **Now:** an unknown username, a locked account and a wrong password take the same steps and get the identical `401 invalid_credentials`:
+  - one Argon2id check (the dummy hash for unknown and locked accounts);
+  - one `UPDATE accounts` (on the nil UUID, which no account has, for an unknown name);
+  - one audit entry;
+  - one `DELETE` of pending sessions (matching nothing unless this failure locked the account);
+  - one commit.
+  - The one failure that locks an account still writes its `auth_account_locked` entry as well, as before. The answer is the same 401.
+- **Verify:** `pytest tests/test_vuln15_login_steps.py -v`. The test compares the SQL statements and password checks of the three paths, not their timing.
+
+### VULN-12: the registration cookie was not Secure
+
+- **Now:** every cookie the platform sets or clears takes the session cookie's `COOKIE_SECURE` setting. The registration cookie, set and cleared, is `Secure` like the session cookie.
+- **Verify:** `pytest tests/test_vuln12_cookie_secure.py -v`, or DevTools > Application > Cookies during registration.
+
+### VULN-04: the Docker image held the keys and did not use TLS
+
+- **Was:** `COPY . .` with only `.env` excluded put `keys/` (the ballot key and the private signing keys), backups and checkpoints into the image, and it ran plain `uvicorn` on port 8000.
+- **Now:**
+  - `backend/.dockerignore` excludes `keys`, `certs`, `backups`, `checkpoints`, `releases`, `exports`, `monitoring`, `logs`, `.env`, `**/*.pem` and `**/*.key`.
+  - The image starts the SR-10 launcher, `python -m app.serve` (TLS 1.3 only), on port 8443 only, with `SERVER_HOST=0.0.0.0` inside the container.
+  - The certificate and the keys the API reads are mounted read-only when the container runs. The private signing keys are never mounted.
+- **Run the API in a container** (PowerShell, from the repository root, after `docker compose up -d db` and `alembic upgrade head`; stop any `python -m app.serve` on port 8443 first):
+
+```powershell
+docker build -t evoting-api backend
+
+# Once: copy only the keys the API reads, and the certificate, into two volumes, owner-only for the
+# container's user (uid 10001). Mounting backend\keys directly does not work on Windows: Docker Desktop
+# shows the files as readable by everyone, and SR-11 then refuses to start with that ballot key.
+docker volume create evoting-keys
+docker volume create evoting-certs
+docker run --rm --user root --entrypoint sh -v "${PWD}\backend\keys:/from/keys:ro" -v "${PWD}\certs:/from/certs:ro" -v evoting-keys:/to/keys -v evoting-certs:/to/certs evoting-api -c 'mkdir -p /to/keys/delegates && cp /from/keys/ballot.key /from/keys/roll_public.pem /to/keys/ && cp /from/keys/delegates/keyring.json /to/keys/delegates/ && for f in checkpoint_public.pem results_public.pem; do if [ -f /from/keys/$f ]; then cp /from/keys/$f /to/keys/; fi; done && cp /from/certs/dev-cert.pem /from/certs/dev-key.pem /to/certs/ && chown -R 10001:10001 /to && find /to -type d -exec chmod 700 {} + && find /to -type f -exec chmod 600 {} +'
+
+# Run it on the Compose network (named after the project folder: docker network ls), published on this computer only
+docker run -d --name evoting-api --network evoting-prototype_default -p 127.0.0.1:8443:8443 --env-file backend\.env -e POSTGRES_HOST=db -v evoting-keys:/app/keys:ro -v evoting-certs:/app/certs:ro evoting-api
+
+curl.exe -k https://localhost:8443/api/health       # {"status":"ok"}
+docker logs evoting-api                              # Uvicorn running on https://0.0.0.0:8443
+docker rm -f evoting-api                             # stop it
+```
+
+- The image serves the API only, because the built frontend is outside its build context (`backend/`). Use `python -m app.serve` for the whole app. After changing a key, run the copy command again.
+- **Verify:** `pytest tests/test_vuln04_docker.py -v` reads the two files as Docker would. The image built and ran this way was checked by hand: no `.pem`, `.key`, `.env`, `keys/`, `backups/` or `checkpoints/` inside it; health `200` over TLS 1.3; TLS 1.2 and plain HTTP refused.
+
+### VULN-07: no browser security headers
+
+- **Now:** one middleware sets these on every response: API answers, errors, 404s, the built elector and staff pages, and the plain-HTTP and wrong-host refusals.
+  - `Content-Security-Policy: default-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; img-src 'self' data:`
+  - `X-Frame-Options: DENY`
+  - `X-Content-Type-Options: nosniff`
+  - `Referrer-Policy: no-referrer`
+  - `Permissions-Policy`: accelerometer, camera, display-capture, geolocation, gyroscope, magnetometer, microphone, payment and usb all off.
+- **The one exception,** `img-src data:`, is the small SVG paper-grain image the built stylesheet carries inline (`.sheet::before`). The build has no inline script, inline style or handler, and no other origin (the fonts are bundled). `Cache-Control: no-store` (SR-09), HSTS (SR-10) and `X-Request-ID` (SR-16) are kept.
+- **Verify:** `pytest tests/test_vuln07_headers.py -v`. Then DevTools > Network > the page request > Response Headers (MANUAL section 18). The built elector and staff pages were loaded in Edge under this policy with no CSP message in the console.
+
+### VULN-09: the API docs were public and any Host was accepted
+
+- **Now:**
+  - `/docs`, `/redoc` and `/openapi.json` are `404` unless `API_DOCS=true` (development only). With it on, only those paths get a relaxed policy for FastAPI's docs pages, which load from `cdn.jsdelivr.net` and start with an inline script.
+  - A trusted-host check, the outermost middleware, refuses any `Host` not in `TRUSTED_HOSTS` (default `["localhost","127.0.0.1"]`, the names the certificate holds) with `400 invalid_host`.
+- **Verify:** `pytest tests/test_vuln09_docs_and_hosts.py -v`; https://localhost:8443/docs answers 404; `curl.exe -k -H "Host: evil.example" https://localhost:8443/api/health` answers `{"detail":"invalid_host"}`.
+
+### SR-03: how long a ballot token lasts
+
+SR-03 asks for a token valid for 10 minutes. This prototype stores no expiry time on the ballot side (SR-12), so the token is bounded instead by its session and its open election, whichever ends first:
+- the session lasts `SESSION_MINUTES` (10) from sign in, at most `MAX_SESSION_EXTENSIONS` (2) more times (30 minutes in all), and 60 seconds once its ballot is accepted (SR-04);
+- since VULN-05 the token works in that one session only;
+- a closed election refuses it (`404 no_open_election`).
+
+So a token never outlives 30 minutes of signed-in time, and usually lasts 10.
+
+### New settings
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `SERVER_HOST` | VULN-04: where `python -m app.serve` listens. The container image sets `0.0.0.0` | `127.0.0.1` |
+| `MAX_USERNAME_ATTEMPTS` | VULN-06: taken usernames one registration session may try before it ends | `5` |
+| `API_DOCS` | VULN-09: serve `/docs`, `/redoc` and `/openapi.json` (development only) | `false` |
+| `TRUSTED_HOSTS` | VULN-09: the `Host` values the server answers, as JSON | `["localhost","127.0.0.1"]` |
+
+### SR behaviour that changed
+
+- **SR-03:** another session's token is refused with `400 invalid_ballot` before the `already_voted` check, and audited with the new reason `wrong_session`. An unknown token is still `invalid`. A token from before signing out no longer works after signing in again.
+- **SR-12:** `pending_ballots` is a ballot-side table, and the separation audit has check `f. system columns`.
+- **SR-13:** the seal moves held ballots, prints a `VACUUM` line, and refuses on `ballot_count_mismatch`. `verify_chain` has seven check groups (`g` is new).
+- **SR-17:** a voted total that differs from the ballots is now refused at check `d` (`chain_invalid`, detail `ballot_count_mismatch`), before check `f` (`total_mismatch`), which stays as a second line of defence. A refused count also audits each chain reason as `BALLOT_CHAIN_VERIFY_FAILED`.
+- **SR-20:** the manifest's `ballot_count` and the recovery checks count held ballots too. A backup from before 0015 still restores.
+- **SR-10:** the launcher's host is a setting; its default, `127.0.0.1`, is unchanged.
+
+### Residual risks
+
+- **Held ballots are linkable until their seal.** A ballot waits in `pending_ballots` from acceptance until the next seal, and while it does it shares its accept transaction's `xmin` with the elector's rows. Seal often during polling (each batch at least `MIN_SEAL_BATCH`) to keep that window short.
+- **The database owner can bypass the triggers.** `evoting` is a superuser in the development setup. An owner can disable a trigger, `TRUNCATE` a table, or read raw pages; the VULN-02 totals check and the SR-13 chain detect changes but cannot prevent them.
+- **Keys on the server (VULN-03, not fixed).** The ballot key and, outside the container, the signing keys sit on the application server.
+- **Design only:** least-privilege database roles (VULN-02) and dual control for staff resets (VULN-10).
+- **Not fixed:** VULN-03, VULN-08, VULN-10, VULN-11, VULN-13 and VULN-14 (the residual parts of VULN-02 are listed above).
 
 ## Folder layout
 

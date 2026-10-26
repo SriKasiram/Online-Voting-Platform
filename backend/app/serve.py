@@ -16,15 +16,15 @@ import uvicorn
 from app.config import settings
 from app.main import app
 
-# SR-10: this computer only. The certificate names localhost and 127.0.0.1.
-HOST = "127.0.0.1"
-
-
 def tls_config(certfile: Path, keyfile: Path, port: int) -> uvicorn.Config:
     """SR-10: the server's settings, with an SSL context that accepts TLS 1.3 and nothing older."""
     config = uvicorn.Config(
         app,
-        host=HOST,
+        # SR-10: this computer only. The certificate names localhost and 127.0.0.1.
+        # VULN-04: now SERVER_HOST, still 127.0.0.1 by default. The container image sets 0.0.0.0, the
+        # only way its published port can reach the server; docker run publishes it on 127.0.0.1 of
+        # the host. Read when the server is built, so the setting (or a test) decides.
+        host=settings.server_host,
         port=port,
         ssl_certfile=str(certfile),
         ssl_keyfile=str(keyfile),
@@ -53,6 +53,9 @@ def main() -> None:
         )
     config = tls_config(certfile, keyfile, settings.server_port)
     print(f"Serving the API and the built frontend at https://localhost:{config.port} (TLS 1.3 only)")
+    if config.host != "127.0.0.1":
+        # VULN-04: say so whenever it listens beyond this computer (inside a container, 0.0.0.0)
+        print(f"Listening on {config.host}: reachable wherever port {config.port} is published")
     uvicorn.Server(config).run()
 
 

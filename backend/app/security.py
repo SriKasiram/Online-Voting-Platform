@@ -64,14 +64,19 @@ def hash_token(token: str) -> bytes:
 
 
 # SR-01: `secure` added for the session cookie (COOKIE_SECURE). The registration cookie is unchanged.
+# VULN-12: no longer unchanged: every cookie, set or cleared, now takes the session cookie's
+# COOKIE_SECURE unless a caller says otherwise, so none can be sent over plain HTTP by default.
 def set_cookie(
-    response: Response, name: str, value: str, path: str, max_age: int | None = None, secure: bool = False
+    response: Response, name: str, value: str, path: str, max_age: int | None = None, secure: bool | None = None
 ) -> None:
     # HttpOnly keeps the token away from page scripts. SameSite=Strict stops other sites sending it.
+    secure = settings.cookie_secure if secure is None else secure
     response.set_cookie(name, value, path=path, max_age=max_age, httponly=True, samesite="strict", secure=secure)
 
 
-def clear_cookie(response: Response, name: str, path: str, secure: bool = False) -> None:
+def clear_cookie(response: Response, name: str, path: str, secure: bool | None = None) -> None:
+    # VULN-12: a cookie is cleared with the same Secure attribute it was set with
+    secure = settings.cookie_secure if secure is None else secure
     response.delete_cookie(name, path=path, httponly=True, samesite="strict", secure=secure)
 
 
@@ -88,6 +93,19 @@ def _derive_key(purpose: str) -> bytes:
 _FIELD_KEY = _derive_key("field-encryption-v1")
 _INDEX_KEY = _derive_key("roll-blind-index-v1")
 _CODE_KEY = _derive_key("enrolment-code-v1")
+# VULN-05: binds a ballot token to its session. Derived like the others, so no new key file.
+_BINDING_KEY = _derive_key("ballot-token-session-binding-v1")
+_BINDING_TAG = b"evoting-ballot-binding-v1|"
+
+
+def ballot_binding(election_id: uuid.UUID, ballot_token: str) -> bytes:
+    """
+    VULN-05: what the session row keeps of the ballot token issued in it: HMAC-SHA256 over a tag,
+    the election and the token exactly as issued. Without SECRET_KEY it cannot be matched to the
+    token's SHA-256 on the ballot side, and the token cannot be recovered from it.
+    """
+    message = _BINDING_TAG + str(election_id).encode("ascii") + b"|" + ballot_token.encode("utf-8")
+    return hmac.new(_BINDING_KEY, message, hashlib.sha256).digest()
 
 # ---------------------------------------------------------------
 # Passwords (Argon2id)

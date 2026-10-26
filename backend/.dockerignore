@@ -6,3 +6,16 @@ venv
 __pycache__
 *.pyc
 .pytest_cache
+# VULN-04: no key, certificate, backup or generated data in the image. The ballot key and the
+# private signing keys live in keys/; the container gets what it needs mounted read-only at run time.
+keys
+certs
+backups
+checkpoints
+releases
+exports
+monitoring
+logs
+**/.env
+**/*.pem
+**/*.key

@@ -9,9 +9,12 @@ every sealed ballot or is not produced at all.
   a. polls_open           the clock is before the election's close (Election.ends_at)
   b. definition_invalid   the active ballot definition does not verify (SR-07), as at the close
   c. no_final_checkpoint  no valid, signed, final checkpoint for the election (SR-13)
-  d. chain_invalid        verify_chain reports any problem (SR-13; its codes are kept as details)
+  d. chain_invalid        verify_chain reports any problem (SR-13; its codes are kept as details).
+                          VULN-02: that includes ballot_count_mismatch, electors who voted against
+                          sealed plus held ballots, and VULN-01: a ballot still held after the final seal
   e.                      ballots are read only through the chain: positions 1 to the final count
   f. total_mismatch       ballots read differ from the final count, or from the electors who voted
+                          (VULN-02: d already compares the totals; f stays as a second line of defence)
   g. decrypt_failed       a ballot does not decrypt with its own ballot id and election (SR-11)
   h. wrong_division       its division is not a division of the active definition
   i. informal_or_invalid  it is not formal for that division's candidates (SR-08)
@@ -342,6 +345,7 @@ def run_count(engine: Engine, election_id: uuid.UUID, public_key: Ed25519PublicK
     """
     SR-17: the House count for one election. Audits COUNT_STARTED, then COUNT_COMPLETED with the
     number of ballots counted, or COUNT_REFUSED with the reason code (and re-raises CountRefused).
+    VULN-02: a chain_invalid refusal also audits each SR-13 code behind it (BALLOT_CHAIN_VERIFY_FAILED).
     The audit entries are written outside the read-only transaction, each in its own short one.
     """
     with Session(engine) as db:
@@ -353,6 +357,9 @@ def run_count(engine: Engine, election_id: uuid.UUID, public_key: Ed25519PublicK
     except CountRefused as refused:
         with Session(engine) as db:
             audit(db, "COUNT_REFUSED", outcome=FAILURE, actor=SCRIPT, role=SCRIPT, reason=refused.code, count=refused.checked)
+            # VULN-02: what the chain check found, one entry per SR-13 code, as the seal and verify scripts audit it
+            for reason in refused.details:
+                audit(db, "BALLOT_CHAIN_VERIFY_FAILED", outcome=FAILURE, actor=SCRIPT, role=SCRIPT, reason=reason)
             db.commit()
         raise
     with Session(engine) as db:

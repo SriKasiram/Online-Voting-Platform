@@ -72,7 +72,8 @@ def zero_loss(session: Session, manifest: dict, public_key: Ed25519PublicKey | N
             reasons = verify_chain(session, election_id, public_key, checkpoint_file(election_id))
             if reasons:
                 problems.append(f"election {election_id}: {', '.join(reasons)}")
-    ballots = session.scalar(text("SELECT count(*) FROM ballots"))
+    # VULN-01: sealed and held ballots, as the manifest counts them
+    ballots = session.scalar(text("SELECT (SELECT count(*) FROM ballots) + (SELECT count(*) FROM pending_ballots)"))
     if ballots != manifest["ballot_count"]:
         problems.append(f"{ballots} ballots restored, the backup holds {manifest['ballot_count']}")
     if problems:
@@ -83,7 +84,12 @@ def zero_loss(session: Session, manifest: dict, public_key: Ed25519PublicKey | N
 def reconciliation(session: Session) -> Check:
     """SR-20 check c: per election, used tokens = ballots = electors marked voted, and every used token has its receipt hash."""
     used = per_election(session, "SELECT election_id, count(*) FROM ballot_tokens WHERE consumed GROUP BY election_id")
-    ballots = per_election(session, "SELECT election_id, count(*) FROM ballots GROUP BY election_id")
+    # VULN-01: a ballot still held for its seal is a ballot too (both are ballot-side tables)
+    ballots = per_election(
+        session,
+        "SELECT election_id, count(*) FROM (SELECT election_id FROM ballots UNION ALL SELECT election_id FROM pending_ballots) "
+        "AS stored GROUP BY election_id",
+    )
     voted = per_election(session, "SELECT election_id, count(*) FROM voter_participation WHERE state = 'voted' GROUP BY election_id")
     no_receipt = per_election(
         session, "SELECT election_id, count(*) FROM ballot_tokens WHERE consumed AND receipt_hash IS NULL GROUP BY election_id"

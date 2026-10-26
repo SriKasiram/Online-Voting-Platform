@@ -126,6 +126,10 @@ REASON_CODES = frozenset(
         "checkpoint_mismatch",
         "tail_mismatch",
         "unsealed_after_final",
+        # VULN-02: electors marked voted differ from sealed plus held ballots (totals only)
+        "ballot_count_mismatch",
+        # VULN-05: a ballot token presented in a session it was not issued to
+        "wrong_session",
         # Registration: the step that failed, or why it ended
         "details_not_verified",
         "wrong_code",

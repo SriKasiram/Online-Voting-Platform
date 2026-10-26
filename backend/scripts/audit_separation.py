@@ -8,6 +8,7 @@ confirms that nothing persistent links an elector on the identity side to a ball
 side (app/stores.py). Prints one PASS, FAIL or SKIPPED line per check, then a summary, and exits
 with code 1 if any check fails. It prints only counts and table, column or file names: never a
 ballot, a full token hash, a receipt or anything about an elector.
+VULN-01: check f reads PostgreSQL's system columns (xmin, ctid), which a database reader can join on.
 """
 
 import argparse
@@ -16,6 +17,7 @@ import os
 import re
 import sys
 from pathlib import Path
+from typing import Any
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -73,7 +75,10 @@ def ballot_identifiers(db: Session) -> set[str]:
     SR-12: ballot ids, token ids and token hashes, normalised like identifiers_in. SR-13: chain entry
     hashes. SR-14: receipt hashes, which also stand for the references themselves (see HEX32).
     """
-    identifiers = {str(ballot_id).lower() for (ballot_id,) in db.execute(text("SELECT id FROM ballots"))}
+    # VULN-01: held ballots' ids too, which become the sealed ballots' ids
+    identifiers = {
+        str(ballot_id).lower() for (ballot_id,) in db.execute(text("SELECT id FROM ballots UNION ALL SELECT id FROM pending_ballots"))
+    }
     for token_id, token_hash, receipt_hash in db.execute(text("SELECT id, token_hash, receipt_hash FROM ballot_tokens")):
         identifiers |= {str(token_id).lower(), token_hash.lower()}
         if receipt_hash:
@@ -252,8 +257,48 @@ def check_files(db: Session, identifiers: set[str], files: list[Path]) -> Check:
     return Check(name, "PASS", f"{len(files)} file(s): ballot identifiers only where they belong")
 
 
+def check_system_columns(db: Session) -> Check:
+    """
+    VULN-01 (f): PostgreSQL's own columns link nothing. No sealed ballot has the xmin (the id of the
+    transaction that wrote it) of any identity-side row, and within each seal batch the ballots sit
+    on disk (ctid) in ballot id order, so the disk cannot replay the order they arrived in. Held
+    ballots still share their accept transaction's xmin until their seal (a residual risk): they are
+    counted here, not failed.
+    """
+    name = "f. system columns"
+    shared: dict[str, int] = {}
+    for table in sorted(IDENTITY_TABLES):
+        found = db.scalar(text(f'SELECT count(*) FROM ballots b WHERE b.xmin::text IN (SELECT t.xmin::text FROM "{table}" t)'))
+        if found:
+            shared[table] = found
+    on_disk = db.execute(
+        text("SELECT b.id, c.election_id, c.batch_no FROM ballots b LEFT JOIN ballot_chain c ON c.ballot_id = b.id ORDER BY b.ctid")
+    ).all()
+    previous: dict[tuple[Any, Any], Any] = {}
+    out_of_order = 0
+    for ballot_id, election_id, batch_no in on_disk:
+        batch = (election_id, batch_no)
+        if batch in previous and ballot_id < previous[batch]:
+            out_of_order += 1
+        previous[batch] = ballot_id
+    problems = []
+    if shared:
+        problems.append("sealed ballots share an xmin (transaction id) with identity-side rows: " + ", ".join(f"{t} ({n})" for t, n in shared.items()))
+    if out_of_order:
+        problems.append(f"disk order (ctid) is not ballot id order for {out_of_order} sealed ballot(s) within their batch")
+    if problems:
+        return Check(name, "FAIL", "; ".join(problems))
+    held = db.scalar(text("SELECT count(*) FROM pending_ballots"))
+    return Check(
+        name,
+        "PASS",
+        f"{len(on_disk)} sealed ballot(s): no xmin shared with the identity side, disk order is ballot id order in each batch; "
+        f"{held} held ballot(s) await their seal",
+    )
+
+
 def run_audit(db: Session, files: list[Path], project_dir: Path, log_dir: Path) -> list[Check]:
-    """SR-12: checks a to e, in order."""
+    """SR-12: checks a to e, in order. VULN-01: then f, the system columns."""
     identifiers = ballot_identifiers(db)
     return [
         check_foreign_keys(db),
@@ -261,6 +306,7 @@ def run_audit(db: Session, files: list[Path], project_dir: Path, log_dir: Path) 
         check_identity_tables(db, identifiers),
         check_logs(db, identifiers, project_dir, log_dir),
         check_files(db, identifiers, files),
+        check_system_columns(db),
     ]
 
 

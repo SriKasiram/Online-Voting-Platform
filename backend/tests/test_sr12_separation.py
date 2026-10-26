@@ -203,7 +203,8 @@ def test_export_holds_only_ballot_fields_and_no_identity(
     assert export_ballots(db_session, out) == 1
     content = out.read_text(encoding="utf-8")
     line = json.loads(content)
-    stored = db_session.execute(text("SELECT id, election_id, encrypted_payload FROM ballots")).one()
+    # VULN-01: an accepted ballot is held in pending_ballots until its seal
+    stored = db_session.execute(text("SELECT id, election_id, encrypted_payload FROM pending_ballots")).one()
 
     assert set(line) == set(EXPORT_FIELDS)
     assert (line["ballot_id"], line["election_id"]) == (str(stored[0]), str(stored[1]))
@@ -275,7 +276,8 @@ def test_audit_fails_on_a_ballot_identifier_planted_in_the_audit_log(
     token_hash = hash_token(vote["token"]).hex()
     value = {
         "token hash": token_hash,
-        "ballot id": str(db_session.scalar(text("SELECT id FROM ballots"))),
+        # VULN-01: an accepted ballot is held in pending_ballots until its seal
+        "ballot id": str(db_session.scalar(text("SELECT id FROM pending_ballots"))),
         "receipt": vote["receipt"],
     }[planted]
     plant_audit_text(value)
@@ -295,7 +297,8 @@ def test_audit_fails_on_a_ballot_id_in_a_log_file(
 ) -> None:
     """SR-12 test 13: a ballot id in a file in the log folder, or in any *.log file, fails check d."""
     cast(client, make_voter, sign_in)
-    ballot_id = str(db_session.scalar(text("SELECT id FROM ballots")))
+    # VULN-01: an accepted ballot is held in pending_ballots until its seal
+    ballot_id = str(db_session.scalar(text("SELECT id FROM pending_ballots")))
     log_dir, project = tmp_path / "logs", tmp_path / "project"
     target = log_dir / "server.txt" if where == "log folder" else project / "backend" / "api.log"
     target.parent.mkdir(parents=True)
@@ -314,15 +317,16 @@ def test_audit_fails_on_a_ballot_id_in_a_log_file(
 
 def synthetic_dump(db_session: Session, extra_identity_line: str = "") -> str:
     """SR-12: a plain pg_dump-style file holding the real ballot-side rows inside their own COPY blocks."""
-    ballot_id, election_id, _ = db_session.execute(text("SELECT id, election_id, encrypted_payload FROM ballots")).one()
+    # VULN-01: an accepted ballot is held in pending_ballots until its seal
+    ballot_id, election_id, _ = db_session.execute(text("SELECT id, election_id, encrypted_payload FROM pending_ballots")).one()
     # SR-14: the token table now holds a used flag and the receipt's hash
     token_id, token_hash, receipt_hash = db_session.execute(text("SELECT id, token_hash, receipt_hash FROM ballot_tokens")).one()
     roll_id = db_session.scalar(text("SELECT roll_id FROM voter_participation"))
     return "\n".join(
         [
             "-- PostgreSQL database dump",
-            "CREATE TABLE public.ballots (id uuid NOT NULL, election_id uuid NOT NULL, encrypted_payload bytea NOT NULL);",
-            "COPY public.ballots (id, election_id, encrypted_payload) FROM stdin;",
+            "CREATE TABLE public.pending_ballots (id uuid NOT NULL, election_id uuid NOT NULL, encrypted_payload bytea NOT NULL);",
+            "COPY public.pending_ballots (id, election_id, encrypted_payload) FROM stdin;",
             f"{ballot_id}\t{election_id}\t\\\\x01aabbcc",
             "\\.",
             "COPY public.ballot_tokens (id, election_id, token_hash, consumed, receipt_hash) FROM stdin;",
@@ -354,7 +358,8 @@ def test_audit_fails_on_a_dump_with_a_ballot_id_outside_the_ballot_tables(
 ) -> None:
     """SR-12 test 15: the same dump with a ballot id in an identity table's data fails check e."""
     cast(client, make_voter, sign_in)
-    ballot_id = str(db_session.scalar(text("SELECT id FROM ballots")))
+    # VULN-01: an accepted ballot is held in pending_ballots until its seal
+    ballot_id = str(db_session.scalar(text("SELECT id FROM pending_ballots")))
     roll_id = db_session.scalar(text("SELECT roll_id FROM voter_participation"))
     dump = tmp_path / "identity.sql"
     dump.write_text(synthetic_dump(db_session, f"{roll_id}\t{ballot_id}\tvoted"), encoding="utf-8")

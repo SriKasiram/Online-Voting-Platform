@@ -10,6 +10,12 @@ ballots are ordered by their random ballot id (never arrival order or time), giv
 positions and batch number, and chained. After the commit a signed checkpoint line is appended to
 CHECKPOINT_DIR/<election id>.jsonl, and the whole chain is verified. No background worker: the
 returning officer runs this. The private key is used here and in tests only, never under app/.
+
+VULN-01: the unsealed ballots are those held in pending_ballots. The seal copies them into ballots
+(same id and ciphertext) in a subtransaction of its own, deletes the held rows, and after the
+commit runs VACUUM FULL pending_ballots, so nothing on disk still ties a sealed ballot to the
+transaction that accepted it. VULN-02: the seal refuses if the electors marked voted do not equal
+sealed plus held ballots (verify_chain check g).
 """
 
 import argparse
@@ -22,7 +28,8 @@ from pathlib import Path
 from typing import Any
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
-from sqlalchemy import text
+from sqlalchemy import Engine, text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.ballot_chain import (
@@ -39,10 +46,14 @@ from app.ballot_definitions import canonical
 # SR-13: the shared private key loader (kept importable from here) and the one signing call
 from scripts.signing_keys import load_private_key, sign  # noqa: F401
 from app.config import settings
-from app.db import SessionLocal
+# VULN-01: the engine, for the VACUUM that must run outside any transaction
+from app.db import SessionLocal, engine
 from app.audit_events import FAILURE, SCRIPT, SUCCESS
 from app.models import BallotChainEntry
 from app.security import audit
+
+# VULN-01: how long the VACUUM may wait for its lock before it gives up (it reports, never hangs)
+VACUUM_LOCK_TIMEOUT = "5s"
 
 
 class SealRefused(Exception):
@@ -99,11 +110,9 @@ def seal_batch(
         {"e": election_id},
     ).first()
     # SR-13: ordered by the random ballot id, so a position reveals nothing about arrival (SR-12)
+    # VULN-01: the unsealed ballots are the held ones; after migration 0015 ballots holds sealed ballots only
     unsealed = db.execute(
-        text(
-            "SELECT b.id, b.encrypted_payload FROM ballots b WHERE b.election_id = :e "
-            "AND NOT EXISTS (SELECT 1 FROM ballot_chain c WHERE c.ballot_id = b.id) ORDER BY b.id"
-        ),
+        text("SELECT id, encrypted_payload FROM pending_ballots WHERE election_id = :e ORDER BY id"),
         {"e": election_id},
     ).all()
     if not unsealed:
@@ -130,20 +139,35 @@ def seal_batch(
     batch_no = (tail.batch_no if tail else 0) + 1
     prev_hash = tail.entry_hash if tail else start_hash(election_id)
     first_position = position + 1
-    for ballot_id, encrypted_payload in unsealed:
-        position += 1
-        entry_hash = compute_entry_hash(prev_hash, ballot_id, election_id, encrypted_payload)
-        db.add(
-            BallotChainEntry(
-                election_id=election_id,
-                position=position,
-                batch_no=batch_no,
-                ballot_id=ballot_id,
-                prev_hash=prev_hash,
-                entry_hash=entry_hash,
-            )
+    # VULN-01: the batch is written in a subtransaction (SAVEPOINT) of its own, so the sealed
+    # ballots get its transaction id as xmin: one for the whole batch, and not the id of the audit
+    # entry below or of any identity-side row. They are inserted in ballot id order, so their disk
+    # order (ctid) is id order too, never arrival order.
+    with db.begin_nested():
+        db.execute(
+            text("INSERT INTO ballots (id, election_id, encrypted_payload) VALUES (:id, :e, :p)"),
+            [{"id": ballot_id, "e": election_id, "p": encrypted_payload} for ballot_id, encrypted_payload in unsealed],
         )
-        prev_hash = entry_hash
+        for ballot_id, encrypted_payload in unsealed:
+            position += 1
+            entry_hash = compute_entry_hash(prev_hash, ballot_id, election_id, encrypted_payload)
+            db.add(
+                BallotChainEntry(
+                    election_id=election_id,
+                    position=position,
+                    batch_no=batch_no,
+                    ballot_id=ballot_id,
+                    prev_hash=prev_hash,
+                    entry_hash=entry_hash,
+                )
+            )
+            prev_hash = entry_hash
+    # VULN-01: the held rows go; the trigger lets each go only because its identical copy is now in
+    # ballots (VULN-02). main() then runs VACUUM FULL, so their dead rows leave the disk too.
+    db.execute(
+        text("DELETE FROM pending_ballots WHERE election_id = :e AND id = ANY(:ids)"),
+        {"e": election_id, "ids": [ballot_id for ballot_id, _ in unsealed]},
+    )
     # SR-13: the batch number and how many, nothing that names a ballot
     # SR-16: in the seal's transaction: if the entry cannot be written, nothing is sealed
     audit(db, "BALLOT_BATCH_SEALED", outcome=SUCCESS, actor=SCRIPT, role=SCRIPT, batch_no=batch_no, count=len(unsealed))
@@ -185,8 +209,14 @@ def main(argv: list[str] | None = None) -> int:
         try:
             result = seal_batch(db, args.election, args.final, load_private_key(private_path), load_checkpoint_public_key(public_path), path)
         except SealRefused as refused:
-            print(f"REFUSED: {refused}")
-            return 1
+            result = refused
+        # VULN-01: end this session's transaction, whose locks VACUUM FULL would otherwise wait for
+        db.rollback()
+    # VULN-01: after every run, sealed or refused, so running the seal again retries a VACUUM that failed
+    problem = vacuum_held_ballots()
+    if isinstance(result, SealRefused):
+        print(f"REFUSED: {result}")
+        return 1
     print(
         f"Sealed batch {result.batch_no}: {result.count} ballot(s) at positions {result.first_position}-{result.entry_count}, "
         "in ballot id order."
@@ -196,7 +226,30 @@ def main(argv: list[str] | None = None) -> int:
     print("Verification: PASS" if not result.reasons else f"Verification: FAIL ({', '.join(result.reasons)})")
     if result.final:
         print("Final seal: no more ballots may be accepted for this election.")
+    if problem:
+        # VULN-01: the batch is sealed, but the dead held rows (with their accept xmin) are still on disk
+        print(f"VACUUM: FAIL ({problem}). Run the seal again, or as the database owner: VACUUM FULL pending_ballots")
+        return 1
+    print("VACUUM: PASS (held ballots removed from disk)")
     return 0 if not result.reasons else 1
+
+
+def vacuum_held_ballots(db_engine: Engine | None = None) -> str | None:
+    """
+    VULN-01: VACUUM FULL pending_ballots, outside any transaction (PostgreSQL requires that), so the
+    sealed ballots' held copies, dead since the seal deleted them, are rewritten off the disk with
+    their accept-time xmin. A short lock_timeout: the ACCESS EXCLUSIVE lock it needs makes new
+    ballot acceptances wait, so it gives up rather than hold them. Returns None, or why it failed
+    (the error's type only: SR-12, a database message can repeat a row).
+    """
+    try:
+        with (db_engine or engine).connect() as connection:
+            connection = connection.execution_options(isolation_level="AUTOCOMMIT")
+            connection.execute(text(f"SET lock_timeout = '{VACUUM_LOCK_TIMEOUT}'"))
+            connection.execute(text("VACUUM FULL pending_ballots"))
+    except SQLAlchemyError as problem:
+        return type(problem).__name__
+    return None
 
 
 if __name__ == "__main__":

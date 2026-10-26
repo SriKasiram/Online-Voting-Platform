@@ -4,6 +4,9 @@ an elector on the identity side to a ballot on the ballot side: no foreign key, 
 identifier, no time of day and no insertion order. tests/test_sr12_separation.py fails if a table
 is added without choosing a side; python -m scripts.audit_separation checks the rest before each
 election.
+VULN-01: nor a PostgreSQL system column. A sealed ballot's xmin is its seal batch's own and its
+disk order (ctid) is ballot id order. A held ballot (pending_ballots) still shares its accept
+transaction's xmin with the elector's rows until its seal: a residual risk, kept short by sealing.
 """
 
 from collections.abc import Iterator
@@ -34,6 +37,8 @@ IDENTITY_TABLES = frozenset(
 BALLOT_TABLES = frozenset(
     {
         "ballots",  # the encrypted ballots (SR-11): random id, election id, ciphertext
+        # VULN-01: accepted ballots waiting for their seal, with the same three columns as ballots
+        "pending_ballots",
         "ballot_tokens",  # one-time token hashes and the receipts they produced
         # SR-13: the hash chain over stored ballots: it names ballots, never electors
         "ballot_chain",
@@ -48,5 +53,11 @@ def ballot_rows(db: Session) -> Iterator[Any]:
     """
     SR-12: the one way to read stored ballots in bulk (export, audit, any future count): ordered by
     the random ballot id, never by insertion order or time, so the order reveals nothing.
+    VULN-01: sealed and held ballots together, so a ballot waiting for its seal is still read.
     """
-    yield from db.execute(text("SELECT id, election_id, encrypted_payload FROM ballots ORDER BY id"))
+    yield from db.execute(
+        text(
+            "SELECT id, election_id, encrypted_payload FROM ballots "
+            "UNION ALL SELECT id, election_id, encrypted_payload FROM pending_ballots ORDER BY id"
+        )
+    )

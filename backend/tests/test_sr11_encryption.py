@@ -193,7 +193,8 @@ def test_submitted_ballot_is_stored_encrypted(
     ranking = cast_ballot(client, make_voter, sign_in)
     division_id = election.divisions["Northgate"].id
 
-    ballot_id, election_id, blob = db_session.execute(text("SELECT id, election_id, encrypted_payload FROM ballots")).one()
+    # VULN-01: an accepted ballot is held in pending_ballots until its seal
+    ballot_id, election_id, blob = db_session.execute(text("SELECT id, election_id, encrypted_payload FROM pending_ballots")).one()
 
     assert isinstance(blob, bytes)
     for readable in readable_forms(ranking, division_id):

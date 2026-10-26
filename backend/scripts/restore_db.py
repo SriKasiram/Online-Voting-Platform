@@ -12,7 +12,8 @@ it already holds any table: a restore never overwrites data. Then, in order:
   3. in ONE transaction: the project's Alembic migrations run on the target up to the manifest's
      revision (so every constraint and the SR-13 and SR-16 append-only triggers exist), every row
      is inserted in foreign-key order, and serial sequences are moved past the restored ids.
-     Anything that fails rolls all of it back, schema included.
+     Anything that fails rolls all of it back, schema included. VULN-01: the ballot side is
+     inserted in a subtransaction of its own, so it shares no xmin with the identity side.
 Prints PASS with the counts, or REFUSED with the reason. No pg_dump, psql or pg_restore.
 """
 
@@ -97,7 +98,8 @@ def decrypted_rows(folder: Path, manifest: dict, key: bytes) -> dict[str, list[d
         if counts != {table: entry["rows"].get(table, 0) for table in counts}:
             raise BackupRefused("manifest_mismatch", f"{entry['name']} does not hold the row counts the manifest records")
         rows |= found
-    if len(rows.get("ballots", [])) != manifest["ballot_count"]:
+    # VULN-01: sealed and held ballots together (a backup from before revision 0015 has no held ones)
+    if len(rows.get("ballots", [])) + len(rows.get("pending_ballots", [])) != manifest["ballot_count"]:
         raise BackupRefused("manifest_mismatch", "the ballots do not match the manifest's ballot_count")
     return rows
 
@@ -122,6 +124,14 @@ def reset_sequences(connection: Any) -> None:
                 )
 
 
+def insert_rows(connection: Any, tables: list, rows: dict[str, list[dict[str, Any]]]) -> None:
+    """SR-20: each table's rows, in the order given (foreign-key order), as the backup holds them (primary-key order)."""
+    for table in tables:
+        decoded = [{name: decode_value(table.c[name], value) for name, value in row.items()} for row in rows.get(table.name, [])]
+        if decoded:
+            connection.execute(table.insert(), decoded)
+
+
 def restore(folder: Path, target_url: str, live_url: URL | str, key: bytes) -> Restored:
     """SR-20: the whole restore, or BackupRefused with the target left as it was."""
     target = check_target(target_url, live_url)
@@ -138,10 +148,13 @@ def restore(folder: Path, target_url: str, live_url: URL | str, key: bytes) -> R
         try:
             with engine.begin() as connection:
                 migrate(connection, manifest["alembic_revision"])
-                for table in application_tables():
-                    decoded = [{name: decode_value(table.c[name], value) for name, value in row.items()} for row in rows.get(table.name, [])]
-                    if decoded:
-                        connection.execute(table.insert(), decoded)
+                tables = application_tables()
+                # VULN-01: the identity side first, then the ballot side in a subtransaction (SAVEPOINT)
+                # of its own, so no restored ballot shares an xmin with a restored identity-side row.
+                # Foreign keys never cross the sides (SR-12), so this keeps foreign-key order.
+                insert_rows(connection, [table for table in tables if table.name in IDENTITY_TABLES], rows)
+                with connection.begin_nested():
+                    insert_rows(connection, [table for table in tables if table.name in BALLOT_TABLES], rows)
                 reset_sequences(connection)
         except (SQLAlchemyError, ValueError, KeyError, TypeError) as problem:
             # SR-20: the type only: a database message could repeat a row of the backup

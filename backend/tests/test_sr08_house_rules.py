@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 from helpers import count, outcome, state_of
 from app.ballot_crypto import RANKING_FIELD, decrypt_ballot
 from app.ballot_rules import Verdict, evaluate_house_ballot
-from app.models import AuditLogEntry, Ballot, BallotToken, Candidate, ParticipationState
+from app.models import AuditLogEntry, BallotToken, Candidate, ParticipationState, PendingBallot  # VULN-01: an accepted ballot is held in pending_ballots until its seal
 from app.routers import ballot as ballot_router
 from scripts.ballot_definition import build_payload, sign, store_active
 
@@ -123,7 +123,7 @@ def test_formal_ballots_are_stored_in_the_submitted_order(
         assert submit(client, ballot, order).status_code == 200
 
     # SR-11: the stored bytes are encrypted, so they are read back through decrypt_ballot
-    stored = [decrypt_ballot(b.encrypted_payload, b.id, b.election_id)[RANKING_FIELD] for b in db_session.scalars(select(Ballot))]
+    stored = [decrypt_ballot(b.encrypted_payload, b.id, b.election_id)[RANKING_FIELD] for b in db_session.scalars(select(PendingBallot))]
     assert sorted(stored) == sorted(orders)
 
 
@@ -148,7 +148,7 @@ def test_a_refused_ballot_changes_nothing_and_can_be_corrected(
     # SR-12, SR-14: still unused, with no receipt hash
     assert db_session.execute(select(BallotToken.consumed, BallotToken.receipt_hash)).one() == (False, None)
     assert state_of(db_session, voter) == ParticipationState.ISSUED
-    assert count(db_session, Ballot) == 0
+    assert count(db_session, PendingBallot) == 0
     assert submit(client, ballot, northgate).status_code == 200
     assert state_of(db_session, voter) == ParticipationState.VOTED
 
@@ -167,7 +167,7 @@ def test_a_used_token_is_answered_before_any_rule_is_checked(
     again = submit(client, ballot, [])
 
     assert outcome(again) == outcome(first) and first.status_code == 200
-    assert count(db_session, Ballot) == 1
+    assert count(db_session, PendingBallot) == 1
 
 
 def test_invalid_requests_are_audited_and_informal_ones_are_not(

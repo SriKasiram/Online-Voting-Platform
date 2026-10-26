@@ -19,7 +19,7 @@ from sqlalchemy import select, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 
-from helpers import triggers_off
+from helpers import mark_electors_voted, triggers_off
 from app.ballot_chain import (
     checkpoint_file,
     checkpoint_message,
@@ -54,13 +54,16 @@ def election_id(election) -> uuid.UUID:
 
 
 def add_ballots(db: Session, election_id: uuid.UUID, count: int = 0, ids: list[uuid.UUID] | None = None) -> list[uuid.UUID]:
-    """SR-13: stored ballots as SR-11 leaves them (real ciphertext), inserted in the order given."""
+    """SR-13: stored ballots as SR-11 leaves them (real ciphertext), inserted in the order given.
+    VULN-01: held in pending_ballots, as acceptance now stores them, for the seal to move.
+    VULN-02: each with an elector marked voted, so the totals stay in balance."""
     ids = ids or [uuid.uuid4() for _ in range(count)]
     for ballot_id in ids:
         db.execute(
-            text("INSERT INTO ballots (id, election_id, encrypted_payload) VALUES (:i, :e, :p)"),
+            text("INSERT INTO pending_ballots (id, election_id, encrypted_payload) VALUES (:i, :e, :p)"),
             {"i": ballot_id, "e": election_id, "p": encrypt_ballot(ballot_payload(1, [1, 2, 3]), ballot_id, election_id)},
         )
+    mark_electors_voted(db, election_id, len(ids))
     db.commit()
     return ids
 
@@ -138,7 +141,9 @@ def test_insertion_of_a_forged_chain_entry_is_detected(db_session: Session, elec
     seal(db_session, election_id, keys)
     tail = chain(db_session, election_id)[-1]
     (forged,) = add_ballots(db_session, election_id, 1)
-    payload = db_session.scalar(text("SELECT encrypted_payload FROM ballots WHERE id = :i"), {"i": forged})
+    # VULN-01: the new ballot is held; the forger copies it into ballots so a chain entry can name it
+    payload = db_session.scalar(text("SELECT encrypted_payload FROM pending_ballots WHERE id = :i"), {"i": forged})
+    db_session.execute(text("INSERT INTO ballots (id, election_id, encrypted_payload) VALUES (:i, :e, :p)"), {"i": forged, "e": election_id, "p": payload})
     db_session.add(
         BallotChainEntry(
             election_id=election_id,
@@ -279,7 +284,8 @@ def test_checkpoint_tampering_is_detected(
     "statement",
     [
         "UPDATE ballots SET encrypted_payload = encrypted_payload WHERE id = :i",
-        "DELETE FROM ballots WHERE id = :u",
+        # VULN-01: an unsealed ballot is now held in pending_ballots, under its own trigger (VULN-02)
+        "DELETE FROM pending_ballots WHERE id = :u",
         "UPDATE ballot_chain SET batch_no = batch_no WHERE ballot_id = :i",
         "DELETE FROM ballot_chain WHERE ballot_id = :i",
     ],
@@ -293,11 +299,14 @@ def test_triggers_reject_update_and_delete_but_allow_insert(
     (unsealed,) = add_ballots(db_session, election_id, 1)  # INSERT still allowed
 
     savepoint = db_session.begin_nested()
-    with pytest.raises(DBAPIError, match="is not allowed: recorded ballots are append-only"):
+    # VULN-02: the holding table's trigger has its own message
+    with pytest.raises(DBAPIError, match="is not allowed: (recorded ballots are append-only|a held ballot leaves only through its seal)"):
         db_session.execute(text(statement), {"i": sealed, "u": unsealed})
     savepoint.rollback()
 
-    assert db_session.scalar(text("SELECT count(*) FROM ballots WHERE election_id = :e"), {"e": election_id}) == 2
+    # VULN-01: one sealed, one held
+    stored = "SELECT (SELECT count(*) FROM ballots WHERE election_id = :e) + (SELECT count(*) FROM pending_ballots WHERE election_id = :e)"
+    assert db_session.scalar(text(stored), {"e": election_id}) == 2
 
 
 # ---------------------------------------------------------------
@@ -307,6 +316,9 @@ def test_triggers_reject_update_and_delete_but_allow_insert(
 
 def run_seal(db: Session, monkeypatch, *argv: str) -> int:
     monkeypatch.setattr(seal_ballots, "SessionLocal", lambda: nullcontext(db))
+    # VULN-01: these tests run inside one rolled-back transaction, whose locks a VACUUM on another
+    # connection would wait for; the VACUUM itself is tested on committed data (test_vuln01_*)
+    monkeypatch.setattr(seal_ballots, "vacuum_held_ballots", lambda: None)
     return seal_ballots.main(list(argv))
 
 
@@ -390,7 +402,8 @@ def test_verify_script_passes_then_fails_after_tampering(db_session: Session, el
 
     assert verify_script.main(["--election", str(election_id)]) == 0
     clean = capsys.readouterr().out
-    assert clean.count("PASS     ") == 6 and clean.rstrip().endswith("SR-13 chain verification: PASS")
+    # VULN-02: seven check groups, with g, the totals
+    assert clean.count("PASS     ") == 7 and clean.rstrip().endswith("SR-13 chain verification: PASS")
     assert f"Entries: 30. Head hash: {chain(db_session, election_id)[-1].entry_hash}" in clean
 
     with triggers_off(db_session, "ballots"):
