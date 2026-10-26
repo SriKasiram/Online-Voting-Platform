@@ -1,0 +1,69 @@
+SECURITY REQUIREMENTS - IMPLEMENTATION STATUS
+=============================================
+
+Status key: Fully implemented / Partially implemented / Not implemented
+
+
+---------------------------------------------
+Roopsee Kaur - S3941005
+---------------------------------------------
+Requirement ID | Description                                   | Status
+---------------|-----------------------------------------------|-------------------
+SR-03          | One ballot per elector (single-use token)     | Fully implemented
+SR-07          | Signed ballot definitions (two delegates)     | Fully implemented
+SR-12          | Identity - ballot separation                  | Fully implemented
+SR-17          | Verified House result calculation             | Fully implemented
+
+
+---------------------------------------------
+Sharvari Kale - S4155687
+---------------------------------------------
+Requirement ID | Description                                   | Status
+---------------|-----------------------------------------------|-------------------
+SR-05          | Role-based access control (deny by default)   | Fully implemented
+SR-08          | House ballot-rule validation                  | Fully implemented
+SR-15          | Session end & clean reset                     | Fully implemented
+SR-19          | Availability monitoring (health probe)        | Fully implemented
+
+
+---------------------------------------------
+Swathi Gajendra Musturanayaka - S4181680
+---------------------------------------------
+Requirement ID | Description                                   | Status
+---------------|-----------------------------------------------|-------------------
+SR-02          | Signed roll & eligibility check               | Fully implemented
+SR-06          | Multi-factor sign-in for privileged users     | Fully implemented
+SR-11          | AES-256-GCM ballot encryption                 | Fully implemented
+SR-16          | Append-only, hash-chained audit logging       | Fully implemented
+
+
+---------------------------------------------
+Sri Kasiram Rajagopal - S4197183
+---------------------------------------------
+Requirement ID | Description                                   | Status
+---------------|-----------------------------------------------|-------------------
+SR-04          | Session expiry & binding                      | Fully implemented
+SR-10          | TLS 1.3 for ballot transmission               | Fully implemented
+SR-14          | Acceptance confirmation (non-content)         | Fully implemented
+SR-20          | Encrypted backups & recovery testing          | Fully implemented
+
+
+---------------------------------------------
+Roshan Kumar Sahu - S4198545
+---------------------------------------------
+Requirement ID | Description                                   | Status
+---------------|-----------------------------------------------|-------------------
+SR-01          | Elector authentication, lockout & rate        | Fully implemented
+               | limiting                                      |
+SR-09          | Review before submission & no client storage  | Fully implemented
+SR-13          | Integrity-protected ballot hash chain         | Fully implemented
+SR-18          | Signed result releases                        | Fully implemented
+
+
+=============================================
+SUMMARY
+=============================================
+Total requirements:        20 (SR-01 to SR-20)
+Fully implemented:         20
+Partially implemented:      0
+Not implemented:            0
